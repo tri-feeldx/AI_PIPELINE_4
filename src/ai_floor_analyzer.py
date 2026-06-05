@@ -116,7 +116,8 @@ Return ONLY valid JSON (no explanation, no markdown, just the JSON object):
           "level_name": "Level 1",
           "level_id": "level_1",
           "ffl_m": 44.000,
-          "slab_plan_pages": [7, 8, 9]
+          "slab_plan_pages": [7, 8, 9],
+          "page_titles": ["LEVEL 01 OUTLINE PLAN - 200PT SLAB", "LEVEL 01 PART PLAN ZONE A", "LEVEL 01 PART PLAN ZONE B"]
         }}
       ]
     }}
@@ -132,6 +133,10 @@ RULES:
 - slab_plan_pages: 1-indexed page numbers for slab/floor PLAN pages only.
   Include ALL zone/area/part variants of the same floor (Zone A, Zone B, Part Plan, etc.) \
   — they must ALL be processed to get complete slab geometry.
+- page_titles: For EACH page number in slab_plan_pages (same order), copy the EXACT drawing \
+  title text found on THAT page (e.g. "LEVEL 02 OUTLINE PLAN - 200 POST TENSIONED SLAB U.N.O"). \
+  Read the title from the page content itself, NOT from the drawing index or table of contents. \
+  This field is mandatory and will be used to verify your floor assignments.
 - ffl_m: REQUIRED — provide a numeric value in metres for EVERY floor. Never leave null.
   Search ALL pages (not just plan pages) for elevation data: FFL, RL, EL, FL, AHD, NGL, \
   "finished floor level", "reduced level", floor schedules, section drawings, key plans.
@@ -163,6 +168,62 @@ def _parse_json_response(text: str) -> Optional[dict]:
             except json.JSONDecodeError:
                 pass
     return None
+
+
+# ── Page-title validation ──────────────────────────────────────────────────────
+
+def _validate_page_titles(parsed: dict) -> dict:
+    """
+    Cross-check page_titles against level assignments.
+    If a page title says "LEVEL 02" but the floor is level_1, move that page
+    to the correct floor (level_2). Logs any corrections made.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for bld in parsed.get("buildings", []):
+        floors = bld.get("floors", [])
+
+        # Build lookup: level_number (int) → floor dict
+        num_to_floor: dict = {}
+        for fl in floors:
+            m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if m:
+                num_to_floor[int(m.group(1))] = fl
+
+        for fl in floors:
+            fl_m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if not fl_m:
+                continue
+            fl_num = int(fl_m.group(1))
+
+            pages = fl.get("slab_plan_pages", [])
+            titles = fl.get("page_titles", [])
+            # Pad titles list if Gemini returned fewer entries than pages
+            titles += [""] * max(0, len(pages) - len(titles))
+
+            keep_pages, keep_titles = [], []
+            for pg, title in zip(pages, titles):
+                m = re.search(r"LEVEL\s+0*(\d+)", str(title).upper())
+                if m:
+                    title_num = int(m.group(1))
+                    if title_num != fl_num:
+                        correct = num_to_floor.get(title_num)
+                        if correct and correct is not fl:
+                            logger.warning(
+                                f"Page {pg} title='{title}' → moved from "
+                                f"{fl.get('level_id')} to {correct.get('level_id')}"
+                            )
+                            correct.setdefault("slab_plan_pages", []).append(pg)
+                            correct.setdefault("page_titles", []).append(title)
+                            continue  # don't add to wrong floor
+                keep_pages.append(pg)
+                keep_titles.append(title)
+
+            fl["slab_plan_pages"] = keep_pages
+            fl["page_titles"] = keep_titles
+
+    return parsed
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -206,6 +267,9 @@ def analyze_floor_structure(
         raise ValueError(
             f"Gemini returned unparseable JSON.\nFirst 300 chars:\n{raw_text[:300]}"
         )
+
+    # 3b. Validate page_titles — auto-correct mis-assigned pages
+    parsed = _validate_page_titles(parsed)
 
     # 4. Flatten all slab_plan_pages → 0-indexed pages_to_process
     all_1idx: set = set()
