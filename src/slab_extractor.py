@@ -126,10 +126,7 @@ def build_polygons_from_drawings(drawings: list[dict], min_pts: int = 4) -> list
         if is_filled or closed:
             try:
                 poly = Polygon(unique_pts)
-                if not poly.is_valid:
-                    poly = _ensure_polygon(poly.buffer(0))
-                else:
-                    poly = _ensure_polygon(poly)
+                poly = _ensure_polygon(poly.buffer(0))  # always normalize — fixes subtle self-intersections
                 if poly and poly.is_valid and not poly.is_empty and poly.area > 0:
                     polygons.append(poly)
             except Exception:
@@ -259,16 +256,28 @@ def filter_slab_candidates(
     # Merge touching structural bays into the complete floor outline.
     # Each floor plan page represents ONE floor; if we detect N>1 polygons they are
     # structural bay fills that must be unioned to recover the true slab boundary.
-    merged = unary_union(result)
+    try:
+        merged = unary_union(result)
+    except Exception as e:
+        get_logger().warning(
+            f"  unary_union failed ({type(e).__name__}): {e} "
+            f"— falling back to largest polygon"
+        )
+        return [max(result, key=lambda p: p.area)]
+
+    if merged is None or merged.is_empty:
+        return [max(result, key=lambda p: p.area)]
 
     if isinstance(merged, MultiPolygon):
         # Multiple disconnected components — keep only significant ones.
-        # Small components (title block boxes, legend panels) are < 10% of main floor.
+        # Small components (title block boxes, legend panels) are < 5% of main floor.
         max_comp_area = max(g.area for g in merged.geoms)
-        kept = [g for g in merged.geoms if g.area >= max_comp_area * 0.10]
+        kept = [g for g in merged.geoms if g.area >= max_comp_area * 0.05]
+        if not kept:
+            kept = [max(merged.geoms, key=lambda g: g.area)]
         get_logger().info(
             f"  Union merge: {len(result)} polys → {len(merged.geoms)} components → "
-            f"kept {len(kept)} (≥10% of {max_comp_area:.0f}pt²)"
+            f"kept {len(kept)} (≥5% of {max_comp_area:.0f}pt²)"
         )
         return kept
     else:
