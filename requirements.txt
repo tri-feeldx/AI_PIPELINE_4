@@ -1,0 +1,11 @@
+streamlit>=1.35.0
+pymupdf>=1.24.0
+shapely>=2.0.0
+matplotlib>=3.8.0
+Pillow>=10.0.0
+pandas>=2.0.0
+ezdxf>=1.2.0
+numpy>=1.26.0
+google-genai>=1.0.0
+google-auth>=2.28.0
+python-dotenv>=1.0.0

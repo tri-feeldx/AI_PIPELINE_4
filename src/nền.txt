@@ -1,0 +1,6 @@
+🏗️ Feeldx Structural Slab Extractor
+Phase 1 — PDF → SketchUp 3D Slabs  |  Australian Structural Drawings  |  Thickness: 200mm fixed
+
+🔍 Step 3 — Nhận diện Slab
+Trang 7: 22 slab tìm được.
+

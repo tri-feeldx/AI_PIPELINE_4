@@ -1,0 +1,31 @@
+# Credentials & secrets — NEVER commit
+.env
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Output & debug
+output/
+debug_images/
+debug_ai/
+*.log
+*.rb
+*.csv
+
+# pip artifacts
+=*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
