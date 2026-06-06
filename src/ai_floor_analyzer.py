@@ -369,6 +369,67 @@ def _rebuild_floor_pages_from_map(parsed: dict, page_level_map: dict) -> dict:
     return parsed
 
 
+def _add_missing_floors_from_map(parsed: dict, page_level_map: dict) -> dict:
+    """
+    If page_level_map contains level numbers not present in Gemini's floor list,
+    create new floor entries for those levels and sort all floors by level number.
+    Handles the case where Gemini omits a floor entirely (non-deterministic output).
+    FFL is estimated from the average step of existing floors.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for bld in parsed.get("buildings", []):
+        floors = bld.get("floors", [])
+
+        existing_levels: dict = {}
+        for fl in floors:
+            m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if m:
+                existing_levels[int(m.group(1))] = fl
+
+        map_levels = set(page_level_map.values())
+        missing = sorted(map_levels - set(existing_levels.keys()))
+        if not missing:
+            continue
+
+        # Estimate step size from existing FFL values
+        known_ffls = sorted(
+            (lvl, fl.get("ffl_m"))
+            for lvl, fl in existing_levels.items()
+            if fl.get("ffl_m") is not None
+        )
+        if len(known_ffls) >= 2:
+            total_h = known_ffls[-1][1] - known_ffls[0][1]
+            total_n = known_ffls[-1][0] - known_ffls[0][0]
+            step = total_h / total_n if total_n else 3.5
+        elif known_ffls:
+            step = 3.5
+        else:
+            step = 3.5
+        ref_lvl, ref_ffl = known_ffls[0] if known_ffls else (1, 0.0)
+
+        for lvl_num in missing:
+            pages_for_level = sorted(pg for pg, lv in page_level_map.items() if lv == lvl_num)
+            ffl = round(ref_ffl + step * (lvl_num - ref_lvl), 3)
+            logger.warning(
+                f"  Level {lvl_num} missing from Gemini output — "
+                f"creating floor entry (pages={pages_for_level}, ffl={ffl})"
+            )
+            floors.append({
+                "level_name": f"Level {lvl_num}",
+                "level_id": f"level_{lvl_num}",
+                "ffl_m": ffl,
+                "slab_plan_pages": pages_for_level,
+                "page_titles": [f"LEVEL {lvl_num:02d} OUTLINE PLAN"] * len(pages_for_level),
+            })
+
+        floors.sort(key=lambda f: int((re.search(r"(\d+)", f.get("level_id", "0")) or re.match(r"(\d+)", "0")).group(1)))
+        bld["floors"] = floors
+
+    return parsed
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def analyze_floor_structure(
@@ -419,6 +480,7 @@ def analyze_floor_structure(
     parsed = _filter_non_outline_pages(parsed)
     if page_level_map:
         parsed = _rebuild_floor_pages_from_map(parsed, page_level_map)
+        parsed = _add_missing_floors_from_map(parsed, page_level_map)
 
     # 4. Flatten all slab_plan_pages → 0-indexed pages_to_process
     all_1idx: set = set()
