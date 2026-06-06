@@ -715,15 +715,18 @@ def _process_page_worker(args: tuple) -> tuple:
             slab_regions = transform_all_slabs(slab_regions, page, scale)
 
         # Build polygon lists once — reuse for visualization steps
-        filled = build_polygons_from_drawings(drawings)
-        recon = reconstruct_closed_polygons(drawings)
-        filtered = filter_slab_candidates(filled + recon, page)
+        filled_pairs = build_polygons_from_drawings(drawings)   # list[(Polygon, color)]
+        recon        = reconstruct_closed_polygons(drawings)    # list[Polygon]
+        recon_pairs  = [(p, None) for p in recon]
+        filtered     = filter_slab_candidates(filled_pairs + recon_pairs, page)
+
+        filled_polys = [p for p, _ in filled_pairs]            # strip color for visualizer
 
         page_debug = {}
         for step_fn, key, step_args in [
-            (save_step1_raw_paths, "step1", (page, drawings,      f"{debug_base}_step1_raw.png")),
-            (save_step2_polygons,  "step2", (page, filled + recon, f"{debug_base}_step2_polys.png")),
-            (save_step3_filtered,  "step3", (page, filtered,       f"{debug_base}_step3_filtered.png")),
+            (save_step1_raw_paths, "step1", (page, drawings,             f"{debug_base}_step1_raw.png")),
+            (save_step2_polygons,  "step2", (page, filled_polys + recon, f"{debug_base}_step2_polys.png")),
+            (save_step3_filtered,  "step3", (page, filtered,             f"{debug_base}_step3_filtered.png")),
             (save_step4_labeled,   "step4", (page, slab_regions,   f"{debug_base}_step4_labeled.png")),
             (save_step5_final,     "step5", (page, slab_regions,   f"{debug_base}_step5_final.png")),
         ]:

@@ -3,20 +3,21 @@ Slab boundary extraction from vector PDF paths.
 
 Strategy:
   1. fitz.Page.get_drawings() → all vector paths (lines, rects, curves, filled shapes)
-  2. Collect closed filled paths → candidate polygons
+  2. Collect closed filled paths → candidate polygons (with fill color)
   3. Also reconstruct closed polygons by chaining open line segments
   4. Filter by area threshold (>= min_area_pdf_units²)
-  5. Associate with nearest text labels and FFL values
+  5. Dominant-color filter: fill color with largest total area = slab color
+  6. Associate with nearest text labels and FFL values
 """
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
 import fitz
 from shapely.geometry import Polygon, MultiPolygon, Point
 from shapely.ops import unary_union
-import numpy as np
 
 from src.pipeline_logger import log_extraction_counts, log_warn, get_logger
 
@@ -45,6 +46,22 @@ class SlabRegion:
     source: str = "filled"    # "filled" | "reconstructed"
     color: tuple = field(default_factory=lambda: (0.3, 0.7, 1.0, 0.4))
 
+
+# ── Color helpers ──────────────────────────────────────────────────────────────
+
+def _round_color(c: tuple, step: float = 0.05) -> tuple:
+    """Round RGB values to nearest step to cluster similar shades."""
+    return tuple(round(v / step) * step for v in c)
+
+
+def _color_close(c1, c2, tol: float = 0.08) -> bool:
+    """True if two RGB tuples are within tol of each other on all channels."""
+    if c1 is None or c2 is None:
+        return False
+    return all(abs(a - b) <= tol for a, b in zip(c1, c2))
+
+
+# ── Path extraction ────────────────────────────────────────────────────────────
 
 def extract_paths(page: fitz.Page) -> list[dict]:
     """Return all vector drawing items from the page."""
@@ -89,19 +106,24 @@ def _rect_to_polygon(rect: fitz.Rect) -> Optional[Polygon]:
     ])
 
 
-def build_polygons_from_drawings(drawings: list[dict], min_pts: int = 4) -> list[Polygon]:
+def build_polygons_from_drawings(
+    drawings: list[dict], min_pts: int = 4
+) -> list[tuple[Polygon, Optional[tuple]]]:
     """
-    Convert fitz drawing items to Shapely Polygons.
+    Convert fitz drawing items to (Shapely Polygon, fill_color) pairs.
+    fill_color is an RGB tuple (r,g,b) with values 0.0–1.0, or None.
     Handles: filled closed paths, rect items, quads.
     """
     polygons = []
 
     for d in drawings:
+        fill_color = d.get("fill")  # RGB tuple or None
+
         # Direct rect
         if d.get("rect") and not d.get("items"):
             poly = _rect_to_polygon(d["rect"])
             if poly and poly.is_valid and not poly.is_empty:
-                polygons.append(poly)
+                polygons.append((poly, fill_color))
             continue
 
         items = d.get("items", [])
@@ -126,9 +148,9 @@ def build_polygons_from_drawings(drawings: list[dict], min_pts: int = 4) -> list
         if is_filled or closed:
             try:
                 poly = Polygon(unique_pts)
-                poly = _ensure_polygon(poly.buffer(0))  # always normalize — fixes subtle self-intersections
+                poly = _ensure_polygon(poly.buffer(0))  # normalize — fixes self-intersections
                 if poly and poly.is_valid and not poly.is_empty and poly.area > 0:
-                    polygons.append(poly)
+                    polygons.append((poly, fill_color))
             except Exception:
                 pass
 
@@ -212,7 +234,7 @@ def reconstruct_closed_polygons(drawings: list[dict], tol: float = 2.0) -> list[
 
 
 def filter_slab_candidates(
-    polygons: list[Polygon],
+    poly_color_pairs: list,   # list[tuple[Polygon, Optional[tuple]]]
     page: fitz.Page,
     min_area_fraction: float = 0.001,
     max_area_fraction: float = 0.95,
@@ -223,20 +245,20 @@ def filter_slab_candidates(
     Strategy:
     1. Drop trivially tiny / overly-elongated shapes (dimension lines, thin borders)
     2. Deduplicate overlapping polygons
-    3. unary_union all survivors → touching structural bays merge into one floor shape
-    4. If the union produces multiple disconnected components (e.g. main slab + legend panel),
-       keep only those ≥ 10% of the largest component area
+    3. Dominant-color filter: the fill color covering the largest total area = slab color.
+       Keep only polygons of that color (ignores steelwork, walls, column caps etc.)
+    4. unary_union all survivors → touching structural bays merge into one floor shape
+    5. If the union produces multiple disconnected components, keep only those ≥ 5% of largest
     """
     page_area = page.rect.width * page.rect.height
     min_area = page_area * min_area_fraction
     max_area = page_area * max_area_fraction
 
-    result = []
-    for poly in polygons:
+    result_pairs = []
+    for poly, color in poly_color_pairs:
         area = poly.area
         if area < min_area or area > max_area:
             continue
-        # Exclude very elongated shapes (lines disguised as thin rects)
         bounds = poly.bounds  # (minx, miny, maxx, maxy)
         w = bounds[2] - bounds[0]
         h = bounds[3] - bounds[1]
@@ -245,17 +267,39 @@ def filter_slab_candidates(
         aspect = max(w, h) / max(min(w, h), 1)
         if aspect > 15:
             continue
-        result.append(poly)
+        result_pairs.append((poly, color))
 
-    # Remove duplicates / heavily overlapping polygons
-    result = _deduplicate_polygons(result)
+    result_pairs = _deduplicate_pairs(result_pairs)
 
-    if not result:
+    if not result_pairs:
         return []
 
+    # Dominant-color filter: pick fill color with largest total area = slab color.
+    # Works without reading the legend — slab always dominates the page area.
+    color_area: dict = defaultdict(float)
+    for poly, color in result_pairs:
+        if color is not None:
+            key = _round_color(color)
+            color_area[key] += poly.area
+
+    if color_area:
+        dominant = max(color_area, key=color_area.get)
+        color_filtered = [
+            p for p, c in result_pairs
+            if c is not None and _color_close(_round_color(c), dominant, tol=0.06)
+        ]
+        if color_filtered:
+            get_logger().info(
+                f"  Color filter: dominant={dominant}, "
+                f"kept {len(color_filtered)}/{len(result_pairs)} polys"
+            )
+            result = color_filtered
+        else:
+            result = [p for p, _ in result_pairs]  # fallback: no color match
+    else:
+        result = [p for p, _ in result_pairs]  # fallback: no fill colors (line drawings)
+
     # Merge touching structural bays into the complete floor outline.
-    # Each floor plan page represents ONE floor; if we detect N>1 polygons they are
-    # structural bay fills that must be unioned to recover the true slab boundary.
     try:
         merged = unary_union(result)
     except Exception as e:
@@ -269,8 +313,6 @@ def filter_slab_candidates(
         return [max(result, key=lambda p: p.area)]
 
     if isinstance(merged, MultiPolygon):
-        # Multiple disconnected components — keep only significant ones.
-        # Small components (title block boxes, legend panels) are < 5% of main floor.
         max_comp_area = max(g.area for g in merged.geoms)
         kept = [g for g in merged.geoms if g.area >= max_comp_area * 0.05]
         if not kept:
@@ -282,31 +324,30 @@ def filter_slab_candidates(
         return kept
     else:
         if len(result) > 1:
-            get_logger().info(
-                f"  Union merge: {len(result)} polys → 1 component"
-            )
+            get_logger().info(f"  Union merge: {len(result)} polys → 1 component")
         return [merged]
 
 
-def _deduplicate_polygons(polygons: list[Polygon], overlap_thresh: float = 0.8) -> list[Polygon]:
-    """Remove polygons that are nearly identical or contained within another."""
-    if not polygons:
+def _deduplicate_pairs(
+    pairs: list, overlap_thresh: float = 0.8
+) -> list:
+    """Remove (Polygon, color) pairs where polygon is nearly identical to or contained in another."""
+    if not pairs:
         return []
-    # Sort by area descending
-    sorted_polys = sorted(polygons, key=lambda p: p.area, reverse=True)
+    sorted_pairs = sorted(pairs, key=lambda pc: pc[0].area, reverse=True)
     kept = []
-    for poly in sorted_polys:
+    for poly, color in sorted_pairs:
         dominated = False
-        for keeper in kept:
+        for kpoly, _ in kept:
             try:
-                intersection = poly.intersection(keeper)
+                intersection = poly.intersection(kpoly)
                 if intersection.area / max(poly.area, 1) > overlap_thresh:
                     dominated = True
                     break
             except Exception:
                 pass
         if not dominated:
-            kept.append(poly)
+            kept.append((poly, color))
     return kept
 
 
@@ -323,7 +364,6 @@ def assign_labels(
     """
     regions = []
 
-    # Build centroid points for text items
     def bbox_center(bbox):
         return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
 
@@ -346,7 +386,6 @@ def assign_labels(
                     best_label_dist = d
                     best_label = sl["label"]
 
-        # Only assign label if it's reasonably close
         if best_label_dist > poly.length:
             best_label = f"S{idx + 1}"
 
@@ -381,26 +420,25 @@ def extract_slabs_from_page(
 ) -> tuple[list[SlabRegion], list[dict]]:
     """
     Full pipeline for one page:
-      drawings → polygons (filled + reconstructed) → filter → label → SlabRegion list
+      drawings → polygons with color → dominant-color filter → label → SlabRegion list
     Returns (slab_regions, raw_drawings) for visualization.
     """
     drawings = extract_paths(page)
 
-    filled_polys = build_polygons_from_drawings(drawings)
-    reconstructed_polys = reconstruct_closed_polygons(drawings)
+    filled_pairs = build_polygons_from_drawings(drawings)        # list[(Polygon, color)]
+    recon_pairs  = [(p, None) for p in reconstruct_closed_polygons(drawings)]
 
-    all_polys = filled_polys + reconstructed_polys
-    candidates = filter_slab_candidates(all_polys, page)
+    all_pairs  = filled_pairs + recon_pairs
+    candidates = filter_slab_candidates(all_pairs, page)
 
-    log_extraction_counts(page.number, len(filled_polys), len(reconstructed_polys), len(candidates))
+    log_extraction_counts(page.number, len(filled_pairs), len(recon_pairs), len(candidates))
 
     if not candidates:
         log_warn(page.number, "No slab candidates after filtering — check scale and page selection")
 
     regions = assign_labels(candidates, text_blocks, ffl_values, slab_labels)
 
-    # Tag source and log FFL warnings
-    n_filled = len(filled_polys)
+    n_filled = len(filled_pairs)
     for i, r in enumerate(regions):
         r.source = "filled" if i < n_filled else "reconstructed"
         r.page_index = page.number
