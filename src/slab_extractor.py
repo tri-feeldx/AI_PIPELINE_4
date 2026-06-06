@@ -264,8 +264,15 @@ def filter_slab_candidates(
         h = bounds[3] - bounds[1]
         if w < 5 or h < 5:
             continue
-        aspect = max(w, h) / max(min(w, h), 1)
-        if aspect > 15:
+        # Convexity ratio: slabs and thin connector strips are near-convex (≥0.55).
+        # Stairwells / lift cores are L-shaped or irregular → convexity ≈ 0.4–0.7.
+        # This replaces the old aspect-ratio check which incorrectly rejected wide thin
+        # connector strips (e.g. 60m × 2m corridor has aspect=30 but convexity=1.0).
+        try:
+            convexity = poly.convex_hull.area / poly.area
+        except Exception:
+            convexity = 1.0
+        if convexity < 0.55:
             continue
         result_pairs.append((poly, color))
 
@@ -314,7 +321,7 @@ def filter_slab_candidates(
 
     if isinstance(merged, MultiPolygon):
         max_comp_area = max(g.area for g in merged.geoms)
-        kept = [g for g in merged.geoms if g.area >= max_comp_area * 0.05]
+        kept = [g for g in merged.geoms if g.area >= max_comp_area * 0.02]
         if not kept:
             kept = [max(merged.geoms, key=lambda g: g.area)]
         get_logger().info(

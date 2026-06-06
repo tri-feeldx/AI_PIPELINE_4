@@ -215,16 +215,16 @@ def step1_upload():
                 unsafe_allow_html=True)
     st.markdown(
         '<div class="info-box">'
-        'Upload bản vẽ kết cấu Úc (vector PDF từ Bluebeam/AutoCAD). '
-        'Hệ thống sẽ tự động nhận diện sàn, trích xuất cao độ FFL, '
-        'và tạo mô hình 3D SketchUp với kích thước chính xác 100%.'
+        'Upload Australian structural drawings (vector PDF from Bluebeam/AutoCAD). '
+        'The system automatically detects slabs, extracts FFL elevations, '
+        'and generates a dimensionally accurate SketchUp 3D model.'
         '</div>', unsafe_allow_html=True,
     )
 
     uploaded = st.file_uploader(
-        "Kéo thả PDF vào đây hoặc nhấp để chọn file",
+        "Drag & drop PDF here or click to browse",
         type=["pdf"],
-        help="Hỗ trợ vector PDF. Scanned PDF cho độ chính xác thấp hơn.",
+        help="Vector PDF supported. Scanned PDFs yield lower accuracy.",
         label_visibility="visible",
     )
 
@@ -233,7 +233,7 @@ def step1_upload():
         tmp_path.write_bytes(uploaded.read())
         st.session_state["pdf_path"] = str(tmp_path)
 
-        with st.spinner("Đang đọc PDF..."):
+        with st.spinner("Reading PDF..."):
             import fitz
             from src.pdf_processor import get_pdf_metadata, classify_pages, load_pdf
             doc = load_pdf(str(tmp_path))
@@ -249,39 +249,39 @@ def step1_upload():
         page_size_label = "A1" if w_pts > 2300 else ("A3" if w_pts > 1100 else "Other")
 
         st.markdown("---")
-        st.markdown("#### 📊 Thông tin PDF")
+        st.markdown("#### 📊 PDF Info")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Tổng số trang", meta["page_count"])
+        c1.metric("Total pages", meta["page_count"])
         c2.metric("Floor Plan (auto)", floor_plan_count)
-        c3.metric("Khổ giấy", page_size_label)
+        c3.metric("Paper size", page_size_label)
         c4.metric("File", uploaded.name[:18] + ("…" if len(uploaded.name) > 18 else ""))
 
         if meta.get("creator"):
             st.markdown(
-                f'<div class="success-box">✅ Vector PDF xác nhận — Creator: '
+                f'<div class="success-box">✅ Vector PDF confirmed — Creator: '
                 f'<b>{meta["creator"]}</b></div>', unsafe_allow_html=True,
             )
 
         st.markdown("---")
-        if st.button("Tiếp theo: Chọn trang →", type="primary", use_container_width=True):
+        if st.button("Next: Select Pages →", type="primary", use_container_width=True):
             st.session_state["step"] = 2
             _rerun()
 
 
 # ── STEP 2: Select Pages ────────────────────────────────────────────────────────
 def step2_select_pages():
-    st.markdown('<div class="step-header">🗂️ Step 2 — Chọn trang Floor Plan</div>',
+    st.markdown('<div class="step-header">🗂️ Step 2 — Select Floor Plan Pages</div>',
                 unsafe_allow_html=True)
     st.markdown(
         '<div class="info-box">'
-        'Các trang floor plan đã được tự động đánh dấu. '
-        'Tick/bỏ tick để tùy chỉnh. Đặt đúng tỉ lệ bản vẽ để kích thước 3D chính xác.'
+        'Floor plan pages have been auto-detected. '
+        'Check/uncheck to customise. Set the correct drawing scale for accurate 3D dimensions.'
         '</div>', unsafe_allow_html=True,
     )
 
     page_infos = st.session_state["page_infos"]
     if not page_infos:
-        st.error("Không tìm thấy thông tin trang.")
+        st.error("No page information found.")
         return
 
     import fitz
@@ -290,7 +290,7 @@ def step2_select_pages():
     # ── Scale selector ──────────────────────────────────────────────────────────
     scale_auto = next((p["scale"] for p in page_infos if p.get("scale")), None)
 
-    st.markdown("#### ⚙️ Tỉ lệ bản vẽ")
+    st.markdown("#### ⚙️ Drawing Scale")
     col_s, col_hint = st.columns([1, 2])
     with col_s:
         scale_input = st.number_input(
@@ -298,7 +298,7 @@ def step2_select_pages():
             min_value=10, max_value=2000,
             value=scale_auto or 100,
             step=10,
-            help="Xem title block của bản vẽ. Phổ biến: 1:100, 1:200, 1:50",
+            help="Check the drawing title block. Common: 1:100, 1:200, 1:50",
         )
         st.session_state["scale"] = int(scale_input)
     with col_hint:
@@ -309,13 +309,13 @@ def step2_select_pages():
             )
         else:
             st.markdown(
-                '<div class="warn-box" style="margin-top:28px;">⚠️ Không tự detect được — '
-                'hãy nhập thủ công. Xem title block PDF.</div>',
+                '<div class="warn-box" style="margin-top:28px;">⚠️ Auto-detect failed — '
+                'enter manually. Check the PDF title block.</div>',
                 unsafe_allow_html=True,
             )
 
     st.markdown("---")
-    st.markdown("#### 📄 Chọn trang cần xử lý")
+    st.markdown("#### 📄 Select Pages to Process")
 
     doc = load_pdf(st.session_state["pdf_path"])
     floor_plan_idxs = {p["index"] for p in page_infos if p["is_floor_plan"]}
@@ -355,7 +355,7 @@ def step2_select_pages():
     n_sel = len(new_selected)
     st.markdown(
         f'<div class="{"success-box" if n_sel > 0 else "warn-box"}">'
-        f'{"✅" if n_sel > 0 else "⚠️"} <b>{n_sel} trang</b> được chọn để phân tích.'
+        f'{"✅" if n_sel > 0 else "⚠️"} <b>{n_sel} page{"s" if n_sel != 1 else ""}</b> selected for analysis.'
         '</div>', unsafe_allow_html=True,
     )
 
@@ -364,8 +364,8 @@ def step2_select_pages():
         st.markdown("---")
         st.markdown("#### 🧠 AI Floor Detection")
         st.markdown(
-            '<div class="info-box">Gemini đọc toàn bộ text trong PDF, tự nhận dạng '
-            'building/tầng/FFL, chọn đúng pages cần xử lý (bỏ sections, details, elevations).</div>',
+            '<div class="info-box">Gemini reads all PDF text, identifies buildings/floors/FFLs, '
+            'and selects the correct pages to process (skipping sections, details, elevations).</div>',
             unsafe_allow_html=True,
         )
 
@@ -373,10 +373,10 @@ def step2_select_pages():
 
         col_ai, col_kw, col_reset = st.columns([2, 2, 1])
         with col_ai:
-            if st.button("🤖 Phân tích AI (Gemini)", use_container_width=True, type="primary"):
+            if st.button("🤖 AI Analysis (Gemini)", use_container_width=True, type="primary"):
                 from src.ai_floor_analyzer import analyze_floor_structure
                 from src.floor_detector import FloorDetectResult, FloorGroup
-                with st.spinner(f"Gemini đang đọc {n_sel} trang (~5-10 giây)..."):
+                with st.spinner(f"Gemini reading {n_sel} pages (~5–10 seconds)..."):
                     try:
                         ai_result, ai_path = analyze_floor_structure(
                             st.session_state["pdf_path"],
@@ -392,9 +392,9 @@ def step2_select_pages():
                         st.error(f"Gemini error: {e}")
                 _rerun()
         with col_kw:
-            if st.button("🔍 Keyword detection (nhanh)", use_container_width=True):
+            if st.button("🔍 Keyword detection (fast)", use_container_width=True):
                 from src.floor_detector import detect_unique_floors
-                with st.spinner(f"Đang scan {n_sel} trang..."):
+                with st.spinner(f"Scanning {n_sel} pages..."):
                     result = detect_unique_floors(
                         st.session_state["pdf_path"],
                         sorted(new_selected),
@@ -415,13 +415,13 @@ def step2_select_pages():
         ai_result = st.session_state.get("ai_floor_result")
         ai_path   = st.session_state.get("ai_floor_output_path")
         if ai_result:
-            with st.expander("🔍 Xem kết quả Gemini (raw JSON)"):
+            with st.expander("🔍 View Gemini output (raw JSON)"):
                 st.json(ai_result)
             if ai_path:
                 try:
                     with open(ai_path, "rb") as f:
                         st.download_button(
-                            "📥 Tải gemini_floors.json",
+                            "📥 Download gemini_floors.json",
                             f,
                             file_name="gemini_floors.json",
                             mime="application/json",
@@ -433,8 +433,8 @@ def step2_select_pages():
             basis_labels = {
                 "ffl": "FFL values ✅ (keyword)",
                 "title": "Title keywords ⚠️ (keyword)",
-                "all_pages": "Keyword: không đủ tín hiệu — xử lý tất cả",
-                "ai_gemini": "Gemini AI ✅ (độ tin cậy cao nhất)",
+                "all_pages": "Keyword: insufficient signal — processing all pages",
+                "ai_gemini": "Gemini AI ✅ (highest confidence)",
                 "page_type": "Page classification ✅ (keyword)",
             }
             basis_txt = basis_labels.get(smart_result.detection_basis, smart_result.detection_basis)
@@ -449,8 +449,8 @@ def step2_select_pages():
                 n_proc = len(smart_result.pages_to_process)
                 n_skip = len(smart_result.skipped_pages)
                 st.markdown(
-                    f'<div class="success-box">✅ Phát hiện <b>{smart_result.floor_count} tầng</b> '
-                    f'— xử lý <b>{n_proc} pages</b>, bỏ qua <b>{n_skip} pages</b>'
+                    f'<div class="success-box">✅ Detected <b>{smart_result.floor_count} floors</b> '
+                    f'— processing <b>{n_proc} pages</b>, skipping <b>{n_skip} pages</b>'
                     f'<br><small>Basis: {basis_txt}</small></div>',
                     unsafe_allow_html=True,
                 )
@@ -460,10 +460,10 @@ def step2_select_pages():
                 rows = []
                 for g in smart_result.groups:
                     rows.append({
-                        "Tầng": g.floor_label,
+                        "Floor": g.floor_label,
                         "Canonical": f"Page {g.canonical_page + 1}",
                         "Supplement": ", ".join(f"P{p+1}" for p in g.supplemental_pages) or "—",
-                        "Bỏ qua": ", ".join(f"P{p+1}" for p in g.skipped_pages) or "—",
+                        "Skipped": ", ".join(f"P{p+1}" for p in g.skipped_pages) or "—",
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
@@ -477,7 +477,7 @@ def step2_select_pages():
             with ca:
                 label = (f"⚡ Process {len(smart_result.pages_to_process)} pages (smart)"
                          if smart_result.detection_basis != "all_pages"
-                         else f"Tiếp với tất cả {n_sel} pages")
+                         else f"Continue with all {n_sel} pages")
                 if st.button(label, type="primary", use_container_width=True):
                     st.session_state["smart_detect_done"] = True
                     st.session_state["slab_results"] = {}   # clear cache → re-process
@@ -485,7 +485,7 @@ def step2_select_pages():
                     _rerun()
             with cb:
                 if smart_result.detection_basis != "all_pages":
-                    if st.button(f"Dùng tất cả {n_sel} pages (bỏ qua smart)", use_container_width=True):
+                    if st.button(f"Use all {n_sel} pages (skip smart mode)", use_container_width=True):
                         st.session_state["smart_detect_done"] = False
                         st.session_state["slab_results"] = {}
                         st.session_state["step"] = 3
@@ -495,18 +495,18 @@ def step2_select_pages():
     st.markdown("---")
     col_back, col_next = st.columns(2)
     with col_back:
-        if st.button("← Quay lại", use_container_width=True):
+        if st.button("← Back", use_container_width=True):
             st.session_state["step"] = 1
             _rerun()
     with col_next:
         if n_sel > 0:
             if not st.session_state.get("smart_detect_result"):
-                if st.button("Tiếp: Detect Slabs →", type="primary", use_container_width=True):
+                if st.button("Next: Detect Slabs →", type="primary", use_container_width=True):
                     st.session_state["slab_results"] = {}
                     st.session_state["step"] = 3
                     _rerun()
         else:
-            st.warning("Chọn ít nhất 1 trang.")
+            st.warning("Select at least 1 page.")
 
 
 # ── AI result converter ──────────────────────────────────────────────────────────
@@ -750,8 +750,8 @@ def _render_step3_results():
     n = len(selected_pages)
 
     st.markdown(
-        f'<div class="success-box">✅ Hoàn tất — phát hiện <b>{total} slab</b> '
-        f'trên {n} trang.</div>', unsafe_allow_html=True,
+        f'<div class="success-box">✅ Complete — detected <b>{total} slab{"s" if total != 1 else ""}</b> '
+        f'across {n} page{"s" if n != 1 else ""}.</div>', unsafe_allow_html=True,
     )
 
     # Log file download
@@ -759,7 +759,7 @@ def _render_step3_results():
     if log_path and Path(log_path).exists():
         with open(log_path, "rb") as lf:
             st.download_button(
-                "📋 Tải Log File (gửi cho engineer để debug)",
+                "📋 Download Log File (for debugging)",
                 lf.read(),
                 file_name=Path(log_path).name,
                 mime="text/plain",
@@ -768,11 +768,11 @@ def _render_step3_results():
 
     # Debug image viewer
     st.markdown("---")
-    st.markdown("#### 📸 Debug Images — từng bước xử lý")
+    st.markdown("#### 📸 Debug Images — processing steps")
     for page_idx in selected_pages:
         page_imgs = debug_imgs.get(page_idx, {})
         n_slabs = len(results.get(page_idx, []))
-        with st.expander(f"📄 Trang {page_idx + 1} — {n_slabs} slab", expanded=(n_slabs > 0)):
+        with st.expander(f"📄 Page {page_idx + 1} — {n_slabs} slab{'s' if n_slabs != 1 else ''}", expanded=(n_slabs > 0)):
             tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "④ Labeled", "⑤ Final"])
             step_keys = ["step1", "step2", "step3", "step4", "step5"]
             for tab, key in zip(tabs, step_keys):
@@ -782,37 +782,37 @@ def _render_step3_results():
                         st.image(img_path, use_container_width=True)
                         with open(img_path, "rb") as f:
                             st.download_button(
-                                f"⬇ Tải {key}.png", f.read(),
+                                f"⬇ Download {key}.png", f.read(),
                                 file_name=Path(img_path).name, mime="image/png",
                                 key=f"dl_{page_idx}_{key}",
                             )
                     else:
-                        st.info("Ảnh không khả dụng.")
+                        st.info("Image not available.")
 
     st.markdown("---")
     col_back, col_next = st.columns(2)
     with col_back:
-        if st.button("← Quay lại", use_container_width=True):
+        if st.button("← Back", use_container_width=True):
             # Clear cache so re-entering step 3 will re-process with any new settings
             st.session_state["slab_results"] = {}
             st.session_state["step"] = 2
             _rerun()
     with col_next:
         if total > 0:
-            if st.button("Tiếp: Review →", type="primary", use_container_width=True):
+            if st.button("Next: Review →", type="primary", use_container_width=True):
                 st.session_state["step"] = 4
                 _rerun()
         else:
             st.markdown(
-                '<div class="warn-box">⚠️ Không tìm thấy slab. Thử: điều chỉnh scale, '
-                'chọn trang khác, hoặc xem debug ①②③ để phân tích.</div>',
+                '<div class="warn-box">⚠️ No slabs found. Try: adjusting scale, '
+                'selecting different pages, or reviewing debug images ①②③.</div>',
                 unsafe_allow_html=True,
             )
 
 
 # ── STEP 3: Detect Slabs ────────────────────────────────────────────────────────
 def step3_detect():
-    st.markdown('<div class="step-header">🔍 Step 3 — Nhận diện Slab</div>',
+    st.markdown('<div class="step-header">🔍 Step 3 — Slab Detection</div>',
                 unsafe_allow_html=True)
 
     selected_pages = st.session_state["selected_pages"]
@@ -826,8 +826,8 @@ def step3_detect():
         n_floors = smart_result.floor_count
         n_skipped = len(smart_result.skipped_pages)
         st.markdown(
-            f'<div class="info-box">🧠 Smart mode — {n_floors} tầng / '
-            f'{len(pages_to_process)} pages (bỏ qua {n_skipped} pages trùng)</div>',
+            f'<div class="info-box">🧠 Smart mode — {n_floors} floors / '
+            f'{len(pages_to_process)} pages (skipping {n_skipped} duplicate pages)</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -849,7 +849,7 @@ def step3_detect():
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     n = len(pages_to_process)
-    progress = st.progress(0, text=f"Đang xử lý {n} trang song song...")
+    progress = st.progress(0, text=f"Processing {n} pages in parallel...")
     status_placeholder = st.empty()
 
     worker_args = [
@@ -873,14 +873,14 @@ def step3_detect():
                 results[page_idx] = []
                 debug_imgs[page_idx] = {}
                 status_placeholder.markdown(
-                    f'<div class="warn-box">⚠️ Lỗi trang {page_idx + 1}: {e}</div>',
+                    f'<div class="warn-box">⚠️ Error on page {page_idx + 1}: {e}</div>',
                     unsafe_allow_html=True,
                 )
             done_count += 1
             n_found = len(results.get(page_idx, []))
             progress.progress(
                 done_count / n,
-                text=f"Trang {page_idx + 1}: {n_found} slab — ({done_count}/{n} trang xong)",
+                text=f"Page {page_idx + 1}: {n_found} slab{'s' if n_found != 1 else ''} — ({done_count}/{n} pages done)",
             )
 
     # Update session state only after all workers finish (thread-safe)
@@ -913,7 +913,7 @@ def step3_detect():
 
 # ── STEP 4: Review ──────────────────────────────────────────────────────────────
 def step4_review():
-    st.markdown('<div class="step-header">📋 Step 4 — Review & Chỉnh sửa</div>',
+    st.markdown('<div class="step-header">📋 Step 4 — Review & Edit</div>',
                 unsafe_allow_html=True)
 
     all_slabs = st.session_state["final_slabs"]
@@ -921,9 +921,9 @@ def step4_review():
     selected_pages = st.session_state["selected_pages"]
 
     if not all_slabs:
-        st.markdown('<div class="warn-box">⚠️ Không có slab để review. Quay lại bước 3.</div>',
+        st.markdown('<div class="warn-box">⚠️ No slabs to review. Go back to step 3.</div>',
                     unsafe_allow_html=True)
-        if st.button("← Quay lại"):
+        if st.button("← Back"):
             st.session_state["step"] = 3
             _rerun()
         return
@@ -932,16 +932,16 @@ def step4_review():
     ffls = [s.ffl_m for s in all_slabs if s.ffl_m is not None]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tổng Slab", len(all_slabs))
-    c2.metric("Tổng Diện Tích", f"{total_area:.1f} m²")
-    c3.metric("Cao độ min", f"{min(ffls):.3f}m" if ffls else "N/A")
-    c4.metric("Cao độ max", f"{max(ffls):.3f}m" if ffls else "N/A")
+    c1.metric("Total Slabs", len(all_slabs))
+    c2.metric("Total Area", f"{total_area:.1f} m²")
+    c3.metric("Min FFL", f"{min(ffls):.3f}m" if ffls else "N/A")
+    c4.metric("Max FFL", f"{max(ffls):.3f}m" if ffls else "N/A")
 
     st.markdown("---")
-    st.markdown("#### ✏️ Chỉnh sửa dữ liệu Slab")
+    st.markdown("#### ✏️ Edit Slab Data")
     st.markdown(
-        '<div class="info-box">Double-click vào ô để sửa Label hoặc FFL. '
-        'Thickness cố định 200mm.</div>', unsafe_allow_html=True,
+        '<div class="info-box">Double-click a cell to edit Label or FFL. '
+        'Thickness is fixed at 200mm.</div>', unsafe_allow_html=True,
     )
 
     df_data = []
@@ -964,11 +964,11 @@ def step4_review():
         column_config={
             "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
             "Label": st.column_config.TextColumn("Label", width="medium"),
-            "Page": st.column_config.NumberColumn("Trang", disabled=True, width="small"),
+            "Page": st.column_config.NumberColumn("Page", disabled=True, width="small"),
             "FFL (m)": st.column_config.NumberColumn("FFL (m)", format="%.3f", width="medium"),
-            "Thickness (mm)": st.column_config.NumberColumn("Dày (mm)", disabled=True, width="small"),
-            "Area (m²)": st.column_config.NumberColumn("Diện tích (m²)", format="%.2f", width="medium"),
-            "Source": st.column_config.TextColumn("Nguồn", disabled=True, width="small"),
+            "Thickness (mm)": st.column_config.NumberColumn("Thickness (mm)", disabled=True, width="small"),
+            "Area (m²)": st.column_config.NumberColumn("Area (m²)", format="%.2f", width="medium"),
+            "Source": st.column_config.TextColumn("Source", disabled=True, width="small"),
         },
         key="slab_editor",
         height=min(400, 60 + len(all_slabs) * 38),
@@ -986,33 +986,33 @@ def step4_review():
 
     # Final images
     st.markdown("---")
-    st.markdown("#### 🖼️ Ảnh kết quả cuối")
+    st.markdown("#### 🖼️ Final Result Images")
     for page_idx in selected_pages:
         img_path = debug_imgs.get(page_idx, {}).get("step5")
         if img_path and Path(img_path).exists():
-            with st.expander(f"Trang {page_idx+1}", expanded=True):
+            with st.expander(f"Page {page_idx+1}", expanded=True):
                 st.image(img_path, use_container_width=True)
 
     st.markdown("---")
     col_back, col_next = st.columns(2)
     with col_back:
-        if st.button("← Quay lại", use_container_width=True):
+        if st.button("← Back", use_container_width=True):
             st.session_state["step"] = 3
             _rerun()
     with col_next:
-        if st.button("Tiếp: Tạo 3D Model →", type="primary", use_container_width=True):
+        if st.button("Next: Generate 3D Model →", type="primary", use_container_width=True):
             st.session_state["step"] = 5
             _rerun()
 
 
 # ── STEP 5: Generate ────────────────────────────────────────────────────────────
 def step5_generate():
-    st.markdown('<div class="step-header">⚙️ Step 5 — Tạo SketchUp 3D Model</div>',
+    st.markdown('<div class="step-header">⚙️ Step 5 — Generate SketchUp 3D Model</div>',
                 unsafe_allow_html=True)
 
     all_slabs = st.session_state["final_slabs"]
     if not all_slabs:
-        st.error("Không có slab để xuất. Quay lại bước 3.")
+        st.error("No slabs to export. Go back to step 3.")
         return
 
     from src.model_builder import generate_ruby_script, generate_slab_csv
@@ -1021,7 +1021,7 @@ def step5_generate():
     ruby_path = str(OUTPUT_DIR / f"slabs_{ts}.rb")
     csv_path  = str(OUTPUT_DIR / f"slabs_{ts}.csv")
 
-    with st.spinner("Đang tạo Ruby script cho SketchUp..."):
+    with st.spinner("Generating Ruby script for SketchUp..."):
         ruby_content = generate_ruby_script(all_slabs, ruby_path)
         generate_slab_csv(all_slabs, csv_path)
 
@@ -1030,16 +1030,16 @@ def step5_generate():
     st.session_state["csv_path"]    = csv_path
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Slabs trong script", len(all_slabs))
-    c2.metric("Kích thước script", f"{len(ruby_content)/1024:.1f} KB")
-    c3.metric("Thickness", "200 mm (cố định)")
+    c1.metric("Slabs in script", len(all_slabs))
+    c2.metric("Script size", f"{len(ruby_content)/1024:.1f} KB")
+    c3.metric("Thickness", "200 mm (fixed)")
 
     st.markdown("---")
     st.markdown("#### ⬇️ Download Files")
     col_rb, col_csv = st.columns(2)
     with col_rb:
         st.download_button(
-            "📥 Tải .rb Script (SketchUp Ruby)",
+            "📥 Download .rb Script (SketchUp Ruby)",
             ruby_content.encode("utf-8"),
             file_name=Path(ruby_path).name,
             mime="text/plain",
@@ -1048,7 +1048,7 @@ def step5_generate():
     with col_csv:
         with open(csv_path, "rb") as f:
             st.download_button(
-                "📊 Tải Slab Data (.csv)",
+                "📊 Download Slab Data (.csv)",
                 f.read(),
                 file_name=Path(csv_path).name,
                 mime="text/csv",
@@ -1057,76 +1057,76 @@ def step5_generate():
 
     st.markdown("---")
     st.markdown("#### 👁️ Preview Ruby Script")
-    with st.expander("Xem code (80 dòng đầu)", expanded=False):
+    with st.expander("View code (first 80 lines)", expanded=False):
         preview = "\n".join(ruby_content.split("\n")[:80])
         st.code(preview, language="ruby")
 
     st.markdown("---")
     col_back, col_next = st.columns(2)
     with col_back:
-        if st.button("← Quay lại", use_container_width=True):
+        if st.button("← Back", use_container_width=True):
             st.session_state["step"] = 4
             _rerun()
     with col_next:
-        if st.button("Tiếp: Hướng dẫn SketchUp →", type="primary", use_container_width=True):
+        if st.button("Next: SketchUp Guide →", type="primary", use_container_width=True):
             st.session_state["step"] = 6
             _rerun()
 
 
 # ── STEP 6: Export / Instructions ──────────────────────────────────────────────
 def step6_done():
-    st.markdown('<div class="step-header">🎉 Step 6 — Import vào SketchUp</div>',
+    st.markdown('<div class="step-header">🎉 Step 6 — Import into SketchUp</div>',
                 unsafe_allow_html=True)
 
     st.markdown(
-        '<div class="success-box">🎉 <b>Xong rồi!</b> Làm theo hướng dẫn bên dưới '
-        'để import slab vào SketchUp 2026.</div>', unsafe_allow_html=True,
+        '<div class="success-box">🎉 <b>Done!</b> Follow the instructions below '
+        'to import slabs into SketchUp 2026.</div>', unsafe_allow_html=True,
     )
 
     st.markdown("""
 ---
-### 🚀 Hướng dẫn import vào SketchUp 2026
+### 🚀 How to import into SketchUp 2026
 
-| Bước | Hành động |
-|------|-----------|
-| 1 | Mở **SketchUp** → `Window` → `Ruby Console` |
-| 2 | **Download** file `.rb` từ Step 5 |
-| 3 | Mở file `.rb` bằng Notepad → **Copy toàn bộ** |
-| 4 | **Paste** vào Ruby Console → nhấn **Enter** |
-| 5 | Nhấn **Z** (Zoom Extents) để xem toàn bộ model |
-
----
-### 📦 Kết quả trong SketchUp
-- Mỗi slab = khối 3D solid dày **200mm**
-- Mỗi tầng = 1 **Layer riêng** (tên theo FFL)
-- Mỗi tầng có **màu material riêng**
-- Đơn vị mô hình: **mm** (tự động set)
+| Step | Action |
+|------|--------|
+| 1 | Open **SketchUp** → `Window` → `Ruby Console` |
+| 2 | **Download** the `.rb` file from Step 5 |
+| 3 | Open the `.rb` file in Notepad → **Copy all** |
+| 4 | **Paste** into Ruby Console → press **Enter** |
+| 5 | Press **Z** (Zoom Extents) to view the full model |
 
 ---
-### 🔍 Kiểm tra độ chính xác
-1. Dùng **Tape Measure** (`T`) đo kích thước slab
-2. So sánh với annotation trên PDF
-3. Nếu sai → quay Step 2, điều chỉnh **Scale**
+### 📦 What you get in SketchUp
+- Each slab = a 3D solid **200mm** thick
+- Each floor = its own **Layer** (named by FFL)
+- Each floor has a **unique material colour**
+- Model units: **mm** (set automatically)
+
+---
+### 🔍 Verify accuracy
+1. Use **Tape Measure** (`T`) to measure slab dimensions
+2. Compare with annotations on the PDF
+3. If incorrect → go back to Step 2 and adjust **Scale**
 
 ---
 ### 🛠️ Troubleshooting
 
-| Vấn đề | Giải pháp |
-|--------|-----------|
-| Không thấy slab | Xem Ruby Console có lỗi không |
-| Kích thước sai | Điều chỉnh Scale ở Step 2 |
-| Cao độ sai | Sửa FFL ở Step 4 |
-| Thiếu slab | Chọn thêm trang ở Step 2 |
-| Slab chồng lên nhau | Kiểm tra debug Step ③ |
+| Issue | Solution |
+|-------|----------|
+| Slabs not visible | Check Ruby Console for errors |
+| Wrong dimensions | Adjust Scale in Step 2 |
+| Wrong elevation | Edit FFL in Step 4 |
+| Missing slabs | Select additional pages in Step 2 |
+| Overlapping slabs | Check debug image Step ③ |
 """)
 
     ruby_content = st.session_state.get("ruby_script", "")
     if ruby_content:
         st.markdown("---")
-        with st.expander("📋 Copy Script nhanh tại đây"):
+        with st.expander("📋 Quick copy script"):
             st.code(ruby_content, language="ruby")
             st.download_button(
-                "⬇️ Download lại .rb",
+                "⬇️ Re-download .rb",
                 ruby_content.encode("utf-8"),
                 file_name="slabs.rb",
                 mime="text/plain",
@@ -1134,12 +1134,12 @@ def step6_done():
 
     st.markdown("---")
     st.markdown(
-        '<div class="info-box">💡 <b>Phase tiếp theo:</b> Sau khi slab OK, '
-        'sẽ thêm cột, dầm, vách, và cốt thép.</div>',
+        '<div class="info-box">💡 <b>Next phase:</b> Once slabs are confirmed, '
+        'columns, beams, walls and reinforcement will be added.</div>',
         unsafe_allow_html=True,
     )
 
-    if st.button("🔄 Xử lý PDF khác", use_container_width=True, type="primary"):
+    if st.button("🔄 Process another PDF", use_container_width=True, type="primary"):
         reset_session()
         _rerun()
 
