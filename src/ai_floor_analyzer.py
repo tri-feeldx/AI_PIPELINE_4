@@ -226,6 +226,111 @@ def _validate_page_titles(parsed: dict) -> dict:
     return parsed
 
 
+# ── Python-side page-level ground truth ───────────────────────────────────────
+
+# Pages whose title contains any of these keywords are NOT outline/floor plans.
+_EXCLUDE_TITLE_KEYWORDS = [
+    "SEISMIC", "REINFORCEMENT", "STEEL MARKING", "MARKING PLAN",
+    "SECTION", "ELEVATION", "DETAIL", "SCHEDULE", "RETENTION",
+    "FOOTING", "PILE", "CONNECTION", "SETTING OUT",
+]
+
+
+def _extract_page_level_map(page_texts: str) -> dict:
+    """
+    Parse the '[Page N]: text...' string and search each page for a drawing title
+    that includes a level number, e.g. 'LEVEL 02 OUTLINE PLAN'.
+    Returns {1-indexed page number: level_number (int)} — ground truth from PDF content.
+    Gemini reads the drawing index (TOC), so this is the authoritative override.
+    """
+    page_level_map: dict = {}
+    for line in page_texts.splitlines():
+        m_page = re.match(r"\[Page (\d+)\]:\s*(.*)", line)
+        if not m_page:
+            continue
+        page_num = int(m_page.group(1))
+        text = m_page.group(2)
+        m_level = re.search(
+            r"LEVEL\s+0*(\d+)\s+(?:OUTLINE|FLOOR|SLAB|PART)\s*PLAN", text.upper()
+        )
+        if m_level:
+            page_level_map[page_num] = int(m_level.group(1))
+    return page_level_map
+
+
+def _filter_non_outline_pages(parsed: dict) -> dict:
+    """
+    Remove pages from slab_plan_pages whose page_title indicates non-outline content
+    (seismic reinforcement, steel marking, sections, details, etc.).
+    Gemini often includes these even though they yield 0 slab polygons.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for bld in parsed.get("buildings", []):
+        for fl in bld.get("floors", []):
+            pages = fl.get("slab_plan_pages", [])
+            titles = fl.get("page_titles", [])
+            titles += [""] * max(0, len(pages) - len(titles))
+            keep_pages, keep_titles = [], []
+            for pg, title in zip(pages, titles):
+                if any(kw in str(title).upper() for kw in _EXCLUDE_TITLE_KEYWORDS):
+                    logger.info(
+                        f"  Page {pg} excluded (non-outline title): '{title}'"
+                    )
+                else:
+                    keep_pages.append(pg)
+                    keep_titles.append(title)
+            fl["slab_plan_pages"] = keep_pages
+            fl["page_titles"] = keep_titles
+    return parsed
+
+
+def _override_with_page_level_map(parsed: dict, page_level_map: dict) -> dict:
+    """
+    For each page in slab_plan_pages: if page_level_map says the page belongs to
+    level X but Gemini assigned it to level Y → move it to the correct floor.
+    page_level_map is extracted from actual PDF page text (not Gemini's output),
+    so it overrides Gemini's drawing-list-based assignments.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for bld in parsed.get("buildings", []):
+        floors = bld.get("floors", [])
+        num_to_floor: dict = {}
+        for fl in floors:
+            m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if m:
+                num_to_floor[int(m.group(1))] = fl
+
+        for fl in floors:
+            fl_m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if not fl_m:
+                continue
+            fl_num = int(fl_m.group(1))
+
+            pages = fl.get("slab_plan_pages", [])
+            keep_pages = []
+            for pg in pages:
+                if pg in page_level_map:
+                    true_level = page_level_map[pg]
+                    if true_level != fl_num:
+                        correct = num_to_floor.get(true_level)
+                        if correct and correct is not fl:
+                            logger.warning(
+                                f"  Page {pg}: PDF title=LEVEL {true_level}, "
+                                f"Gemini→{fl.get('level_id')} "
+                                f"→ corrected to {correct.get('level_id')}"
+                            )
+                            correct.setdefault("slab_plan_pages", []).append(pg)
+                            continue
+                keep_pages.append(pg)
+            fl["slab_plan_pages"] = keep_pages
+
+    return parsed
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def analyze_floor_structure(
@@ -254,6 +359,9 @@ def analyze_floor_structure(
     # 1. Extract page texts
     page_texts = extract_pdf_text_for_ai(pdf_path, page_indices)
 
+    # 1b. Build ground-truth page→level map directly from PDF text (before Gemini)
+    page_level_map = _extract_page_level_map(page_texts)
+
     # 2. Build prompt and call Gemini
     prompt = _PROMPT.format(page_texts=page_texts)
     client = _get_client()
@@ -268,8 +376,11 @@ def analyze_floor_structure(
             f"Gemini returned unparseable JSON.\nFirst 300 chars:\n{raw_text[:300]}"
         )
 
-    # 3b. Validate page_titles — auto-correct mis-assigned pages
+    # 3b. Post-processing: validate titles → filter non-outline pages → override with PDF ground truth
     parsed = _validate_page_titles(parsed)
+    parsed = _filter_non_outline_pages(parsed)
+    if page_level_map:
+        parsed = _override_with_page_level_map(parsed, page_level_map)
 
     # 4. Flatten all slab_plan_pages → 0-indexed pages_to_process
     all_1idx: set = set()
