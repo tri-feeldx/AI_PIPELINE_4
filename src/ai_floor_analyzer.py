@@ -67,13 +67,17 @@ def _get_model_name() -> str:
 
 # ── Text extraction ────────────────────────────────────────────────────────────
 
-MAX_CHARS_PER_PAGE = 1000   # ~250 tokens; keeps total prompt < 200K tokens for 200 pages
+MAX_CHARS_PER_PAGE = 3000   # increased from 1000 — title blocks appear later in page text
 
 
 def extract_pdf_text_for_ai(pdf_path: str, page_indices: list) -> str:
     """
     Extract text from selected pages, formatted for Gemini prompt.
     One line per page: "[Page N]: text..."
+
+    Also extracts from the bottom 18% of each page (title block region) and appends
+    it as a TITLE_BLOCK suffix so Gemini sees the actual drawing title even when the
+    title block appears after MAX_CHARS_PER_PAGE characters in the body text.
     """
     doc = fitz.open(pdf_path)
     parts = []
@@ -87,6 +91,14 @@ def extract_pdf_text_for_ai(pdf_path: str, page_indices: list) -> str:
                 b["text"].strip() for b in blocks if b["text"].strip()
             )
             page_text = page_text[:MAX_CHARS_PER_PAGE]
+
+            # Clip title block region (bottom 18% of page) — drawing title always here
+            pr = page.rect
+            title_area = fitz.Rect(pr.x0, pr.y0 + pr.height * 0.82, pr.x1, pr.y1)
+            title_clip = page.get_text("text", clip=title_area).strip()
+            if title_clip and title_clip.upper() not in page_text.upper():
+                page_text += " | TITLE_BLOCK: " + title_clip[:300]
+
             parts.append(f"[Page {idx + 1}]: {page_text}")
     finally:
         doc.close()
@@ -265,14 +277,20 @@ def _extract_page_level_map(pdf_path: str, page_indices: list) -> dict:
         for idx in page_indices:
             if idx >= doc.page_count:
                 continue
-            full_text = doc[idx].get_text("text").upper()
+            page = doc[idx]
+            full_text = page.get_text("text").upper()
 
             if any(kw in full_text for kw in _COVER_KEYWORDS):
                 continue
 
-            all_levels = re.findall(
-                r"LEVEL\s+0*(\d+)\s+(?:OUTLINE|FLOOR|SLAB|PART)\s*PLAN", full_text
-            )
+            # Search title block clip first (fast, precise) then full page as fallback
+            pr = page.rect
+            title_area = fitz.Rect(pr.x0, pr.y0 + pr.height * 0.82, pr.x1, pr.y1)
+            title_text = page.get_text("text", clip=title_area).upper()
+            search_text = title_text if title_text.strip() else full_text
+
+            _LEVEL_PLAN_RE = r"LEVEL\s+0*(\d+)\s+(?:OUTLINE|FLOOR|SLAB|PART|GA)\s*PLAN"
+            all_levels = re.findall(_LEVEL_PLAN_RE, search_text)
             unique_levels = set(all_levels)
             if len(unique_levels) > 1:
                 continue
