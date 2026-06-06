@@ -97,7 +97,7 @@ def extract_pdf_text_for_ai(pdf_path: str, page_indices: list) -> str:
             title_area = fitz.Rect(pr.x0, pr.y0 + pr.height * 0.82, pr.x1, pr.y1)
             title_clip = page.get_text("text", clip=title_area).strip()
             if title_clip and title_clip.upper() not in page_text.upper():
-                page_text += " | TITLE_BLOCK: " + title_clip[:300]
+                page_text += " | TITLE_BLOCK: " + title_clip  # no truncation — title block can appear late
 
             parts.append(f"[Page {idx + 1}]: {page_text}")
     finally:
