@@ -148,6 +148,12 @@ RULES:
 - detection_confidence: "high" (clear keywords), "medium" (inferred), or "low" (guessed).
 - If no clear floor plans are found, set buildings to [] and total_unique_floors to 0.
 - If no building separation is evident, use a single building named after the project.
+- MULTI-BUILDING RULE: If a floor level has both an OVERALL plan (title contains "OVERALL") \
+  AND per-building plans (title contains "BUILDING A", "BUILDING B", etc.), you MUST list \
+  the per-building plans in slab_plan_pages — NOT the OVERALL plan. \
+  The OVERALL plan shows all buildings at reduced scale and is unsuitable for slab geometry. \
+  Each building entry must reference its own specific page \
+  (e.g., Building A → "GA PLAN - BUILDING A", Building B → "GA PLAN - BUILDING B").
 """
 
 
@@ -233,6 +239,7 @@ _EXCLUDE_TITLE_KEYWORDS = [
     "SEISMIC", "REINFORCEMENT", "STEEL MARKING", "MARKING PLAN",
     "SECTION", "ELEVATION", "DETAIL", "SCHEDULE", "RETENTION",
     "FOOTING", "PILE", "CONNECTION", "SETTING OUT",
+    "- OVERALL", "PLAN - OVERALL",   # overall plans mix all buildings at reduced scale
 ]
 
 
@@ -430,6 +437,76 @@ def _add_missing_floors_from_map(parsed: dict, page_level_map: dict) -> dict:
     return parsed
 
 
+def _expand_overall_to_building_pages(parsed: dict, pdf_path: str, page_indices: list) -> dict:
+    """
+    For multi-building PDFs: replace OVERALL pages with the per-building GA plan pages.
+
+    Pattern: page N = "GROUND LEVEL PLAN - OVERALL"
+             page N+1 = "CARPARK B2 GA PLAN - BUILDING A"
+             page N+2 = "CARPARK GA PLAN - BUILDING B"  ...
+
+    For each building in parsed, if a floor's page is an OVERALL page, scan the next
+    8 pages for one containing "BUILDING <letter>" and use that instead.
+    Only applies when building name contains "BUILDING A/B/C/D".
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Cache full text for all pages in page_indices
+    page_texts: dict = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for idx in page_indices:
+            if idx < doc.page_count:
+                page_texts[idx + 1] = doc[idx].get_text("text").upper()
+    finally:
+        doc.close()
+
+    # Identify which pages are OVERALL pages (their text contains "PLAN - OVERALL" or "- OVERALL")
+    overall_pages = {
+        pg for pg, text in page_texts.items()
+        if "- OVERALL" in text or re.search(r"PLAN\s*[-–]\s*OVERALL", text)
+    }
+
+    if not overall_pages:
+        return parsed  # single-building or no OVERALL pages
+
+    for bld in parsed.get("buildings", []):
+        bld_name = bld.get("name", "").upper()
+        m_letter = re.search(r"BUILDING\s+([A-Z])", bld_name)
+        if not m_letter:
+            continue  # not a named building (e.g., single-building project)
+        bld_letter = m_letter.group(1)
+
+        for fl in bld.get("floors", []):
+            new_pages = []
+            for pg in fl.get("slab_plan_pages", []):
+                if pg not in overall_pages:
+                    new_pages.append(pg)
+                    continue
+                # pg is OVERALL — find per-building replacement
+                found = None
+                for candidate in range(pg + 1, pg + 9):
+                    text = page_texts.get(candidate, "")
+                    if f"BUILDING {bld_letter}" in text:
+                        found = candidate
+                        logger.info(
+                            f"  {bld.get('name')} {fl.get('level_id')}: "
+                            f"OVERALL page {pg} → per-building page {candidate}"
+                        )
+                        break
+                if found:
+                    new_pages.append(found)
+                else:
+                    logger.warning(
+                        f"  {bld.get('name')} {fl.get('level_id')}: "
+                        f"OVERALL page {pg} removed, no BUILDING {bld_letter} found nearby"
+                    )
+            fl["slab_plan_pages"] = sorted(set(new_pages))
+
+    return parsed
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def analyze_floor_structure(
@@ -475,12 +552,13 @@ def analyze_floor_structure(
             f"Gemini returned unparseable JSON.\nFirst 300 chars:\n{raw_text[:300]}"
         )
 
-    # 3b. Post-processing: validate titles → filter non-outline pages → override with PDF ground truth
+    # 3b. Post-processing pipeline
     parsed = _validate_page_titles(parsed)
-    parsed = _filter_non_outline_pages(parsed)
+    parsed = _filter_non_outline_pages(parsed)                              # remove seismic/steel/OVERALL pages
+    parsed = _expand_overall_to_building_pages(parsed, pdf_path, page_indices)  # OVERALL → per-building
     if page_level_map:
-        parsed = _rebuild_floor_pages_from_map(parsed, page_level_map)
-        parsed = _add_missing_floors_from_map(parsed, page_level_map)
+        parsed = _rebuild_floor_pages_from_map(parsed, page_level_map)     # correct wrong level assignments
+        parsed = _add_missing_floors_from_map(parsed, page_level_map)      # create floors Gemini missed
 
     # 4. Flatten all slab_plan_pages → 0-indexed pages_to_process
     all_1idx: set = set()
