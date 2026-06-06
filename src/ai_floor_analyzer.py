@@ -236,25 +236,44 @@ _EXCLUDE_TITLE_KEYWORDS = [
 ]
 
 
-def _extract_page_level_map(page_texts: str) -> dict:
+_COVER_KEYWORDS = [
+    "COVER SHEET", "STRUCTURAL DRAWING LIST",
+    "SHEET INDEX", "DRAWING REGISTER", "DRAWING LIST",
+]
+
+
+def _extract_page_level_map(pdf_path: str, page_indices: list) -> dict:
     """
-    Parse the '[Page N]: text...' string and search each page for a drawing title
-    that includes a level number, e.g. 'LEVEL 02 OUTLINE PLAN'.
+    Read full text (no truncation) from each PDF page and search for a drawing title
+    matching 'LEVEL XX OUTLINE/FLOOR/SLAB/PART PLAN'.
     Returns {1-indexed page number: level_number (int)} — ground truth from PDF content.
-    Gemini reads the drawing index (TOC), so this is the authoritative override.
+
+    Two guards prevent false matches from drawing index / cover sheet pages:
+      Guard 1 — skip pages containing cover/index keywords (drawing list pages)
+      Guard 2 — skip pages that list multiple different levels (= TOC)
     """
     page_level_map: dict = {}
-    for line in page_texts.splitlines():
-        m_page = re.match(r"\[Page (\d+)\]:\s*(.*)", line)
-        if not m_page:
-            continue
-        page_num = int(m_page.group(1))
-        text = m_page.group(2)
-        m_level = re.search(
-            r"LEVEL\s+0*(\d+)\s+(?:OUTLINE|FLOOR|SLAB|PART)\s*PLAN", text.upper()
-        )
-        if m_level:
-            page_level_map[page_num] = int(m_level.group(1))
+    doc = fitz.open(pdf_path)
+    try:
+        for idx in page_indices:
+            if idx >= doc.page_count:
+                continue
+            full_text = doc[idx].get_text("text").upper()
+
+            if any(kw in full_text for kw in _COVER_KEYWORDS):
+                continue
+
+            all_levels = re.findall(
+                r"LEVEL\s+0*(\d+)\s+(?:OUTLINE|FLOOR|SLAB|PART)\s*PLAN", full_text
+            )
+            unique_levels = set(all_levels)
+            if len(unique_levels) > 1:
+                continue
+
+            if unique_levels:
+                page_level_map[idx + 1] = int(next(iter(unique_levels)))
+    finally:
+        doc.close()
     return page_level_map
 
 
@@ -286,15 +305,23 @@ def _filter_non_outline_pages(parsed: dict) -> dict:
     return parsed
 
 
-def _override_with_page_level_map(parsed: dict, page_level_map: dict) -> dict:
+def _rebuild_floor_pages_from_map(parsed: dict, page_level_map: dict) -> dict:
     """
-    For each page in slab_plan_pages: if page_level_map says the page belongs to
-    level X but Gemini assigned it to level Y → move it to the correct floor.
-    page_level_map is extracted from actual PDF page text (not Gemini's output),
-    so it overrides Gemini's drawing-list-based assignments.
+    Rebuild slab_plan_pages for every floor using page_level_map as ground truth.
+
+    Algorithm:
+    - Pages in page_level_map: assigned exclusively to the floor matching their
+      actual PDF title (no duplicates possible — one page, one floor).
+    - Pages NOT in page_level_map: kept from Gemini's assignment, but de-duplicated
+      across floors (first floor that claims the page wins).
+    - Floors that end up with 0 pages after filtering are recovered from
+      page_level_map entries not yet assigned to any floor.
     """
     import logging
     logger = logging.getLogger(__name__)
+
+    if not page_level_map:
+        return parsed
 
     for bld in parsed.get("buildings", []):
         floors = bld.get("floors", [])
@@ -304,29 +331,40 @@ def _override_with_page_level_map(parsed: dict, page_level_map: dict) -> dict:
             if m:
                 num_to_floor[int(m.group(1))] = fl
 
-        for fl in floors:
-            fl_m = re.search(r"(\d+)", fl.get("level_id", ""))
-            if not fl_m:
-                continue
-            fl_num = int(fl_m.group(1))
+        map_pages = set(page_level_map.keys())
+        gemini_claimed: set = set()  # tracks pages already given to a floor via Gemini fallback
 
-            pages = fl.get("slab_plan_pages", [])
-            keep_pages = []
-            for pg in pages:
-                if pg in page_level_map:
-                    true_level = page_level_map[pg]
-                    if true_level != fl_num:
-                        correct = num_to_floor.get(true_level)
-                        if correct and correct is not fl:
-                            logger.warning(
-                                f"  Page {pg}: PDF title=LEVEL {true_level}, "
-                                f"Gemini→{fl.get('level_id')} "
-                                f"→ corrected to {correct.get('level_id')}"
-                            )
-                            correct.setdefault("slab_plan_pages", []).append(pg)
-                            continue
-                keep_pages.append(pg)
-            fl["slab_plan_pages"] = keep_pages
+        for fl in floors:
+            m = re.search(r"(\d+)", fl.get("level_id", ""))
+            if not m:
+                continue
+            fl_num = int(m.group(1))
+
+            # Verified pages: those whose PDF title matches this floor
+            verified = sorted(pg for pg, lv in page_level_map.items() if lv == fl_num)
+            for pg in verified:
+                if pg != fl_num and pg not in (fl.get("slab_plan_pages") or []):
+                    orig_floor = next(
+                        (f.get("level_id") for f in floors
+                         if pg in f.get("slab_plan_pages", []) and f is not fl),
+                        None
+                    )
+                    if orig_floor:
+                        logger.warning(
+                            f"  Page {pg}: PDF title=LEVEL {fl_num}, "
+                            f"moved from {orig_floor} → {fl.get('level_id')}"
+                        )
+
+            # Unverified pages: Gemini assigned, not in page_level_map, not yet claimed
+            gemini_pages = fl.get("slab_plan_pages", [])
+            unverified = [
+                pg for pg in gemini_pages
+                if pg not in map_pages and pg not in gemini_claimed
+            ]
+            gemini_claimed.update(unverified)
+
+            final = sorted(set(verified) | set(unverified))
+            fl["slab_plan_pages"] = final
 
     return parsed
 
@@ -359,8 +397,8 @@ def analyze_floor_structure(
     # 1. Extract page texts
     page_texts = extract_pdf_text_for_ai(pdf_path, page_indices)
 
-    # 1b. Build ground-truth page→level map directly from PDF text (before Gemini)
-    page_level_map = _extract_page_level_map(page_texts)
+    # 1b. Build ground-truth page→level map using full PDF text (not truncated page_texts)
+    page_level_map = _extract_page_level_map(pdf_path, page_indices)
 
     # 2. Build prompt and call Gemini
     prompt = _PROMPT.format(page_texts=page_texts)
@@ -380,7 +418,7 @@ def analyze_floor_structure(
     parsed = _validate_page_titles(parsed)
     parsed = _filter_non_outline_pages(parsed)
     if page_level_map:
-        parsed = _override_with_page_level_map(parsed, page_level_map)
+        parsed = _rebuild_floor_pages_from_map(parsed, page_level_map)
 
     # 4. Flatten all slab_plan_pages → 0-indexed pages_to_process
     all_1idx: set = set()
