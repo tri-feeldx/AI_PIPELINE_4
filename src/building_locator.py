@@ -176,7 +176,7 @@ def _is_ambiguous(name_to_idx: dict, building_names: list[str]) -> bool:
 
 # ── Step 2b: Gemini Vision fallback ───────────────────────────────────────────
 
-_VISION_MAX_PX = 2048   # longest edge cap for Gemini Vision input
+_VISION_MAX_PX = 4096   # longest edge cap for Gemini Vision input
 
 
 def _gemini_vision_fallback(
@@ -185,49 +185,65 @@ def _gemini_vision_fallback(
     building_names: list[str],
     page_width_pt: float,
     page_height_pt: float,
+    candidates: list = None,
 ) -> dict:
     """
-    Render the site plan page and ask Gemini Vision to locate each building.
-    Returns {name: Polygon} in PDF coordinate space (points).
+    Hybrid fallback using Gemini Vision:
+      1. Ask Gemini where each building LABEL text is located (pixel coordinate).
+      2. Convert label pixel → PDF point, then assign the nearest/containing PDF polygon.
+      3. If no PDF polygon found for a building, fall back to Gemini's bbox_px rectangle.
+
+    This is more accurate than asking Gemini to draw bboxes directly, because
+    Gemini reliably reads text positions but struggles with tight footprint geometry.
     """
-    # Cap resolution so the longest edge <= _VISION_MAX_PX
     longest_pt = max(page_width_pt, page_height_pt)
     dpi = min(150, int(_VISION_MAX_PX / longest_pt * 72))
-    dpi = max(dpi, 48)   # floor at 48 DPI so tiny pages still render legibly
+    dpi = max(dpi, 48)
     scale = dpi / 72.0
     print(f"[building_locator] Vision render: {dpi} DPI  (scale={scale:.2f})")
 
-    # Render page to PNG bytes
     doc = fitz.open(pdf_path)
     page = doc[location_page - 1]
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
     doc.close()
 
     img_bytes = pix.tobytes("png")
     img_w, img_h = pix.width, pix.height
     names_str = ", ".join(building_names)
 
-    prompt = (
-        f"This is a structural engineering SITE PLAN showing buildings: {names_str}.\n\n"
-        "For each building label visible in the image, provide a tight bounding box "
-        "around the BUILDING FOOTPRINT (the filled/outlined shape representing the "
-        "floor area of that building) — not just the text label itself.\n\n"
-        f"Image size: {img_w} x {img_h} pixels (width x height). "
-        "Coordinates are in pixels measured from the top-left corner.\n\n"
-        "Respond ONLY with JSON:\n"
-        '{\n'
-        '  "buildings": [\n'
-        '    {\n'
-        '      "name": "Building A",\n'
-        '      "bbox_px": [x_min, y_min, x_max, y_max],\n'
-        '      "confidence": "high|medium|low",\n'
-        '      "found": true\n'
-        '    }\n'
-        '  ]\n'
-        '}\n\n'
-        'Set "found": false (and omit bbox_px) for any building not clearly visible.'
-    )
+    prompt = f"""This is a structural engineering SITE PLAN image.
+
+Buildings to find: {names_str}
+
+For each building, I need TWO things:
+A) LABEL POSITION: the pixel coordinate of the CENTER of the building's text label
+   (labels may be horizontal or vertical/rotated, e.g. "BUILDING A REFER TO DRAWING S100-S199")
+B) FOOTPRINT BBOX: a tight bounding box around the building's floor area shape
+   (the filled coloured shape or dashed outline that shows where the building sits on the site)
+
+Image size: {img_w} x {img_h} pixels, top-left origin.
+
+Important notes:
+- Labels are often placed OUTSIDE or BELOW the footprint shape, pointing to it
+- Labels may be written vertically (rotated 90 degrees)
+- Stage 2 / future buildings may have only a dashed outline -- still provide their bbox
+- Do NOT divide the drawing into equal strips; follow the actual shapes
+
+Respond ONLY with JSON (no markdown):
+{{
+  "reasoning": "<1-2 sentences describing the building shapes and label positions you see>",
+  "buildings": [
+    {{
+      "name": "Building A",
+      "label_px": [cx, cy],
+      "bbox_px": [x_min, y_min, x_max, y_max],
+      "confidence": "high|medium|low",
+      "found": true
+    }}
+  ]
+}}
+
+Set "found": false and omit label_px / bbox_px for buildings not visible in the image."""
 
     from google.genai import types as genai_types
     client = _get_client()
@@ -243,30 +259,62 @@ def _gemini_vision_fallback(
     raw = response.text or ""
     parsed = _parse_json_response(raw)
     if not parsed:
-        print(f"[building_locator] Vision fallback parse failed. Raw: {raw[:300]}")
+        print(f"[building_locator] Vision parse failed. Raw: {raw[:300]}")
         return {"unmatched": []}
 
+    reasoning = parsed.get("reasoning", "")
+    if reasoning:
+        print(f"[building_locator] Vision reasoning: {reasoning}")
+
     result: dict = {}
-    for bld in parsed.get("buildings", []):
-        name = bld.get("name", "")
+    bld_data = {b.get("name", ""): b for b in parsed.get("buildings", [])}
+
+    for name in building_names:
+        bld = bld_data.get(name, {})
         if not bld.get("found", True):
-            print(f"[building_locator] Vision: {name} — not found in image")
-            continue
-        bbox_px = bld.get("bbox_px")
-        if not bbox_px or len(bbox_px) != 4:
+            print(f"[building_locator] Vision: {name} - not found")
             continue
 
-        x0_px, y0_px, x1_px, y1_px = bbox_px
-        # Convert pixel → PDF points, clamped to page
-        x0 = max(0.0, min(x0_px / scale, page_width_pt))
-        y0 = max(0.0, min(y0_px / scale, page_height_pt))
-        x1 = max(0.0, min(x1_px / scale, page_width_pt))
-        y1 = max(0.0, min(y1_px / scale, page_height_pt))
-
-        poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
         conf = bld.get("confidence", "medium")
-        print(f"[building_locator] Vision: {name}  bbox_px={[int(v) for v in bbox_px]}  conf={conf}")
-        result[name] = poly
+        label_px = bld.get("label_px")
+        bbox_px = bld.get("bbox_px")
+
+        # --- Strategy A: use label position to assign a PDF polygon ---
+        matched_poly = None
+        if label_px and candidates:
+            lx_pt = label_px[0] / scale
+            ly_pt = label_px[1] / scale
+            label_pt = Point(lx_pt, ly_pt)
+
+            # Find smallest polygon that contains the label point
+            containing = [(p.area, i) for i, p in enumerate(candidates) if p.contains(label_pt)]
+            if containing:
+                best_idx = min(containing, key=lambda t: t[0])[1]
+                matched_poly = candidates[best_idx]
+            else:
+                # Nearest centroid within 500pt; beyond that use bbox fallback
+                nearest_idx = min(range(len(candidates)),
+                                  key=lambda i: candidates[i].centroid.distance(label_pt))
+                dist = candidates[nearest_idx].centroid.distance(label_pt)
+                if dist < 500:
+                    matched_poly = candidates[nearest_idx]
+
+        if matched_poly is not None:
+            print(f"[building_locator] Vision+polygon: {name}  label_px={label_px}  "
+                  f"poly_area={matched_poly.area:.0f}  conf={conf}")
+            result[name] = matched_poly
+            continue
+
+        # --- Strategy B: use Gemini bbox rectangle directly ---
+        if bbox_px and len(bbox_px) == 4:
+            x0_px, y0_px, x1_px, y1_px = bbox_px
+            x0 = max(0.0, min(x0_px / scale, page_width_pt))
+            y0 = max(0.0, min(y0_px / scale, page_height_pt))
+            x1 = max(0.0, min(x1_px / scale, page_width_pt))
+            y1 = max(0.0, min(y1_px / scale, page_height_pt))
+            poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+            print(f"[building_locator] Vision bbox: {name}  bbox_px={bbox_px}  conf={conf}")
+            result[name] = poly
 
     result["unmatched"] = []
     return result
@@ -317,8 +365,9 @@ def extract_building_polygons(
 
     if not candidates:
         print("[building_locator] No polygon candidates — using Vision fallback")
-        result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h)
+        result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h, [])
         result["_method"] = "vision"
+        save_debug_outputs(pdf_path, location_page, result)
         return result
 
     result, name_to_idx = _match_polygons_to_buildings(candidates, text_blocks, building_names)
@@ -330,8 +379,9 @@ def extract_building_polygons(
             f"[building_locator] Polygon match ambiguous "
             f"({matched} buildings -> {unique} unique polygons) -- using Vision fallback"
         )
-        vision_result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h)
+        vision_result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h, candidates)
         vision_result["_method"] = "vision"
+        save_debug_outputs(pdf_path, location_page, vision_result)
         return vision_result
 
     # Polygon match succeeded
@@ -340,6 +390,7 @@ def extract_building_polygons(
     result["unmatched"] = unmatched
     result["_method"] = "polygon"
     print(f"[building_locator] Polygon match: {len(name_to_idx)}/{len(building_names)} buildings matched")
+    save_debug_outputs(pdf_path, location_page, result)
     return result
 
 
@@ -407,6 +458,84 @@ def render_building_polygons(
     print(f"[building_locator] Saved: {output_path}")
 
 
+# ── Debug output ──────────────────────────────────────────────────────────────
+
+def save_debug_outputs(
+    pdf_path: str,
+    location_page: int,
+    building_polygons: dict,
+    debug_dir: str = "debug_ai",
+) -> None:
+    """
+    Save three debug artifacts to debug_dir/:
+      - building_location_page.png   raw site plan page (no overlay)
+      - building_location_result.png site plan + colored polygon overlay
+      - building_location.json       JSON summary with polygon coordinates
+    """
+    import json
+    from datetime import datetime
+    from pathlib import Path
+
+    Path(debug_dir).mkdir(exist_ok=True)
+    pdf_name = Path(pdf_path).name
+
+    # Compute render scale (same cap as vision: longest edge <= 4096px)
+    doc = fitz.open(pdf_path)
+    page = doc[location_page - 1]
+    longest_pt = max(page.rect.width, page.rect.height)
+    doc.close()
+    dpi = max(72, min(150, int(4096 / longest_pt * 72)))
+    scale = dpi / 72.0
+
+    # 1. Raw page PNG
+    doc = fitz.open(pdf_path)
+    page = doc[location_page - 1]
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    doc.close()
+    raw_path = f"{debug_dir}/building_location_page.png"
+    pix.save(raw_path)
+
+    # 2. Overlay PNG
+    result_path = f"{debug_dir}/building_location_result.png"
+    render_building_polygons(pdf_path, location_page, building_polygons, result_path, dpi=dpi)
+
+    # 3. JSON summary
+    buildings_out = []
+    for name, poly in building_polygons.items():
+        if name in ("unmatched", "_method"):
+            continue
+        if hasattr(poly, "exterior"):
+            pts = [[round(x, 1), round(y, 1)] for x, y in poly.exterior.coords]
+            c = poly.centroid
+            b = poly.bounds
+            buildings_out.append({
+                "name": name,
+                "found": True,
+                "polygon_pts": pts,
+                "area_pt2": round(poly.area, 1),
+                "centroid": [round(c.x, 1), round(c.y, 1)],
+                "bbox": [round(b[0], 1), round(b[1], 1), round(b[2], 1), round(b[3], 1)],
+            })
+        else:
+            buildings_out.append({"name": name, "found": False})
+
+    summary = {
+        "pdf": pdf_name,
+        "location_page": location_page,
+        "method": building_polygons.get("_method", "unknown"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "buildings": buildings_out,
+        "unmatched_count": len(building_polygons.get("unmatched", [])),
+    }
+    json_path = f"{debug_dir}/building_location.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print(f"[building_locator] Debug: {raw_path}")
+    print(f"[building_locator] Debug: {result_path}")
+    print(f"[building_locator] Debug: {json_path}")
+
+
 # ── Standalone test ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -442,12 +571,9 @@ if __name__ == "__main__":
                 continue
             if hasattr(poly, "area"):
                 c = poly.centroid
-                print(f"  {name}: area={poly.area:.0f} pt²  centroid=({c.x:.0f}, {c.y:.0f})")
+                print(f"  {name}: area={poly.area:.0f} pt2  centroid=({c.x:.0f}, {c.y:.0f})")
             else:
                 print(f"  {name}: not found")
         unmatched = polys.get("unmatched", [])
         print(f"  unmatched: {len(unmatched)} polygon(s)")
-
-        out = str(pathlib.Path(pdf).with_name("building_location_check.png"))
-        render_building_polygons(pdf, pg, polys, out, dpi=150)
-        print(f"\nCheck the image: {out}")
+        print("\nDebug files saved to: debug_ai/")
