@@ -4,7 +4,8 @@ Building location detection from structural PDF site plans.
 Pipeline:
   1. find_location_page()  — ask Gemini which page is the site/location plan
   2. extract_building_polygons() — detect filled polygon per building on that page,
-     matched to building names by proximity to text labels
+     matched to building names by proximity to text labels.
+     Falls back to Gemini Vision if polygon matching is ambiguous.
 """
 
 import pathlib
@@ -15,8 +16,6 @@ _project_root = str(pathlib.Path(__file__).parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import json
-import math
 import re
 from typing import Optional
 
@@ -42,8 +41,7 @@ def find_location_page(
 ) -> Optional[int]:
     """
     Ask Gemini which page contains the site plan / location plan.
-
-    Returns 1-indexed page number, or None if not found / low confidence.
+    Returns 1-indexed page number, or None if not found.
     """
     page_texts = extract_pdf_text_for_ai(pdf_path, page_indices)
     names_str = ", ".join(building_names)
@@ -67,10 +65,9 @@ Respond ONLY with JSON (no markdown, no explanation):
   "notes": "<one sentence explaining your choice>"
 }}"""
 
+    from google.genai import types as genai_types
     client = _get_client()
     model = _get_model_name()
-
-    from google.genai import types as genai_types
     response = client.models.generate_content(
         model=model,
         contents=prompt,
@@ -92,74 +89,34 @@ Respond ONLY with JSON (no markdown, no explanation):
     if page is None:
         return None
     if confidence == "low":
-        print("[building_locator] Low confidence — returning result but treat with caution")
-
+        print("[building_locator] Low confidence — treat result with caution")
     return int(page)
 
 
-# ── Step 2: extract building polygons ─────────────────────────────────────────
+# ── Step 2a: polygon-based matching ───────────────────────────────────────────
 
-# Polygon must be > 1% of page area — filters out text label boxes and tiny annotations.
-# Building footprints on a site plan are always a significant fraction of the page.
+# 1% of page area minimum — excludes text label boxes (~5000 pt²) while keeping
+# building footprints (typically 50,000–600,000 pt² on a site plan).
 _MIN_AREA_FRACTION = 0.01
-_MAX_AREA_FRACTION = 0.90    # skip full-page border
+_MAX_AREA_FRACTION = 0.90
 
 
-def extract_building_polygons(
-    pdf_path: str,
-    location_page: int,
+def _match_polygons_to_buildings(
+    candidates: list[Polygon],
+    text_blocks: list[dict],
     building_names: list[str],
-) -> dict:
+) -> tuple[dict, dict]:
     """
-    From the site plan page, extract one Shapely Polygon per building.
-
-    Returns dict:
-      {
-        "Building A": Polygon(...),   # PDF coordinate space (points)
-        "Building B": Polygon(...),
-        ...
-        "unmatched": [Polygon, ...]   # polygons with no nearby building label
-      }
+    Match building names to candidate polygons via label proximity.
+    Returns (result_dict, name_to_idx) where result_dict = {name: Polygon}
+    and name_to_idx = {name: candidate_index} (used for ambiguity check).
     """
-    doc = fitz.open(pdf_path)
-    page_idx = location_page - 1   # convert to 0-indexed
-    if page_idx < 0 or page_idx >= doc.page_count:
-        doc.close()
-        raise ValueError(f"location_page={location_page} out of range (doc has {doc.page_count} pages)")
-
-    page = doc[page_idx]
-    page_area = page.rect.width * page.rect.height
-    min_area = page_area * _MIN_AREA_FRACTION
-    max_area = page_area * _MAX_AREA_FRACTION
-
-    drawings = page.get_drawings()
-    all_pairs = build_polygons_from_drawings(drawings)   # list[(Polygon, color)]
-
-    # Filter by area — keep candidates large enough to be building footprints
-    candidates = [
-        poly for poly, _color in all_pairs
-        if min_area <= poly.area <= max_area
-    ]
-
-    # Get text blocks with their bounding boxes
-    text_blocks = extract_text_blocks(page)
-    doc.close()
-
-    if not candidates:
-        return {"unmatched": []}
-
-    # Match building names to polygons
-    result = {}
-    matched_poly_indices = set()
-
-    # Normalise building names for matching: "Building A" → "BUILDING A" etc.
     name_patterns = {
         name: re.compile(re.escape(name.upper()))
         for name in building_names
     }
 
-    # For each text block, collect label positions
-    label_points: list[tuple[str, float, float]] = []  # (name, cx, cy)
+    label_points: list[tuple[str, float, float]] = []
     for block in text_blocks:
         text_upper = block["text"].strip().upper()
         for name, pattern in name_patterns.items():
@@ -168,18 +125,17 @@ def extract_building_polygons(
                 cx = (bbox[0] + bbox[2]) / 2
                 cy = (bbox[1] + bbox[3]) / 2
                 label_points.append((name, cx, cy))
-                break  # each block → first matching name
+                break
 
-    # For each building name, find best polygon.
-    # Strategy: among polygons that *contain* the label point, pick the smallest
-    # (actual building footprint, not the larger site boundary that encloses everything).
-    # If no polygon contains the label, fall back to nearest centroid distance.
+    result: dict = {}
+    name_to_idx: dict = {}
+
     for name in building_names:
         pts = [(cx, cy) for n, cx, cy in label_points if n == name]
         if not pts:
             continue
 
-        containing: list[tuple[float, int]] = []   # (area, idx) for polys containing label
+        containing: list[tuple[float, int]] = []
         nearest_idx = None
         nearest_dist = float("inf")
 
@@ -202,30 +158,202 @@ def extract_building_polygons(
 
         if best_idx is not None:
             result[name] = candidates[best_idx]
-            matched_poly_indices.add(best_idx)
+            name_to_idx[name] = best_idx
 
-    # Collect unmatched polygons
-    unmatched = [
-        candidates[i] for i in range(len(candidates))
-        if i not in matched_poly_indices
-    ]
+    return result, name_to_idx
+
+
+def _is_ambiguous(name_to_idx: dict, building_names: list[str]) -> bool:
+    """True if multiple buildings mapped to the same polygon, or too few matched."""
+    matched = [name for name in building_names if name in name_to_idx]
+    unique_polys = len(set(name_to_idx.values()))
+    if unique_polys < len(matched):
+        return True  # collisions
+    if len(matched) < max(1, len(building_names) // 2):
+        return True  # too few buildings found
+    return False
+
+
+# ── Step 2b: Gemini Vision fallback ───────────────────────────────────────────
+
+_VISION_MAX_PX = 2048   # longest edge cap for Gemini Vision input
+
+
+def _gemini_vision_fallback(
+    pdf_path: str,
+    location_page: int,
+    building_names: list[str],
+    page_width_pt: float,
+    page_height_pt: float,
+) -> dict:
+    """
+    Render the site plan page and ask Gemini Vision to locate each building.
+    Returns {name: Polygon} in PDF coordinate space (points).
+    """
+    # Cap resolution so the longest edge <= _VISION_MAX_PX
+    longest_pt = max(page_width_pt, page_height_pt)
+    dpi = min(150, int(_VISION_MAX_PX / longest_pt * 72))
+    dpi = max(dpi, 48)   # floor at 48 DPI so tiny pages still render legibly
+    scale = dpi / 72.0
+    print(f"[building_locator] Vision render: {dpi} DPI  (scale={scale:.2f})")
+
+    # Render page to PNG bytes
+    doc = fitz.open(pdf_path)
+    page = doc[location_page - 1]
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    doc.close()
+
+    img_bytes = pix.tobytes("png")
+    img_w, img_h = pix.width, pix.height
+    names_str = ", ".join(building_names)
+
+    prompt = (
+        f"This is a structural engineering SITE PLAN showing buildings: {names_str}.\n\n"
+        "For each building label visible in the image, provide a tight bounding box "
+        "around the BUILDING FOOTPRINT (the filled/outlined shape representing the "
+        "floor area of that building) — not just the text label itself.\n\n"
+        f"Image size: {img_w} x {img_h} pixels (width x height). "
+        "Coordinates are in pixels measured from the top-left corner.\n\n"
+        "Respond ONLY with JSON:\n"
+        '{\n'
+        '  "buildings": [\n'
+        '    {\n'
+        '      "name": "Building A",\n'
+        '      "bbox_px": [x_min, y_min, x_max, y_max],\n'
+        '      "confidence": "high|medium|low",\n'
+        '      "found": true\n'
+        '    }\n'
+        '  ]\n'
+        '}\n\n'
+        'Set "found": false (and omit bbox_px) for any building not clearly visible.'
+    )
+
+    from google.genai import types as genai_types
+    client = _get_client()
+    model = _get_model_name()
+
+    image_part = genai_types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+    response = client.models.generate_content(
+        model=model,
+        contents=[image_part, prompt],
+        config=genai_types.GenerateContentConfig(temperature=0.0),
+    )
+
+    raw = response.text or ""
+    parsed = _parse_json_response(raw)
+    if not parsed:
+        print(f"[building_locator] Vision fallback parse failed. Raw: {raw[:300]}")
+        return {"unmatched": []}
+
+    result: dict = {}
+    for bld in parsed.get("buildings", []):
+        name = bld.get("name", "")
+        if not bld.get("found", True):
+            print(f"[building_locator] Vision: {name} — not found in image")
+            continue
+        bbox_px = bld.get("bbox_px")
+        if not bbox_px or len(bbox_px) != 4:
+            continue
+
+        x0_px, y0_px, x1_px, y1_px = bbox_px
+        # Convert pixel → PDF points, clamped to page
+        x0 = max(0.0, min(x0_px / scale, page_width_pt))
+        y0 = max(0.0, min(y0_px / scale, page_height_pt))
+        x1 = max(0.0, min(x1_px / scale, page_width_pt))
+        y1 = max(0.0, min(y1_px / scale, page_height_pt))
+
+        poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        conf = bld.get("confidence", "medium")
+        print(f"[building_locator] Vision: {name}  bbox_px={[int(v) for v in bbox_px]}  conf={conf}")
+        result[name] = poly
+
+    result["unmatched"] = []
+    return result
+
+
+# ── Step 2 (public): extract building polygons ─────────────────────────────────
+
+def extract_building_polygons(
+    pdf_path: str,
+    location_page: int,
+    building_names: list[str],
+) -> dict:
+    """
+    From the site plan page, extract one Shapely Polygon per building.
+
+    First tries polygon-based matching (fast, deterministic).
+    If matching is ambiguous (buildings share a polygon), automatically falls back
+    to Gemini Vision which reads the rendered page image.
+
+    Returns:
+      {
+        "Building A": Polygon(...),   # PDF coordinate space (points)
+        "Building B": Polygon(...),
+        ...
+        "unmatched": [Polygon, ...],  # polygons with no label match
+        "_method": "polygon" | "vision",
+      }
+    """
+    doc = fitz.open(pdf_path)
+    page_idx = location_page - 1
+    if page_idx < 0 or page_idx >= doc.page_count:
+        doc.close()
+        raise ValueError(f"location_page={location_page} out of range ({doc.page_count} pages)")
+
+    page = doc[page_idx]
+    page_w = page.rect.width
+    page_h = page.rect.height
+    page_area = page_w * page_h
+    min_area = page_area * _MIN_AREA_FRACTION
+    max_area = page_area * _MAX_AREA_FRACTION
+
+    drawings = page.get_drawings()
+    all_pairs = build_polygons_from_drawings(drawings)
+    candidates = [p for p, _ in all_pairs if min_area <= p.area <= max_area]
+
+    text_blocks = extract_text_blocks(page)
+    doc.close()
+
+    if not candidates:
+        print("[building_locator] No polygon candidates — using Vision fallback")
+        result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h)
+        result["_method"] = "vision"
+        return result
+
+    result, name_to_idx = _match_polygons_to_buildings(candidates, text_blocks, building_names)
+
+    if _is_ambiguous(name_to_idx, building_names):
+        matched = len(name_to_idx)
+        unique = len(set(name_to_idx.values()))
+        print(
+            f"[building_locator] Polygon match ambiguous "
+            f"({matched} buildings -> {unique} unique polygons) -- using Vision fallback"
+        )
+        vision_result = _gemini_vision_fallback(pdf_path, location_page, building_names, page_w, page_h)
+        vision_result["_method"] = "vision"
+        return vision_result
+
+    # Polygon match succeeded
+    matched_indices = set(name_to_idx.values())
+    unmatched = [candidates[i] for i in range(len(candidates)) if i not in matched_indices]
     result["unmatched"] = unmatched
-
+    result["_method"] = "polygon"
+    print(f"[building_locator] Polygon match: {len(name_to_idx)}/{len(building_names)} buildings matched")
     return result
 
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 
-# Colors for up to 8 buildings: (R, G, B) 0–255
 _BUILDING_COLORS = [
-    (255, 80, 80),    # red
-    (80, 160, 255),   # blue
-    (80, 220, 80),    # green
-    (255, 200, 50),   # yellow
-    (200, 80, 255),   # purple
-    (255, 140, 40),   # orange
-    (40, 220, 220),   # cyan
-    (255, 80, 180),   # pink
+    (255, 80,  80),    # red
+    (80,  160, 255),   # blue
+    (80,  220, 80),    # green
+    (255, 200, 50),    # yellow
+    (200, 80,  255),   # purple
+    (255, 140, 40),    # orange
+    (40,  220, 220),   # cyan
+    (255, 80,  180),   # pink
 ]
 
 
@@ -236,51 +364,44 @@ def render_building_polygons(
     output_path: str,
     dpi: int = 150,
 ) -> None:
-    """
-    Render the site plan page with building polygons overlaid as colored outlines.
-    Saves a PNG to output_path.
-    """
+    """Render site plan page with building polygons overlaid. Saves PNG."""
     from PIL import Image, ImageDraw, ImageFont
 
     doc = fitz.open(pdf_path)
     page = doc[location_page - 1]
-
     scale = dpi / 72.0
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
     doc.close()
 
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     draw = ImageDraw.Draw(img, "RGBA")
 
-    names = [k for k in building_polygons if k != "unmatched"]
+    try:
+        font = ImageFont.truetype("arial.ttf", 22)
+    except Exception:
+        font = ImageFont.load_default()
+
+    names = [k for k in building_polygons if k not in ("unmatched", "_method")]
     for idx, name in enumerate(names):
         poly = building_polygons.get(name)
         if poly is None or not hasattr(poly, "exterior"):
             continue
 
         r, g, b = _BUILDING_COLORS[idx % len(_BUILDING_COLORS)]
-        fill_color = (r, g, b, 60)     # semi-transparent fill
-        outline_color = (r, g, b, 220) # solid outline
-
-        # Scale PDF coords → pixel coords
         pts = [(x * scale, y * scale) for x, y in poly.exterior.coords]
         if len(pts) >= 3:
-            draw.polygon(pts, fill=fill_color)
-            draw.line(pts + [pts[0]], fill=outline_color, width=3)
+            draw.polygon(pts, fill=(r, g, b, 55))
+            draw.line(pts + [pts[0]], fill=(r, g, b, 220), width=4)
 
-        # Label at centroid
         cx = poly.centroid.x * scale
         cy = poly.centroid.y * scale
-        try:
-            font = ImageFont.truetype("arial.ttf", 20)
-        except Exception:
-            font = ImageFont.load_default()
-
-        # White shadow + colored text
         for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
             draw.text((cx + dx, cy + dy), name, fill=(255, 255, 255, 220), font=font)
         draw.text((cx, cy), name, fill=(r, g, b, 255), font=font)
+
+    method = building_polygons.get("_method", "")
+    if method:
+        draw.text((10, 10), f"method: {method}", fill=(50, 50, 50, 200), font=font)
 
     img.save(output_path)
     print(f"[building_locator] Saved: {output_path}")
@@ -291,11 +412,10 @@ def render_building_polygons(
 if __name__ == "__main__":
     import sys
     import pathlib
-    # Allow `python src/building_locator.py` from project root
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
     if len(sys.argv) < 2:
-        print("Usage: python src/building_locator.py <path-to-pdf> [Building A] [Building B] ...")
+        print("Usage: python src/building_locator.py <pdf> [Building A] [Building B] ...")
         sys.exit(1)
 
     pdf = sys.argv[1]
@@ -306,28 +426,28 @@ if __name__ == "__main__":
     doc = fitz.open(pdf)
     n_pages = doc.page_count
     doc.close()
-    pages = list(range(n_pages))
 
     print(f"PDF: {pdf}  ({n_pages} pages)")
-    print(f"Buildings: {building_names}")
-    print()
+    print(f"Buildings: {building_names}\n")
 
-    pg = find_location_page(pdf, pages, building_names)
+    pg = find_location_page(pdf, list(range(n_pages)), building_names)
     print(f"\nLocation page: {pg}")
 
     if pg:
         polys = extract_building_polygons(pdf, pg, building_names)
-        print("\nBuilding polygons:")
+        method = polys.get("_method", "?")
+        print(f"\nBuilding polygons  [method={method}]:")
         for name, poly in polys.items():
-            if name == "unmatched":
-                print(f"  unmatched: {len(poly)} polygon(s)")
-            elif hasattr(poly, "area"):
-                centroid = poly.centroid
-                print(f"  {name}: area={poly.area:.0f} pt²  centroid=({centroid.x:.0f}, {centroid.y:.0f})")
+            if name in ("unmatched", "_method"):
+                continue
+            if hasattr(poly, "area"):
+                c = poly.centroid
+                print(f"  {name}: area={poly.area:.0f} pt²  centroid=({c.x:.0f}, {c.y:.0f})")
             else:
                 print(f"  {name}: not found")
+        unmatched = polys.get("unmatched", [])
+        print(f"  unmatched: {len(unmatched)} polygon(s)")
 
-        # Save visualization PNG next to the PDF
         out = str(pathlib.Path(pdf).with_name("building_location_check.png"))
         render_building_polygons(pdf, pg, polys, out, dpi=150)
         print(f"\nCheck the image: {out}")
