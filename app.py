@@ -142,6 +142,11 @@ def init_session():
         "smart_detect_done": False,
         "ai_floor_result": None,
         "ai_floor_output_path": None,
+        "ai_floor_pdf": None,
+        "vision_backend": "gemini",
+        "column_census": None,
+        "column_regions": [],
+        "foundation_regions": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -262,34 +267,50 @@ def step1_upload():
                 f'<b>{meta["creator"]}</b></div>', unsafe_allow_html=True,
             )
 
+        # ── Auto-run Gemini AI floor analysis on new upload ────────────────────
+        pdf_path = str(tmp_path)
+        if st.session_state.get("ai_floor_pdf") != pdf_path:
+            with st.spinner("Gemini AI analysing floor structure... (15-30s)"):
+                try:
+                    import fitz as _fitz_ai
+                    from src.ai_floor_analyzer import analyze_floor_structure
+                    _doc_ai = _fitz_ai.open(pdf_path)
+                    _all_pages = list(range(_doc_ai.page_count))
+                    _doc_ai.close()
+                    ai_result, ai_path = analyze_floor_structure(pdf_path, _all_pages)
+                    st.session_state["ai_floor_result"] = ai_result
+                    st.session_state["ai_floor_pdf"]    = pdf_path
+                    st.session_state["ai_floor_output_path"] = ai_path
+                    smart_res = _ai_result_to_floor_detect(ai_result, _all_pages)
+                    st.session_state["smart_detect_result"] = smart_res
+                    st.session_state["smart_detect_done"] = False
+                    slab_pages = sorted({
+                        pg - 1
+                        for b in ai_result.get("buildings", [])
+                        for f in b.get("floors", [])
+                        for pg in f.get("slab_plan_pages", [])
+                        if isinstance(pg, int)
+                    })
+                    st.session_state["selected_pages"] = slab_pages
+                except Exception as _e:
+                    st.warning(f"Gemini floor analysis failed: {_e}. Configure manually in Step 2.")
+
         st.markdown("---")
-        if st.button("Next: Select Pages →", type="primary", use_container_width=True):
+        if st.button("Next: Configure →", type="primary", use_container_width=True):
             st.session_state["step"] = 2
             _rerun()
 
 
-# ── STEP 2: Select Pages ────────────────────────────────────────────────────────
+# ── STEP 2: Configure ────────────────────────────────────────────────────────────
 def step2_select_pages():
-    st.markdown('<div class="step-header">🗂️ Step 2 — Select Floor Plan Pages</div>',
+    st.markdown("""<div class="step-header">⚙️ Step 2 — Configure Detection</div>""",
                 unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-box">'
-        'Floor plan pages have been auto-detected. '
-        'Check/uncheck to customise. Set the correct drawing scale for accurate 3D dimensions.'
-        '</div>', unsafe_allow_html=True,
-    )
 
-    page_infos = st.session_state["page_infos"]
-    if not page_infos:
-        st.error("No page information found.")
-        return
-
-    import fitz
-    from src.pdf_processor import load_pdf, get_page_thumbnail
+    page_infos = st.session_state.get("page_infos") or []
+    smart_result = st.session_state.get("smart_detect_result")
 
     # ── Scale selector ──────────────────────────────────────────────────────────
     scale_auto = next((p["scale"] for p in page_infos if p.get("scale")), None)
-
     st.markdown("#### ⚙️ Drawing Scale")
     col_s, col_hint = st.columns([1, 2])
     with col_s:
@@ -304,192 +325,63 @@ def step2_select_pages():
     with col_hint:
         if scale_auto:
             st.markdown(
-                f'<div class="success-box" style="margin-top:28px;">✅ Auto-detect scale: <b>1:{scale_auto}</b></div>',
+                f"""<div class="success-box" style="margin-top:28px;">✅ Auto-detected scale: <b>1:{scale_auto}</b></div>""",
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
-                '<div class="warn-box" style="margin-top:28px;">⚠️ Auto-detect failed — '
-                'enter manually. Check the PDF title block.</div>',
+                """<div class="warn-box" style="margin-top:28px;">⚠️ Scale not detected — enter manually from the PDF title block.</div>""",
                 unsafe_allow_html=True,
             )
 
     st.markdown("---")
-    st.markdown("#### 📄 Select Pages to Process")
 
-    doc = load_pdf(st.session_state["pdf_path"])
-    floor_plan_idxs = {p["index"] for p in page_infos if p["is_floor_plan"]}
-    current_selected = set(
-        st.session_state.get("selected_pages") or list(floor_plan_idxs)
+    # ── Vision backend ──────────────────────────────────────────────────────────
+    st.markdown("#### 👁️ Vision Backend")
+    vision_backend = st.radio(
+        "Vision LLM for slab boundary tracing",
+        ["gemini", "openai"],
+        index=0 if st.session_state.get("vision_backend", "gemini") == "gemini" else 1,
+        horizontal=True,
     )
-
-    new_selected = set()
-    cols_per_row = 5
-    rows = [page_infos[i:i+cols_per_row] for i in range(0, len(page_infos), cols_per_row)]
-
-    for row in rows:
-        cols = st.columns(cols_per_row)
-        for col, page_info in zip(cols, row):
-            with col:
-                try:
-                    thumb = get_page_thumbnail(doc[page_info["index"]], dpi=50)
-                    st.image(thumb, use_container_width=True)
-                except Exception:
-                    st.markdown("_(no preview)_")
-
-                badge = "🔵" if page_info["is_floor_plan"] else "⬜"
-                checked = st.checkbox(
-                    f'{badge} P{page_info["index"]+1}',
-                    value=page_info["index"] in current_selected,
-                    key=f"pg_{page_info['index']}",
-                )
-                title = page_info.get("title", "")
-                st.caption(title[:22] + "…" if len(title) > 22 else title or f"Page {page_info['index']+1}")
-                if checked:
-                    new_selected.add(page_info["index"])
-
-    doc.close()
-    st.session_state["selected_pages"] = sorted(new_selected)
+    st.session_state["vision_backend"] = vision_backend
 
     st.markdown("---")
-    n_sel = len(new_selected)
-    st.markdown(
-        f'<div class="{"success-box" if n_sel > 0 else "warn-box"}">'
-        f'{"✅" if n_sel > 0 else "⚠️"} <b>{n_sel} page{"s" if n_sel != 1 else ""}</b> selected for analysis.'
-        '</div>', unsafe_allow_html=True,
-    )
 
-    # ── Smart Floor Detection (AI + keyword fallback) ───────────────────────
-    if n_sel > 0:
-        st.markdown("---")
-        st.markdown("#### 🧠 AI Floor Detection")
+    # ── Detected floors summary ─────────────────────────────────────────────────
+    st.markdown("#### 🏢 Detected Floors")
+    if smart_result and smart_result.groups:
+        n_pages = len(st.session_state.get("selected_pages", []))
         st.markdown(
-            '<div class="info-box">Gemini reads all PDF text, identifies buildings/floors/FFLs, '
-            'and selects the correct pages to process (skipping sections, details, elevations).</div>',
+            f"""<div class="success-box">✅ Gemini detected <b>{smart_result.floor_count} floors</b> across <b>{n_pages} plan pages</b></div>""",
             unsafe_allow_html=True,
         )
+        rows = []
+        for g in smart_result.groups:
+            rows.append({
+                "Floor": g.floor_label,
+                "Canonical": f"Page {g.canonical_page + 1}",
+                "Supplement": ", ".join(f"P{p+1}" for p in g.supplemental_pages) or "—",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        smart_result = st.session_state.get("smart_detect_result")
-
-        col_ai, col_kw, col_reset = st.columns([2, 2, 1])
-        with col_ai:
-            if st.button("🤖 AI Analysis (Gemini)", use_container_width=True, type="primary"):
-                from src.ai_floor_analyzer import analyze_floor_structure
-                from src.floor_detector import FloorDetectResult, FloorGroup
-                with st.spinner(f"Gemini reading {n_sel} pages (~5–10 seconds)..."):
-                    try:
-                        ai_result, ai_path = analyze_floor_structure(
-                            st.session_state["pdf_path"],
-                            sorted(new_selected),
-                        )
-                        st.session_state["ai_floor_result"] = ai_result
-                        st.session_state["ai_floor_output_path"] = ai_path
-                        # Convert AI result → FloorDetectResult for step3
-                        smart_res = _ai_result_to_floor_detect(ai_result, sorted(new_selected))
-                        st.session_state["smart_detect_result"] = smart_res
-                        st.session_state["smart_detect_done"] = False
-                    except Exception as e:
-                        st.error(f"Gemini error: {e}")
-                _rerun()
-        with col_kw:
-            if st.button("🔍 Keyword detection (fast)", use_container_width=True):
-                from src.floor_detector import detect_unique_floors
-                with st.spinner(f"Scanning {n_sel} pages..."):
-                    result = detect_unique_floors(
-                        st.session_state["pdf_path"],
-                        sorted(new_selected),
+        ai_path = st.session_state.get("ai_floor_output_path")
+        if ai_path:
+            try:
+                with open(ai_path, "rb") as f:
+                    st.download_button(
+                        "📥 Download gemini_floors.json",
+                        f,
+                        file_name="gemini_floors.json",
+                        mime="application/json",
                     )
-                st.session_state["smart_detect_result"] = result
-                st.session_state["ai_floor_result"] = None
-                st.session_state["smart_detect_done"] = False
-                _rerun()
-        with col_reset:
-            if smart_result and st.button("↺ Reset", use_container_width=True):
-                st.session_state["smart_detect_result"] = None
-                st.session_state["smart_detect_done"] = False
-                st.session_state["ai_floor_result"] = None
-                st.session_state["ai_floor_output_path"] = None
-                _rerun()
-
-        # ── Show AI raw JSON for review ──────────────────────────────────
-        ai_result = st.session_state.get("ai_floor_result")
-        ai_path   = st.session_state.get("ai_floor_output_path")
-        if ai_result:
-            with st.expander("🔍 View Gemini output (raw JSON)"):
-                st.json(ai_result)
-            if ai_path:
-                try:
-                    with open(ai_path, "rb") as f:
-                        st.download_button(
-                            "📥 Download gemini_floors.json",
-                            f,
-                            file_name="gemini_floors.json",
-                            mime="application/json",
-                        )
-                except FileNotFoundError:
-                    pass
-
-        if smart_result:
-            basis_labels = {
-                "ffl": "FFL values ✅ (keyword)",
-                "title": "Title keywords ⚠️ (keyword)",
-                "all_pages": "Keyword: insufficient signal — processing all pages",
-                "ai_gemini": "Gemini AI ✅ (highest confidence)",
-                "page_type": "Page classification ✅ (keyword)",
-            }
-            basis_txt = basis_labels.get(smart_result.detection_basis, smart_result.detection_basis)
-
-            if smart_result.detection_basis == "all_pages":
-                st.markdown(
-                    f'<div class="warn-box">⚠️ {smart_result.warnings[0] if smart_result.warnings else ""}'
-                    f'<br>Basis: {basis_txt}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                n_proc = len(smart_result.pages_to_process)
-                n_skip = len(smart_result.skipped_pages)
-                st.markdown(
-                    f'<div class="success-box">✅ Detected <b>{smart_result.floor_count} floors</b> '
-                    f'— processing <b>{n_proc} pages</b>, skipping <b>{n_skip} pages</b>'
-                    f'<br><small>Basis: {basis_txt}</small></div>',
-                    unsafe_allow_html=True,
-                )
-
-                # Results table
-                import pandas as pd
-                rows = []
-                for g in smart_result.groups:
-                    rows.append({
-                        "Floor": g.floor_label,
-                        "Canonical": f"Page {g.canonical_page + 1}",
-                        "Supplement": ", ".join(f"P{p+1}" for p in g.supplemental_pages) or "—",
-                        "Skipped": ", ".join(f"P{p+1}" for p in g.skipped_pages) or "—",
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-                for w in (smart_result.warnings or []):
-                    if w:
-                        st.warning(w)
-
-            # Confirm buttons
-            st.markdown("")
-            ca, cb = st.columns(2)
-            with ca:
-                label = (f"⚡ Process {len(smart_result.pages_to_process)} pages (smart)"
-                         if smart_result.detection_basis != "all_pages"
-                         else f"Continue with all {n_sel} pages")
-                if st.button(label, type="primary", use_container_width=True):
-                    st.session_state["smart_detect_done"] = True
-                    st.session_state["slab_results"] = {}   # clear cache → re-process
-                    st.session_state["step"] = 3
-                    _rerun()
-            with cb:
-                if smart_result.detection_basis != "all_pages":
-                    if st.button(f"Use all {n_sel} pages (skip smart mode)", use_container_width=True):
-                        st.session_state["smart_detect_done"] = False
-                        st.session_state["slab_results"] = {}
-                        st.session_state["step"] = 3
-                        _rerun()
+            except FileNotFoundError:
+                pass
+    else:
+        st.markdown(
+            """<div class="warn-box">⚠️ No floor structure detected. Gemini analysis may have failed — check your API credentials.</div>""",
+            unsafe_allow_html=True,
+        )
 
     # ── Navigation ───────────────────────────────────────────────────────────
     st.markdown("---")
@@ -499,15 +391,18 @@ def step2_select_pages():
             st.session_state["step"] = 1
             _rerun()
     with col_next:
-        if n_sel > 0:
-            if not st.session_state.get("smart_detect_result"):
-                if st.button("Next: Detect Slabs →", type="primary", use_container_width=True):
-                    st.session_state["slab_results"] = {}
-                    st.session_state["step"] = 3
-                    _rerun()
+        selected = st.session_state.get("selected_pages", [])
+        if selected:
+            if st.button(
+                f"▶ Detect Slabs on {len(selected)} pages",
+                type="primary", use_container_width=True,
+            ):
+                st.session_state["smart_detect_done"] = True
+                st.session_state["slab_results"] = {}
+                st.session_state["step"] = 3
+                _rerun()
         else:
-            st.warning("Select at least 1 page.")
-
+            st.warning("No floor plan pages detected. Go back and re-upload.")
 
 # ── AI result converter ──────────────────────────────────────────────────────────
 
@@ -886,7 +781,127 @@ def step3_detect():
     # Update session state only after all workers finish (thread-safe)
     st.session_state["slab_results"] = results
     st.session_state["debug_images"] = debug_imgs
+
+    # ── Vision Refinement (Stage 4) ─────────────────────────────────────────────
+    import fitz as _fitz
+    from src.vision_refiner import get_vision_client, refine_page_slabs
+    backend = st.session_state.get("vision_backend", "gemini")
+    try:
+        v_client, v_model = get_vision_client(backend)
+        doc_v = _fitz.open(pdf_path)
+        v_prog = st.progress(0, text="Vision Refinement (Stage 4)...")
+        pages_with_slabs = [(idx, slabs) for idx, slabs in results.items() if slabs]
+        for vi, (page_idx, page_slabs) in enumerate(pages_with_slabs):
+            results[page_idx] = refine_page_slabs(
+                page_slabs, doc_v[page_idx], v_client, v_model, backend
+            )
+            v_prog.progress((vi + 1) / max(len(pages_with_slabs), 1),
+                            text=f"Vision: page {page_idx + 1} done ({vi+1}/{len(pages_with_slabs)})")
+        doc_v.close()
+        v_prog.empty()
+        st.session_state["slab_results"] = results
+    except Exception as ve:
+        st.warning(f"Vision Refinement failed: {ve} — using standard detection results")
+
     all_slabs = [s for page_slabs in results.values() for s in page_slabs]
+
+    # ── Column & Foundation Detection ───────────────────────────────────────────
+    try:
+        from src.column_analyzer import analyze_columns_and_foundations
+        from src.column_detector import (
+            detect_columns_on_page, detect_foundations_on_page,
+            assign_columns_to_regions,
+        )
+        import fitz as _fitz2
+
+        ai_floor_res = st.session_state.get("ai_floor_result")
+        c_prog = st.progress(0, text="Column & Foundation Census (Gemini)...")
+        census = analyze_columns_and_foundations(
+            pdf_path, pages_to_process, ai_floor_res or {}
+        )
+        st.session_state["column_census"] = census
+        c_prog.progress(0.4, text="Detecting column positions (vector)...")
+
+        footing_pages_1idx = set(census.get("footing_plan_pages", []))
+        col_types = census.get("column_types", {})
+        fdn_types = census.get("foundation_types", {})
+
+        _page_job_map: dict = {}
+        for _bldg in census.get("buildings", []):
+            for _floor in _bldg.get("floors", []):
+                for _pg1 in _floor.get("slab_plan_pages", []):
+                    _idx = _pg1 - 1
+                    _relevant = {
+                        sym: col_types[sym]
+                        for sym in _floor.get("columns", {})
+                        if sym in col_types and col_types[sym].get("width_mm") is not None
+                    }
+                    if _idx not in _page_job_map:
+                        _page_job_map[_idx] = {
+                            "building": _bldg["name"],
+                            "level": _floor["level_name"],
+                            "col_types": {},
+                        }
+                    _page_job_map[_idx]["col_types"].update(_relevant)
+
+        doc_c = _fitz2.open(pdf_path)
+        all_columns, all_foundations = [], []
+        for page_idx, job in sorted(_page_job_map.items()):
+            page_c = doc_c[page_idx]
+            all_columns.extend(
+                detect_columns_on_page(
+                    page_c, job["col_types"], scale, page_idx,
+                    building=job["building"], level=job["level"],
+                )
+            )
+            if (page_idx + 1) in footing_pages_1idx:
+                all_foundations.extend(
+                    detect_foundations_on_page(page_c, fdn_types, scale, page_idx)
+                )
+        doc_c.close()
+
+        all_columns = assign_columns_to_regions(all_columns, census, ai_floor_res)
+        st.session_state["column_regions"]     = all_columns
+        st.session_state["foundation_regions"] = all_foundations
+        c_prog.empty()
+
+        # Per-floor column / foundation summary
+        st.markdown("#### 🏛️ Column & Foundation Schedule")
+        for _bldg in census.get("buildings", []):
+            bldg_rows = []
+            for _floor in _bldg.get("floors", []):
+                for sym, count in _floor.get("columns", {}).items():
+                    if sym == "UNSCHEDULED_COLUMN":
+                        continue
+                    info = col_types.get(sym, {})
+                    bldg_rows.append({
+                        "Floor": _floor.get("level_name", ""),
+                        "Symbol": sym,
+                        "Width (mm)": info.get("width_mm", "?"),
+                        "Depth (mm)": info.get("depth_mm", "?"),
+                        "Count": count,
+                    })
+            if bldg_rows:
+                st.markdown(f"**{_bldg['name']} — Columns**")
+                st.dataframe(pd.DataFrame(bldg_rows), use_container_width=True, hide_index=True)
+
+        fdn_types_info = census.get("foundation_types", {})
+        if fdn_types_info:
+            fdn_rows = [
+                {
+                    "Symbol": sym,
+                    "Type": info.get("type", "pad"),
+                    "Width (mm)": info.get("width_mm", "?"),
+                    "Depth (mm)": info.get("depth_mm", "?"),
+                    "Depth below GL (mm)": info.get("depth_below_gl_mm", "?"),
+                }
+                for sym, info in fdn_types_info.items()
+            ]
+            st.markdown("**Foundations**")
+            st.dataframe(pd.DataFrame(fdn_rows), use_container_width=True, hide_index=True)
+
+    except Exception as ce:
+        st.warning(f"Column & Foundation detection failed: {ce}")
 
     # AI floor merge: combine all polygons from the same Gemini floor group.
     # Handles: (1) cross-page duplicates (same polygon on pages 9+10 → union = one),
