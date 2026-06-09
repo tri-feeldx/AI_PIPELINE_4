@@ -21,6 +21,11 @@ class ColumnRegion:
     is_detail_only: bool = False       # True = from detail/section page, not real location
     real_polygon: Optional[Polygon] = None   # in mm after coordinate mapping
     area_m2: float = 0.0
+    height_mm: float = 0.0
+    family: str = "unknown_column"
+    status: str = "unknown"            # normal | under_only | over_only | unknown
+    detection_confidence: float = 0.0
+    source: str = "geometry"
 
 
 @dataclass
@@ -35,3 +40,6 @@ class FoundationRegion:
     page_index: int = 0
     real_polygon: Optional[Polygon] = None
     area_m2: float = 0.0
+    thickness_mm: float = 0.0
+    detection_confidence: float = 0.0
+    source: str = "geometry"

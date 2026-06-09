@@ -152,6 +152,97 @@ def save_step3_filtered(
     )
 
 
+def _draw_poly(ax, poly, page: fitz.Page, dpi: int, facecolor=None, edgecolor="white",
+               alpha: float = 0.35, linewidth: float = 1.0, linestyle: str = "-"):
+    for part in ([poly] if not isinstance(poly, _MultiPolygon) else list(poly.geoms)):
+        pts = _pdf_coords_to_img(list(part.exterior.coords), page, dpi)
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        if facecolor is not None:
+            ax.fill(xs, ys, alpha=alpha, color=facecolor)
+        ax.plot(xs, ys, color=edgecolor, linewidth=linewidth, linestyle=linestyle)
+        for interior in getattr(part, "interiors", []):
+            hole_pts = _pdf_coords_to_img(list(interior.coords), page, dpi)
+            hx = [p[0] for p in hole_pts]
+            hy = [p[1] for p in hole_pts]
+            ax.plot(hx, hy, color=edgecolor, linewidth=linewidth, linestyle=linestyle)
+
+
+def save_gross_net_slab_debug(
+    page: fitz.Page,
+    extraction_result,
+    save_path: str,
+    dpi: int = 150,
+) -> str:
+    """Overlay gross slab, recovered appendages, void candidates, and ignored regions."""
+    img = _page_to_image(page, dpi)
+    h, w = img.shape[:2]
+
+    fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img, origin="upper")
+
+    for item in getattr(extraction_result, "ignored_regions", [])[:80]:
+        poly = item.get("polygon")
+        if poly is not None and not poly.is_empty:
+            _draw_poly(ax, poly, page, dpi, facecolor=None, edgecolor="#78909C",
+                       alpha=0.12, linewidth=0.5, linestyle=":")
+
+    for poly in getattr(extraction_result, "gross_slabs", []):
+        _draw_poly(ax, poly, page, dpi, facecolor="#7ED957", edgecolor="#00C853",
+                   alpha=0.22, linewidth=1.4)
+
+    for poly in getattr(extraction_result, "appendages", []):
+        _draw_poly(ax, poly, page, dpi, facecolor=None, edgecolor="#B2FF59",
+                   alpha=0.4, linewidth=2.2)
+
+    for candidate in getattr(extraction_result, "void_candidates", []):
+        poly = candidate.get("polygon")
+        if poly is None or poly.is_empty:
+            continue
+        auto_cut = candidate.get("auto_cut")
+        color = "#FF1744" if auto_cut else "#FF9100"
+        _draw_poly(ax, poly, page, dpi, facecolor=color, edgecolor=color,
+                   alpha=0.28 if auto_cut else 0.20, linewidth=1.4)
+        try:
+            cx = poly.centroid.x * dpi / 72.0
+            cy = poly.centroid.y * dpi / 72.0
+            label = "CUT" if auto_cut else "REVIEW"
+            reason = candidate.get("reason", "void")
+            conf = candidate.get("confidence", 0)
+            ax.text(
+                cx, cy, f"{label}\n{reason}\n{conf:.2f}",
+                ha="center", va="center", fontsize=5, color="white",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.65, edgecolor=color),
+            )
+        except Exception:
+            pass
+
+    handles = [
+        mpatches.Patch(color="#7ED957", alpha=0.35, label="gross slab"),
+        mpatches.Patch(color="#B2FF59", alpha=0.65, label="recovered appendage"),
+        mpatches.Patch(color="#FF1744", alpha=0.45, label="auto subtract"),
+        mpatches.Patch(color="#FF9100", alpha=0.45, label="review candidate"),
+        mpatches.Patch(color="#78909C", alpha=0.35, label="ignored"),
+    ]
+
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    debug = getattr(extraction_result, "debug", {}) or {}
+    title = (
+        "Gross -> Net Slab | "
+        f"gross={len(getattr(extraction_result, 'gross_slabs', []))}, "
+        f"appendages={debug.get('appendages', 0)}, "
+        f"voids={len(getattr(extraction_result, 'void_candidates', []))}"
+    )
+    ax.set_title(title, fontsize=8, color="white", backgroundcolor="black")
+    ax.legend(handles=handles, loc="lower right", fontsize=5, framealpha=0.75)
+    fig.tight_layout(pad=0)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight", facecolor="black")
+    plt.close(fig)
+    return save_path
+
+
 def save_step4_labeled(
     page: fitz.Page,
     slab_regions: list,
@@ -266,3 +357,111 @@ def get_session_dir(base_dir: str, session_id: str) -> Path:
 def image_to_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
+
+def _save_element_polygons(page: fitz.Page, elements: list, save_path: str, title: str,
+                           color: str, dpi: int = 150) -> str:
+    img = _page_to_image(page, dpi)
+    h, w = img.shape[:2]
+    scale = dpi / 72.0
+    fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img, origin="upper")
+
+    for elem in elements:
+        poly = getattr(elem, "polygon", None)
+        if poly is None or poly.is_empty:
+            continue
+        _draw_poly(ax, poly, page, dpi, facecolor=color, edgecolor=color, alpha=0.25, linewidth=1.4)
+        try:
+            cx, cy = poly.centroid.x * scale, poly.centroid.y * scale
+            label = getattr(elem, "symbol", "?")
+            conf = getattr(elem, "detection_confidence", 0.0)
+            ax.text(
+                cx, cy, f"{label}\n{conf:.2f}",
+                ha="center", va="center", fontsize=5.5, color="white",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.65, edgecolor=color),
+            )
+        except Exception:
+            pass
+
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    ax.set_title(f"{title}: {len(elements)} detected", fontsize=8, color="white", backgroundcolor="black")
+    fig.tight_layout(pad=0)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight", facecolor="black")
+    plt.close(fig)
+    return save_path
+
+
+def save_column_polygons(page: fitz.Page, columns: list, save_path: str, dpi: int = 150) -> str:
+    return _save_element_polygons(page, columns, save_path, "Columns", "#D500F9", dpi=dpi)
+
+
+def save_foundation_polygons(page: fitz.Page, foundations: list, save_path: str, dpi: int = 150) -> str:
+    return _save_element_polygons(page, foundations, save_path, "Foundations", "#795548", dpi=dpi)
+
+
+def save_building_footprints(registry: dict, save_path: str, dpi: int = 140) -> str:
+    """Save a native-coordinate building footprint preview in real-world mm."""
+    buildings = list((registry or {}).get("buildings", {}).values())
+    polys = [
+        p
+        for b in buildings
+        for p in (b.get("footprint_parts") or [])
+        if p is not None and not p.is_empty
+    ]
+    if not polys:
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=dpi)
+        ax.text(0.5, 0.5, "No building footprint polygons", ha="center", va="center")
+        ax.axis("off")
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        return save_path
+
+    minx = min(p.bounds[0] for p in polys)
+    miny = min(p.bounds[1] for p in polys)
+    maxx = max(p.bounds[2] for p in polys)
+    maxy = max(p.bounds[3] for p in polys)
+    width = max(maxx - minx, 1.0)
+    depth = max(maxy - miny, 1.0)
+    fig_w = min(max(width / 2500.0, 7), 16)
+    fig_h = min(max(depth / 2500.0, 5), 12)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+    colors = [
+        "#00C853", "#2962FF", "#FF6D00", "#D500F9",
+        "#00B8D4", "#FFD600", "#C51162", "#64DD17",
+    ]
+    for idx, b in enumerate(buildings):
+        color = colors[idx % len(colors)]
+        for poly in b.get("footprint_parts") or []:
+            if poly is None or poly.is_empty:
+                continue
+            xs, ys = poly.exterior.xy
+            ax.fill(xs, ys, facecolor=color, edgecolor=color, alpha=0.22, linewidth=2.0)
+            for interior in getattr(poly, "interiors", []):
+                hx, hy = interior.xy
+                ax.fill(hx, hy, facecolor="white", edgecolor=color, alpha=1.0, linewidth=1.0)
+        fp = b.get("footprint_polygon")
+        if fp is not None and not fp.is_empty:
+            c = fp.centroid
+            ax.text(
+                c.x, c.y,
+                f"{b.get('name')}\n{len(b.get('levels', {}))} floors\n{b.get('area_m2', 0):.1f} m2",
+                ha="center", va="center", fontsize=8, color="white",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.72, edgecolor=color),
+            )
+
+    ax.set_aspect("equal", adjustable="box")
+    pad_x = width * 0.04
+    pad_y = depth * 0.04
+    ax.set_xlim(minx - pad_x, maxx + pad_x)
+    ax.set_ylim(maxy + pad_y, miny - pad_y)
+    ax.grid(True, linewidth=0.3, alpha=0.35)
+    ax.set_title("Building Footprints (native PDF coordinates, mm)", fontsize=10)
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return save_path

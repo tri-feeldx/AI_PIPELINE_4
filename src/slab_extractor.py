@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import fitz
-from shapely.geometry import Polygon, MultiPolygon, Point
+from shapely.geometry import Polygon, MultiPolygon, Point, box
 from shapely.ops import unary_union
 
 from src.pipeline_logger import log_extraction_counts, log_warn, get_logger
@@ -45,6 +45,18 @@ class SlabRegion:
     page_index: int = 0
     source: str = "filled"    # "filled" | "reconstructed"
     color: tuple = field(default_factory=lambda: (0.3, 0.7, 1.0, 0.4))
+
+
+@dataclass
+class SlabExtractionResult:
+    """Structured slab extraction output for gross-slab -> net-slab processing."""
+    gross_slabs: list[Polygon] = field(default_factory=list)
+    net_slabs: list[Polygon] = field(default_factory=list)
+    dominant_fill: Optional[tuple] = None
+    appendages: list[Polygon] = field(default_factory=list)
+    ignored_regions: list[dict] = field(default_factory=list)
+    void_candidates: list[dict] = field(default_factory=list)
+    debug: dict = field(default_factory=dict)
 
 
 # ── Color helpers ──────────────────────────────────────────────────────────────
@@ -233,7 +245,140 @@ def reconstruct_closed_polygons(drawings: list[dict], tol: float = 2.0) -> list[
     return polygons
 
 
-def filter_slab_candidates(
+def _bbox_from_text_block(block: dict) -> Polygon:
+    x0, y0, x1, y1 = block["bbox"]
+    return box(float(x0), float(y0), float(x1), float(y1))
+
+
+def _iter_polygons(geom) -> list[Polygon]:
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return list(geom.geoms)
+    return []
+
+
+def _merge_to_components(polygons: list[Polygon]) -> list[Polygon]:
+    if not polygons:
+        return []
+    return _iter_polygons(unary_union(polygons))
+
+
+def _semantic_void_allowlist() -> dict:
+    return {
+        "cut_keywords": ("STAIR", "LIFT", "CORE", "VOID", "OPENING", "SHAFT", "PENETRATION"),
+        "keep_keywords": ("C.J", "P.M.J", "T.M.J", "SETDOWN", "STEP", "THICKNESS", "COLUMN"),
+    }
+
+
+def _text_hits_for_voids(text_blocks: list[dict], page: fitz.Page) -> list[dict]:
+    spec = _semantic_void_allowlist()
+    hits = []
+    for block in text_blocks or []:
+        txt = (block.get("text") or "").upper().strip()
+        if not txt:
+            continue
+        if any(k in txt for k in spec["cut_keywords"]):
+            try:
+                bbox_poly = _bbox_from_text_block(block)
+            except Exception:
+                continue
+            cx = bbox_poly.centroid.x
+            cy = bbox_poly.centroid.y
+            if cx > page.rect.width * 0.82 or cy > page.rect.height * 0.88:
+                continue
+            hits.append({"text": txt, "bbox": block["bbox"], "polygon": bbox_poly})
+    return hits
+
+
+def _detect_semantic_void_candidates(
+    non_slab_pairs: list[tuple[Polygon, Optional[tuple]]],
+    gross_slabs: list[Polygon],
+    text_blocks: list[dict],
+    page: fitz.Page,
+    min_confidence: float = 0.75,
+    auto_cut_voids: bool = True,
+) -> list[dict]:
+    if not non_slab_pairs or not gross_slabs:
+        return []
+
+    gross_union = unary_union(gross_slabs)
+    text_hits = _text_hits_for_voids(text_blocks, page)
+    if not text_hits:
+        return []
+
+    page_area = page.rect.width * page.rect.height
+    min_area = page_area * 0.00008
+    max_area = page_area * 0.08
+    search_radius = max(page.rect.width, page.rect.height) * 0.045
+
+    def _is_steelwork_color(color) -> bool:
+        if color is None or len(color) < 3:
+            return False
+        r, g, b = color[:3]
+        if r > 0.90 and g > 0.90 and b > 0.90:
+            return False
+        return b > r + 0.12 and g > 0.45
+
+    candidates = []
+    used = set()
+    for hit_idx, hit in enumerate(text_hits):
+        txt = hit["text"]
+        is_stair = "STAIR" in txt
+        is_void = any(k in txt for k in ("VOID", "OPENING", "LIFT", "CORE", "SHAFT", "PENETRATION"))
+        nearby = []
+        for poly_idx, (poly, color) in enumerate(non_slab_pairs):
+            if color is None or poly_idx in used:
+                continue
+            if is_stair and not _is_steelwork_color(color):
+                continue
+            if poly.is_empty or poly.area > max_area:
+                continue
+            if poly.distance(hit["polygon"]) > search_radius:
+                continue
+            try:
+                if not gross_union.buffer(2).intersects(poly):
+                    continue
+            except Exception:
+                continue
+            nearby.append((poly_idx, poly, color))
+
+        if not nearby:
+            continue
+
+        try:
+            cluster = unary_union([p for _, p, _ in nearby]).buffer(2).envelope
+            cut_poly = cluster.intersection(gross_union).buffer(0)
+        except Exception:
+            continue
+        if cut_poly.is_empty or cut_poly.area < min_area or cut_poly.area > max_area:
+            continue
+
+        confidence = 0.62
+        if is_stair:
+            confidence += 0.23
+        if is_void:
+            confidence += 0.20
+        if len(nearby) >= 3:
+            confidence += 0.05
+        confidence = min(confidence, 0.95)
+        for poly_idx, _, _ in nearby:
+            used.add(poly_idx)
+        candidates.append({
+            "polygon": cut_poly,
+            "reason": "stair_steelwork_cluster" if is_stair else "semantic_void_cluster",
+            "confidence": confidence,
+            "auto_cut": bool(auto_cut_voids and confidence >= min_confidence),
+            "text": txt,
+            "color": "cluster",
+        })
+
+    return candidates
+
+
+def _filter_slab_candidates_legacy(
     poly_color_pairs: list,   # list[tuple[Polygon, Optional[tuple]]]
     page: fitz.Page,
     min_area_fraction: float = 0.001,
@@ -333,6 +478,204 @@ def filter_slab_candidates(
         if len(result) > 1:
             get_logger().info(f"  Union merge: {len(result)} polys → 1 component")
         return [merged]
+
+
+def filter_slab_candidates_structured(
+    poly_color_pairs: list,
+    page: fitz.Page,
+    text_blocks: Optional[list[dict]] = None,
+    min_area_fraction: float = 0.001,
+    max_area_fraction: float = 0.95,
+    recover_slab_appendages: bool = True,
+    auto_cut_voids: bool = True,
+    cut_walls: bool = False,
+    min_void_confidence: float = 0.75,
+) -> SlabExtractionResult:
+    """
+    Gross-slab -> net-slab extraction.
+
+    Gross slab keeps valid dominant-fill regions, including small edge appendages.
+    Net slab subtracts only high-confidence semantic void candidates.
+    """
+    _ = cut_walls
+    page_area = page.rect.width * page.rect.height
+    min_area = page_area * min_area_fraction
+    max_area = page_area * max_area_fraction
+
+    result_pairs = []
+    ignored_regions = []
+    for poly, color in poly_color_pairs:
+        area = poly.area
+        if area < min_area or area > max_area:
+            ignored_regions.append({"polygon": poly, "reason": "area_filter", "color": color})
+            continue
+        bounds = poly.bounds
+        w = bounds[2] - bounds[0]
+        h = bounds[3] - bounds[1]
+        if w < 5 or h < 5:
+            ignored_regions.append({"polygon": poly, "reason": "thin_filter", "color": color})
+            continue
+        try:
+            convexity = poly.convex_hull.area / poly.area
+        except Exception:
+            convexity = 1.0
+        if convexity < 0.55:
+            ignored_regions.append({"polygon": poly, "reason": "convexity_filter", "color": color})
+            continue
+        result_pairs.append((poly, color))
+
+    result_pairs = _deduplicate_pairs(result_pairs)
+    if not result_pairs:
+        return SlabExtractionResult(ignored_regions=ignored_regions)
+
+    color_area: dict = defaultdict(float)
+    for poly, color in result_pairs:
+        if color is not None:
+            key = _round_color(color)
+            color_area[key] += poly.area
+
+    dominant = None
+    non_slab_pairs = []
+    if color_area:
+        dominant = max(color_area, key=color_area.get)
+        slab_pairs = [
+            (p, c) for p, c in result_pairs
+            if c is not None and _color_close(_round_color(c), dominant, tol=0.06)
+        ]
+        non_slab_pairs = [
+            (p, c) for p, c in result_pairs
+            if not (c is not None and _color_close(_round_color(c), dominant, tol=0.06))
+        ]
+        if not slab_pairs:
+            slab_pairs = result_pairs
+            non_slab_pairs = []
+            dominant = None
+    else:
+        slab_pairs = result_pairs
+
+    if dominant is not None:
+        raw_non_slab_pairs = []
+        raw_min_area = page_area * 0.00001
+        for poly, color in poly_color_pairs:
+            if color is None or poly.area < raw_min_area:
+                continue
+            if _color_close(_round_color(color), dominant, tol=0.06):
+                continue
+            cx, cy = poly.centroid.x, poly.centroid.y
+            if cx > page.rect.width * 0.82 or cy > page.rect.height * 0.88:
+                continue
+            raw_non_slab_pairs.append((poly, color))
+        if raw_non_slab_pairs:
+            non_slab_pairs = raw_non_slab_pairs
+
+    slab_polys = [p for p, _ in slab_pairs]
+    try:
+        components = _merge_to_components(slab_polys)
+    except Exception as e:
+        get_logger().warning(f"  gross slab union failed ({type(e).__name__}): {e}")
+        largest = max(slab_polys, key=lambda p: p.area)
+        return SlabExtractionResult(
+            gross_slabs=[largest],
+            net_slabs=[largest],
+            dominant_fill=dominant,
+            ignored_regions=ignored_regions,
+            debug={"fallback": "largest_after_gross_union_failure"},
+        )
+
+    if not components:
+        components = [max(slab_polys, key=lambda p: p.area)]
+
+    largest = max(components, key=lambda g: g.area)
+    max_comp_area = max(largest.area, 1.0)
+    attach_distance = max(page.rect.width, page.rect.height) * 0.018
+    kept = []
+    appendages = []
+    far_same_fill = []
+
+    for comp in sorted(components, key=lambda g: g.area, reverse=True):
+        is_major = comp.area >= max_comp_area * 0.02
+        is_attached = recover_slab_appendages and comp.distance(largest) <= attach_distance
+        is_useful_appendage = comp.area >= max_comp_area * 0.0015
+        if is_major or (is_attached and is_useful_appendage):
+            kept.append(comp)
+            if not is_major:
+                appendages.append(comp)
+        else:
+            far_same_fill.append(comp)
+            ignored_regions.append({
+                "polygon": comp,
+                "reason": "far_or_tiny_same_fill",
+                "color": dominant,
+            })
+
+    if not kept:
+        kept = [largest]
+
+    gross_slabs = _merge_to_components(kept) or kept
+    void_candidates = _detect_semantic_void_candidates(
+        non_slab_pairs=non_slab_pairs,
+        gross_slabs=gross_slabs,
+        text_blocks=text_blocks or [],
+        page=page,
+        min_confidence=min_void_confidence,
+        auto_cut_voids=auto_cut_voids,
+    )
+
+    cut_polys = [c["polygon"] for c in void_candidates if c.get("auto_cut")]
+    net_slabs = gross_slabs
+    if cut_polys:
+        try:
+            cut_union = unary_union(cut_polys)
+            net_geom = unary_union(gross_slabs).difference(cut_union).buffer(0)
+            net_slabs = [
+                g for g in _iter_polygons(net_geom)
+                if g.area >= max_comp_area * 0.001
+            ] or gross_slabs
+        except Exception as e:
+            get_logger().warning(f"  Void subtraction failed ({type(e).__name__}): {e}")
+            net_slabs = gross_slabs
+
+    get_logger().info(
+        f"  Gross/net slab: dominant={dominant}, gross={len(gross_slabs)}, "
+        f"net={len(net_slabs)}, appendages={len(appendages)}, "
+        f"void_candidates={len(void_candidates)}, auto_cuts={len(cut_polys)}"
+    )
+
+    return SlabExtractionResult(
+        gross_slabs=gross_slabs,
+        net_slabs=net_slabs,
+        dominant_fill=dominant,
+        appendages=appendages,
+        ignored_regions=ignored_regions,
+        void_candidates=void_candidates,
+        debug={
+            "dominant_pairs": len(slab_pairs),
+            "non_slab_pairs": len(non_slab_pairs),
+            "components_before_recovery": len(components),
+            "components_kept": len(kept),
+            "appendages": len(appendages),
+            "ignored_same_fill": len(far_same_fill),
+            "auto_cut_voids": len(cut_polys),
+            "semantic_spec_source": "default_allowlist",
+            "cut_walls": False,
+        },
+    )
+
+
+def filter_slab_candidates(
+    poly_color_pairs: list,
+    page: fitz.Page,
+    min_area_fraction: float = 0.001,
+    max_area_fraction: float = 0.95,
+) -> list[Polygon]:
+    """Compatibility wrapper: return final net slab polygons only."""
+    result = filter_slab_candidates_structured(
+        poly_color_pairs,
+        page,
+        min_area_fraction=min_area_fraction,
+        max_area_fraction=max_area_fraction,
+    )
+    return result.net_slabs
 
 
 def _deduplicate_pairs(
@@ -435,8 +778,9 @@ def extract_slabs_from_page(
     filled_pairs = build_polygons_from_drawings(drawings)        # list[(Polygon, color)]
     recon_pairs  = [(p, None) for p in reconstruct_closed_polygons(drawings)]
 
-    all_pairs  = filled_pairs + recon_pairs
-    candidates = filter_slab_candidates(all_pairs, page)
+    all_pairs = filled_pairs + recon_pairs
+    slab_result = filter_slab_candidates_structured(all_pairs, page, text_blocks=text_blocks)
+    candidates = slab_result.net_slabs
 
     log_extraction_counts(page.number, len(filled_pairs), len(recon_pairs), len(candidates))
 
@@ -445,9 +789,8 @@ def extract_slabs_from_page(
 
     regions = assign_labels(candidates, text_blocks, ffl_values, slab_labels)
 
-    n_filled = len(filled_pairs)
     for i, r in enumerate(regions):
-        r.source = "filled" if i < n_filled else "reconstructed"
+        r.source = "filled-net" if slab_result.dominant_fill is not None else "reconstructed"
         r.page_index = page.number
         if r.ffl_m is None:
             log_warn(page.number, f"Slab {r.label}: no FFL found → default FFL=0.000m will be used")
