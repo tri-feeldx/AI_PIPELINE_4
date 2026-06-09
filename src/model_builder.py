@@ -1,18 +1,16 @@
 """
-SketchUp Ruby script generator.
+SketchUp Ruby script generator — slabs, columns & foundations.
 
-Generates a .rb script that:
-  1. Creates one Layer per floor level
-  2. For each slab: adds a Face (polygon) then push/pulls it -200mm (downward)
-  3. Assigns a material color per level
-  4. Groups all slabs on the same level together
-  5. Sets the active model units to mm
-
-Usage: paste the generated script into SketchUp's Ruby Console (Window > Ruby Console).
+Generates a .rb script with:
+  1. Layers per floor level (slabs) + Columns + Foundations
+  2. Slabs: Face → pushpull down per thickness
+  3. Columns: Face → pushpull UP from slab FFL
+  4. Foundations: Face → pushpull DOWN below GL
+  5. Material colors per type, grouped elements
 """
 
+import csv
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -27,186 +25,388 @@ def _get_polygon(geom):
 
 
 LEVEL_COLORS = [
-    "#4FC3F7",  # light blue
-    "#81C784",  # green
-    "#FFB74D",  # orange
-    "#F06292",  # pink
-    "#CE93D8",  # purple
-    "#80DEEA",  # cyan
-    "#FFCC02",  # yellow
-    "#FF8A65",  # deep orange
+    "#4FC3F7", "#81C784", "#FFB74D", "#F06292",
+    "#CE93D8", "#80DEEA", "#FFCC02", "#FF8A65",
 ]
+COLUMN_COLOR = "#9E9E9E"
+FOOTING_COLOR = "#795548"
 
 
-def _ruby_point(x_mm: float, y_mm: float, z_mm: float) -> str:
-    """Format a SketchUp Geom::Point3d in mm units."""
+def _ruby_point(x_mm, y_mm, z_mm):
     return f"Geom::Point3d.new({x_mm:.2f}.mm, {y_mm:.2f}.mm, {z_mm:.2f}.mm)"
 
 
-def _sanitize_layer_name(name: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_\-\. ]", "_", name)
+def _sanitize(n):
+    return re.sub(r"[^a-zA-Z0-9_\-\. ]", "_", n)
 
 
-def _level_key(page_index: int, ffl_m: Optional[float]) -> str:
-    """Unique layer key combining page and FFL — prevents merge of same-FFL slabs on different floors."""
-    ffl_str = f"{ffl_m:.3f}m" if ffl_m is not None else "Unknown"
-    return f"P{page_index + 1:02d}_FFL_{ffl_str}"
+def generate_ruby_script(slab_regions, output_path, thickness_mm=200.0,
+                         generated_by="Feeldx Slab Extractor", **kwargs):
+    return generate_full_ruby_script(slab_regions=slab_regions,
+                                     column_regions=[], foundation_regions=[],
+                                     output_path=output_path,
+                                     slab_thickness_mm=thickness_mm,
+                                     generated_by=generated_by)
 
 
-def generate_ruby_script(
-    slab_regions: list,
-    output_path: str,
-    thickness_mm: float = 200.0,
-    generated_by: str = "Feeldx Slab Extractor",
-) -> str:
-    """
-    Generate SketchUp Ruby script from a list of SlabRegion objects.
-    slab_regions must have .real_polygon (Shapely Polygon in mm), .label, .ffl_m, .area_m2
-    """
+def generate_slab_csv(slab_regions, output_path, **kwargs):
+    rows = [{"ID": s.id, "Label": s.label, "FFL_m": s.ffl_m or "",
+             "FFL_mm": s.ffl_mm or "", "Thickness_mm": 200,
+             "Area_m2": f"{s.area_m2:.3f}" if s.area_m2 else "",
+             "Page": s.page_index + 1, "Source": s.source} for s in slab_regions]
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        if rows:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+    return output_path
+
+
+def compute_storey_heights(slab_regions) -> dict:
+    """Compute page-index -> height to next FFL in metres."""
+    page_ffl = {}
+    for s in slab_regions:
+        if s.ffl_m is not None and s.page_index not in page_ffl:
+            page_ffl[s.page_index] = float(s.ffl_m)
+    ordered = sorted(page_ffl.items(), key=lambda kv: kv[1])
+    heights = {}
+    for i, (page_idx, ffl) in enumerate(ordered):
+        if i + 1 < len(ordered):
+            heights[page_idx] = round(ordered[i + 1][1] - ffl, 4)
+    return heights
+
+
+def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
+                              output_path, slab_thickness_mm=200.0,
+                              column_height_mm=3000.0,
+                              storey_height_by_page_mm=None,
+                              storey_height_report=None,
+                              building_registry=None,
+                              single_model=True,
+                              preserve_native_building_position=True,
+                              generated_by="Feeldx Pipeline"):
+    """Generate complete Ruby script for all structural elements."""
     lines = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total = len(slab_regions) + len(column_regions) + len(foundation_regions)
+    storey_height_by_page_mm = storey_height_by_page_mm or {}
+    storey_height_report = storey_height_report or []
+    building_registry = building_registry or {"buildings": {}, "warnings": []}
+    building_count = len(building_registry.get("buildings", {}))
+    floor_count = sum(
+        sum(1 for lvl in b.get("levels", {}) if str(lvl).lower() != "foundation")
+        for b in building_registry.get("buildings", {}).values()
+    )
+    height_status_counts = Counter((r.get("Status") or "unknown") for r in storey_height_report)
 
-    # Header
     lines += [
-        "# ============================================================",
+        "# " + "=" * 60,
         f"# Generated by: {generated_by}",
         f"# Date: {now}",
-        f"# Slabs: {len(slab_regions)}",
-        f"# Thickness: {thickness_mm:.0f}mm (fixed)",
-        "# Instructions: paste into SketchUp Ruby Console",
-        "#   Window > Ruby Console > paste > Enter",
-        "# ============================================================",
+        f"# Buildings: {building_count} | Floors: {floor_count}",
+        f"# Slabs: {len(slab_regions)} | Columns: {len(column_regions)} | Foundations: {len(foundation_regions)}",
+        f"# Total elements: {total}",
+        f"# Model mode: {'single_model' if single_model else 'multi_export'} | Building position: "
+        f"{'native_coordinates' if preserve_native_building_position else 'presentation_offset'}",
+        "# Storey heights: "
+        f"verified={height_status_counts.get('verified', 0)} | "
+        f"inferred={height_status_counts.get('inferred', 0)} | "
+        f"missing/default={height_status_counts.get('missing', 0) + height_status_counts.get('default', 0)}",
+        "# Paste into SketchUp Ruby Console (Window > Ruby Console)",
+        "# " + "=" * 60,
         "",
         "model = Sketchup.active_model",
-        "model.start_operation('Import Slabs', true)",
-        "",
+        "model.start_operation('Import Structural Model', true)",
         "entities = model.active_entities",
         "layers = model.layers",
         "materials = model.materials",
-        "",
-        "# Set model units to mm",
         "model.options['UnitsOptions']['LengthUnit'] = 4  # mm",
         "",
     ]
 
-    # Compute page-level dominant FFL: most-frequently-assigned FFL across all slabs on a page.
-    # This prevents layer explosion when individual slabs have different nearest-FFL values.
-    page_ffl_counts: dict = defaultdict(Counter)
-    for slab in slab_regions:
-        if slab.ffl_m is not None:
-            page_ffl_counts[slab.page_index][round(slab.ffl_m, 3)] += 1
-    page_primary_ffl: dict = {
-        page_idx: counts.most_common(1)[0][0]
-        for page_idx, counts in page_ffl_counts.items()
-        if counts
-    }
+    # Page-level dominant FFL
+    page_ffl_counts = defaultdict(Counter)
+    for s in slab_regions:
+        if s.ffl_m is not None:
+            page_ffl_counts[s.page_index][round(s.ffl_m, 3)] += 1
+    page_primary_ffl = {p: c.most_common(1)[0][0]
+                        for p, c in page_ffl_counts.items() if c}
 
-    # Collect unique levels (one per page, keyed by page + dominant FFL)
-    level_set = {}
-    for slab in slab_regions:
-        lvl = _level_key(slab.page_index, page_primary_ffl.get(slab.page_index))
-        if lvl not in level_set:
-            idx = len(level_set)
-            color = LEVEL_COLORS[idx % len(LEVEL_COLORS)]
-            level_set[lvl] = {"color": color, "index": idx}
-
-    # Create layers and materials
+    # Layers & materials
     lines.append("# --- Layers & Materials ---")
-    for lvl_name, info in level_set.items():
-        safe_name = _sanitize_layer_name(lvl_name)
-        lines.append(f'layer_{info["index"]} = layers.add("{safe_name}")')
-        lines.append(
-            f'mat_{info["index"]} = materials.add("mat_{safe_name}"); '
-            f'mat_{info["index"]}.color = Sketchup::Color.new("{info["color"]}")'
-        )
+    level_map = {}
+    for s in slab_regions:
+        lvl = page_primary_ffl.get(s.page_index)
+        key = f"P{s.page_index + 1:02d}_FFL_{lvl:.1f}m" if lvl is not None else f"P{s.page_index + 1:02d}"
+        if key not in level_map:
+            idx = len(level_map)
+            color = LEVEL_COLORS[idx % len(LEVEL_COLORS)]
+            level_map[key] = {"idx": idx, "color": color, "ffl_mm": (lvl or 0) * 1000}
+            safe = _sanitize(key)
+            lines.append(f'layer_slab_{idx} = layers.add("{safe}")')
+            lines.append(f'mat_slab_{idx} = materials.add("mat_{safe}"); mat_slab_{idx}.color = Sketchup::Color.new("{color}")')
+    lines.append('layer_col = layers.add("Columns")')
+    lines.append(f'mat_col = materials.add("mat_columns"); mat_col.color = Sketchup::Color.new("{COLUMN_COLOR}")')
+    lines.append('layer_fdn = layers.add("Foundations")')
+    lines.append(f'mat_fdn = materials.add("mat_foundations"); mat_fdn.color = Sketchup::Color.new("{FOOTING_COLOR}")')
     lines.append("")
 
-    # Create slab geometry
-    lines.append("# --- Slab Geometry ---")
+    # Building/level/type group containers. Coordinates are preserved inside these groups.
+    page_to_building = defaultdict(list)
+    for b in building_registry.get("buildings", {}).values():
+        for page_1 in b.get("slab_pages", []) or []:
+            if isinstance(page_1, int) and page_1 > 0:
+                page_to_building[page_1 - 1].append(b.get("name") or "(unknown)")
+    container_entities = {}
+    container_idx = 0
+
+    def _context_for_slab(slab):
+        label = getattr(slab, "label", "") or ""
+        bld = None
+        candidates = page_to_building.get(getattr(slab, "page_index", -1), [])
+        if len(candidates) == 1:
+            bld = candidates[0]
+            lvl_name = re.sub(rf"^{re.escape(bld)}\s*[—–\-_]*\s*", "", label).strip() or label
+            lvl_name = re.sub(r"^[^A-Za-z0-9]+", "", lvl_name).strip()
+            return bld or "(unknown)", lvl_name or "Level"
+        parts = re.split(r"\s+[—–-]\s+", label, maxsplit=1)
+        if len(parts) == 2:
+            bld = parts[0].strip()
+            lvl_name = parts[1].strip()
+        else:
+            bld = candidates[0] if len(candidates) == 1 else "(unknown)"
+            lvl_name = label or f"Page {getattr(slab, 'page_index', -1) + 1}"
+        return bld or "(unknown)", lvl_name or "Level"
+
+    def _context_for_element(elem, fallback_type="element"):
+        bld = getattr(elem, "building", "") or ""
+        lvl_name = getattr(elem, "level", "") or ""
+        if not bld:
+            candidates = page_to_building.get(getattr(elem, "page_index", -1), [])
+            bld = candidates[0] if len(candidates) == 1 else "(unknown)"
+        if not lvl_name:
+            lvl_name = fallback_type
+        return bld or "(unknown)", lvl_name or fallback_type
+
+    def _ensure_container(building, level, elem_type):
+        nonlocal container_idx
+        key = (building or "(unknown)", level or "Level", elem_type)
+        if key in container_entities:
+            return container_entities[key]
+        idx = container_idx
+        container_idx += 1
+        b_safe = _sanitize(key[0])
+        l_safe = _sanitize(key[1])
+        t_safe = _sanitize(key[2])
+        lines.extend([
+            f'grp_container_{idx} = entities.add_group',
+            f'grp_container_{idx}.name = "{b_safe} / {l_safe} / {t_safe}"',
+            f'ents_container_{idx} = grp_container_{idx}.entities',
+        ])
+        container_entities[key] = f"ents_container_{idx}"
+        return container_entities[key]
+
+    # --- SLABS ---
+    lines.append("# === SLABS ===")
     for i, slab in enumerate(slab_regions):
         poly = _get_polygon(getattr(slab, "real_polygon", None))
         if poly is None or poly.is_empty:
-            lines.append(f"# SKIPPED slab {slab.label}: no real_polygon")
+            lines.append(f"# SKIP slab {slab.label}: no polygon")
             continue
-
-        lvl = _level_key(slab.page_index, page_primary_ffl.get(slab.page_index))
-        lvl_info = level_set[lvl]
-        z_mm = slab.ffl_mm if slab.ffl_mm is not None else 0.0
-        area_txt = f"{slab.area_m2:.2f}m²" if slab.area_m2 > 0 else "?"
-        safe_label = _sanitize_layer_name(slab.label)
-
-        # Exterior ring coords
+        lvl = page_primary_ffl.get(slab.page_index)
+        key = f"P{slab.page_index + 1:02d}_FFL_{lvl:.1f}m" if lvl is not None else f"P{slab.page_index + 1:02d}"
+        if key not in level_map:
+            continue
+        info = level_map[key]
+        z_mm = slab.ffl_mm if slab.ffl_mm else 0.0
+        safe = _sanitize(slab.label)
         coords = list(poly.exterior.coords)
         if len(coords) < 3:
-            lines.append(f"# SKIPPED slab {slab.label}: too few points")
             continue
-
-        # SketchUp add_face needs CCW order when viewed from above
-        # Shapely exterior is CCW by default (positive area)
-
-        lines += [
-            "",
-            f"# Slab {i + 1}: {slab.label} | {lvl} | Area: {area_txt}",
-            f"begin",
-            f"  pts_{i} = [",
-        ]
-        for x, y in coords[:-1]:  # exclude closing duplicate
+        area_txt = f"{slab.area_m2:.2f}m²" if slab.area_m2 else "?"
+        bld, lvl_name = _context_for_slab(slab)
+        slab_entities = _ensure_container(bld, lvl_name, "Slabs")
+        lines += ["", f"# Slab {i + 1}: {slab.label} | Area: {area_txt}", "begin",
+                  f"  pts_slab_{i} = ["]
+        for x, y in coords[:-1]:
             lines.append(f"    {_ruby_point(x, y, z_mm)},")
-        lines[-1] = lines[-1].rstrip(",")  # remove trailing comma on last point
-        lines += [
-            f"  ]",
-            # Each slab gets its own Group so SketchUp cannot auto-merge shared edges,
-            # which previously caused "reference to deleted DrawingElement" errors.
-            f"  grp_{i} = entities.add_group",
-            f"  face_{i} = grp_{i}.entities.add_face(pts_{i})",
-            f"  if face_{i} && face_{i}.valid?",
-            f"    face_{i}.pushpull(-{thickness_mm:.0f}.mm)",
-            f"    grp_{i}.layer = layer_{lvl_info['index']}",
-            f"    grp_{i}.material = mat_{lvl_info['index']}",
-            f"    grp_{i}.name = '{safe_label}'",
-            f"  end",
-            f"rescue => e",
-            f"  puts 'Error creating slab {safe_label}: ' + e.message",
-            f"end",
-        ]
+        lines[-1] = lines[-1].rstrip(",")
+        lines += ["  ]", f"  grp_slab_{i} = {slab_entities}.add_group",
+                  f"  face_slab_{i} = grp_slab_{i}.entities.add_face(pts_slab_{i})",
+                  f"  if face_slab_{i} && face_slab_{i}.valid?",
+                  f"    hole_faces_{i} = []"]
+        for h_idx, interior in enumerate(getattr(poly, "interiors", [])):
+            hole_coords = list(interior.coords)
+            if len(hole_coords) < 4:
+                continue
+            lines += [f"    pts_slab_{i}_hole_{h_idx} = ["]
+            for x, y in hole_coords[:-1]:
+                lines.append(f"      {_ruby_point(x, y, z_mm)},")
+            lines[-1] = lines[-1].rstrip(",")
+            lines += [
+                "    ]",
+                f"    hole_face_{i}_{h_idx} = grp_slab_{i}.entities.add_face(pts_slab_{i}_hole_{h_idx})",
+                f"    hole_faces_{i} << hole_face_{i}_{h_idx} if hole_face_{i}_{h_idx} && hole_face_{i}_{h_idx}.valid?",
+            ]
+        lines += [f"    hole_faces_{i}.each {{ |hf| hf.erase! if hf && hf.valid? }}",
+                  f"    face_slab_{i}.pushpull(-{slab_thickness_mm:.0f}.mm)",
+                  f"    grp_slab_{i}.layer = layer_slab_{info['idx']}",
+                  f"    grp_slab_{i}.material = mat_slab_{info['idx']}",
+                  f"    grp_slab_{i}.name = '{safe}'",
+                  "  end", "rescue => e",
+                  f"  puts 'Error slab {safe}: ' + e.message", "end"]
+
+    # --- COLUMNS ---
+    lines += ["", "# === COLUMNS ==="]
+    col_idx = 0
+    for col in column_regions:
+        poly = _get_polygon(getattr(col, "real_polygon", None)) or getattr(col, "polygon", None)
+        if poly is None or poly.is_empty:
+            lines.append(f"# SKIP col {col.symbol}: no polygon")
+            continue
+        z_base = 0.0
+        if slab_regions:
+            cx, cy = poly.centroid.x, poly.centroid.y
+            best = float("inf")
+            for s in slab_regions:
+                if s.page_index != col.page_index:
+                    continue
+                sp = _get_polygon(getattr(s, "real_polygon", None))
+                if sp is None or sp.is_empty:
+                    continue
+                d = ((cx - sp.centroid.x) ** 2 + (cy - sp.centroid.y) ** 2) ** 0.5
+                if d < best and s.ffl_mm is not None:
+                    best, z_base = d, s.ffl_mm
+        if z_base == 0:
+            z_base = page_primary_ffl.get(col.page_index, 0) * 1000
+        safe = _sanitize(col.symbol)
+        w, d = col.width_mm or 200, col.depth_mm or 200
+        col_height = (
+            getattr(col, "height_mm", 0)
+            or storey_height_by_page_mm.get(col.page_index)
+            or column_height_mm
+        )
+        bld, lvl_name = _context_for_element(col, "Columns")
+        col_entities = _ensure_container(bld, lvl_name, "Columns")
+        coords = list(poly.exterior.coords)
+        if len(coords) < 3:
+            cx, cy = poly.centroid.x, poly.centroid.y
+            hw, hd = w / 2, d / 2
+            coords = [(cx - hw, cy - hd), (cx + hw, cy - hd),
+                      (cx + hw, cy + hd), (cx - hw, cy + hd)]
+        if len(coords) < 3:
+            continue
+        lines += ["", f"# Col {col.symbol} Z={z_base:.0f}mm {w:.0f}x{d:.0f}mm H={col_height:.0f}mm", "begin",
+                  f"  pts_col_{col_idx} = ["]
+        for x, y in coords[:-1]:
+            lines.append(f"    {_ruby_point(x, y, z_base)},")
+        lines[-1] = lines[-1].rstrip(",")
+        lines += ["  ]", f"  grp_col_{col_idx} = {col_entities}.add_group",
+                  f"  face_col_{col_idx} = grp_col_{col_idx}.entities.add_face(pts_col_{col_idx})",
+                  f"  if face_col_{col_idx} && face_col_{col_idx}.valid?",
+                  f"    face_col_{col_idx}.pushpull({col_height:.0f}.mm)",
+                  f"    grp_col_{col_idx}.layer = layer_col",
+                  f"    grp_col_{col_idx}.material = mat_col",
+                  f"    grp_col_{col_idx}.name = 'COL_{safe}'",
+                  "  end", "rescue => e",
+                  f"  puts 'Error col {safe}: ' + e.message", "end"]
+        col_idx += 1
+
+    # --- FOUNDATIONS ---
+    lines += ["", "# === FOUNDATIONS ==="]
+    fdn_idx = 0
+    for fdn in foundation_regions:
+        poly = _get_polygon(getattr(fdn, "real_polygon", None)) or getattr(fdn, "polygon", None)
+        if poly is None or poly.is_empty:
+            lines.append(f"# SKIP fdn {fdn.symbol}: no polygon")
+            continue
+        safe = _sanitize(fdn.symbol)
+        thk = fdn.depth_mm or 400
+        z_bot = -(fdn.depth_below_gl_mm or 1500)
+        z_top = z_bot + thk
+        w, d = fdn.width_mm or 1000, fdn.depth_mm or 1000
+        bld, lvl_name = _context_for_element(fdn, "Foundations")
+        fdn_entities = _ensure_container(bld, lvl_name, "Foundations")
+        coords = list(poly.exterior.coords)
+        if len(coords) < 3:
+            cx, cy = poly.centroid.x, poly.centroid.y
+            coords = [(cx - w / 2, cy - d / 2), (cx + w / 2, cy - d / 2),
+                      (cx + w / 2, cy + d / 2), (cx - w / 2, cy + d / 2)]
+        if len(coords) < 3:
+            continue
+        lines += ["", f"# FDN {fdn.symbol} Ztop={z_top:.0f}mm Thk={thk:.0f}mm", "begin",
+                  f"  pts_fdn_{fdn_idx} = ["]
+        for x, y in coords[:-1]:
+            lines.append(f"    {_ruby_point(x, y, z_top)},")
+        lines[-1] = lines[-1].rstrip(",")
+        lines += ["  ]", f"  grp_fdn_{fdn_idx} = {fdn_entities}.add_group",
+                  f"  face_fdn_{fdn_idx} = grp_fdn_{fdn_idx}.entities.add_face(pts_fdn_{fdn_idx})",
+                  f"  if face_fdn_{fdn_idx} && face_fdn_{fdn_idx}.valid?",
+                  f"    face_fdn_{fdn_idx}.pushpull(-{thk:.0f}.mm)",
+                  f"    grp_fdn_{fdn_idx}.layer = layer_fdn",
+                  f"    grp_fdn_{fdn_idx}.material = mat_fdn",
+                  f"    grp_fdn_{fdn_idx}.name = 'FDN_{safe}'",
+                  "  end", "rescue => e",
+                  f"  puts 'Error fdn {safe}: ' + e.message", "end"]
+        fdn_idx += 1
 
     # Finalize
-    lines += [
-        "",
-        "# --- Finalize ---",
-        "model.commit_operation",
-        "Sketchup.active_model.active_view.zoom_extents",
-        f"puts 'Done! {len(slab_regions)} slabs imported.'",
-    ]
+    lines += ["", "# --- Finalize ---",
+              "model.commit_operation",
+              "Sketchup.active_model.active_view.zoom_extents",
+              f"puts 'Done! {total} elements imported.'"]
 
-    script_content = "\n".join(lines)
+    script = "\n".join(lines)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(script_content)
+        f.write(script)
+    return script
 
-    return script_content
+
+def generate_columns_ruby(column_regions, output_path, storey_heights=None, height_map=None):
+    """Debug/export helper for columns only."""
+    return generate_full_ruby_script(
+        slab_regions=[],
+        column_regions=column_regions,
+        foundation_regions=[],
+        output_path=output_path,
+        generated_by="Feeldx Columns Export",
+    )
 
 
-def generate_slab_csv(slab_regions: list, output_path: str) -> str:
-    """Export slab data as CSV for reference."""
-    import csv
-    rows = []
-    for slab in slab_regions:
-        rows.append({
-            "ID": slab.id,
-            "Label": slab.label,
-            "FFL_m": slab.ffl_m if slab.ffl_m is not None else "",
-            "FFL_mm": slab.ffl_mm if slab.ffl_mm is not None else "",
-            "Thickness_mm": 200,
-            "Area_m2": f"{slab.area_m2:.3f}" if slab.area_m2 > 0 else "",
-            "Page": slab.page_index + 1,
-            "Source": slab.source,
-        })
+def generate_foundations_ruby(foundation_regions, output_path):
+    """Debug/export helper for foundations only."""
+    return generate_full_ruby_script(
+        slab_regions=[],
+        column_regions=[],
+        foundation_regions=foundation_regions,
+        output_path=output_path,
+        generated_by="Feeldx Foundations Export",
+    )
 
+
+def generate_columns_csv(column_regions, output_path):
+    rows = [{
+        "ID": c.id,
+        "Symbol": c.symbol,
+        "Family": getattr(c, "family", ""),
+        "Status": getattr(c, "status", ""),
+        "Building": c.building,
+        "Level": c.level,
+        "Width_mm": f"{c.width_mm:.0f}" if c.width_mm else "",
+        "Depth_mm": f"{c.depth_mm:.0f}" if c.depth_mm else "",
+        "Height_mm": f"{getattr(c, 'height_mm', 0):.0f}" if getattr(c, "height_mm", 0) else "",
+        "Page": c.page_index + 1,
+        "Confidence": getattr(c, "detection_confidence", ""),
+    } for c in column_regions]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         if rows:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
     return output_path
+
+
+def _compute_ffl_height_map(slab_regions, census=None) -> dict:
+    """Compatibility helper used by app.py; returns symbol height overrides when known."""
+    return {}

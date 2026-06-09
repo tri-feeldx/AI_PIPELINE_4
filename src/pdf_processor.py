@@ -23,6 +23,9 @@ SLAB_LABEL_PATTERN = re.compile(
 )
 
 
+_PT_TO_MM = 25.4 / 72.0
+
+
 def load_pdf(path: str) -> fitz.Document:
     return fitz.open(path)
 
@@ -146,3 +149,97 @@ def extract_slab_labels(text_blocks: list[dict]) -> list[dict]:
                     "bbox": block["bbox"],
                 })
     return results
+
+
+def convert_pts_to_mm(pts: float, scale: float = 100.0) -> float:
+    """
+    Convert PDF points to real-world millimeters using the drawing scale.
+    
+    scale: denominator of the scale ratio (e.g., 100 means 1:100).
+    """
+    return pts * _PT_TO_MM * scale
+
+
+# ── Storey height from elevation ─────────────────────────────────────────────
+
+_LEVEL_LABEL_RE = re.compile(r"^0*(\d{1,2})$")
+
+
+def extract_storey_heights_from_elevation(doc: fitz.Document) -> dict[int, float]:
+    """
+    Derive inter-storey heights from elevation/section drawing pages.
+
+    Approach: level label text ("LEVEL 01", "LEVEL 02"…) is placed AT each floor line
+    in elevation drawings. The Y-coordinate difference between adjacent labels, scaled by
+    the drawing scale, gives the storey height.
+
+    Returns: {level_num: storey_height_m}  e.g. {1: 3.800, 2: 4.500, 3: 4.000, ...}
+    where storey_height_m is the floor-to-floor height FROM that level to the level above.
+    """
+    best_result: dict[int, float] = {}
+    best_count = 0
+
+    for page in doc:
+        words = page.get_text("words")  # (x0,y0,x1,y1,text,block,line,word)
+
+        # Collect LEVEL N and ROOF label positions
+        positions: list[tuple] = []  # (level_key, x_center, y_center)
+        for i, w in enumerate(words):
+            txt = w[4].strip()
+            if txt.upper() == "LEVEL":
+                for j in range(i + 1, min(i + 3, len(words))):
+                    nxt = words[j][4].strip(",.")
+                    m = _LEVEL_LABEL_RE.fullmatch(nxt)
+                    if m:
+                        lvl = int(m.group(1))
+                        if 1 <= lvl <= 20:
+                            positions.append((lvl, (w[0] + w[2]) / 2, (w[1] + w[3]) / 2))
+                        break
+            elif txt.upper() == "ROOF":
+                positions.append(("ROOF", (w[0] + w[2]) / 2, (w[1] + w[3]) / 2))
+
+        if len(positions) < 3:
+            continue
+
+        # Detect scale for this page (default 100)
+        blocks = extract_text_blocks(page)
+        scale = detect_scale_from_blocks(blocks) or 100
+
+        # Cluster positions by X bucket (50pt bins) — each cluster = one elevation view
+        from collections import defaultdict
+        x_bucket = lambda x: round(x / 50) * 50
+        by_bucket: dict = defaultdict(list)
+        for lvl_key, xc, yc in positions:
+            by_bucket[x_bucket(xc)].append((lvl_key, xc, yc))
+
+        # Find the column with the most complete, monotone level sequence
+        for bucket, group in by_bucket.items():
+            # Sort by Y ascending (top of page = higher floor in elevation drawings)
+            col = sorted(group, key=lambda p: p[2])
+
+            # Extract only integer levels from this column
+            int_levels = [(lvl, y) for lvl, _, y in col if isinstance(lvl, int)]
+            if len(int_levels) < 2:
+                continue
+
+            # Check monotone (levels must be in descending order as Y increases)
+            lvl_seq = [l for l, _ in int_levels]
+            if lvl_seq != sorted(lvl_seq, reverse=True):
+                continue  # mixed elevations, not a clean column
+
+            heights: dict[int, float] = {}
+            for i in range(len(int_levels) - 1):
+                upper_lvl, upper_y = int_levels[i]
+                lower_lvl, lower_y = int_levels[i + 1]
+                if lower_lvl != upper_lvl - 1:
+                    continue  # non-consecutive, skip
+                diff_pt = lower_y - upper_y
+                storey_m = round(diff_pt * _PT_TO_MM * scale / 1000.0, 3)
+                if 2.0 <= storey_m <= 8.0:  # sanity: 2m–8m per storey
+                    heights[lower_lvl] = storey_m  # height FROM lower_lvl TO lower_lvl+1
+
+            if len(heights) > best_count:
+                best_count = len(heights)
+                best_result = heights
+
+    return best_result

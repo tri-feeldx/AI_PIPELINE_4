@@ -121,6 +121,22 @@ def transform_all_slabs(slabs, page: fitz.Page, scale: int) -> list:
     return slabs
 
 
+def transform_structural_elements(elements, page: fitz.Page, scale: int) -> list:
+    """Transform column/foundation polygons from PDF coordinates to real-world mm."""
+    if not elements:
+        return elements
+    origin_x_pdf = page.rect.x0
+    origin_y_pdf = page.rect.y1
+    for elem in elements:
+        poly = getattr(elem, "polygon", None)
+        if poly is None or poly.is_empty:
+            continue
+        real_poly = transform_polygon(poly, page, scale, origin_x_pdf, origin_y_pdf)
+        elem.real_polygon = real_poly
+        elem.area_m2 = real_poly.area / 1_000_000.0
+    return elements
+
+
 def estimate_origin_from_grid(text_blocks: list[dict], page: fitz.Page) -> tuple[float, float]:
     """
     Try to find the drawing origin by looking for '0,0' or 'A/1' grid intersection.
