@@ -19,6 +19,13 @@ debug_ai/
 *.rb
 *.csv
 
+# Debug/output images ở thư mục gốc (generated, không phải source)
+debug_*.png
+output_*.png
+demo_stage4_*.png
+ok.txt
+oko.txt
+
 # pip artifacts
 =*
 
@@ -29,3 +36,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Codegraph index (mỗi máy tự index locally)
+.codegraph/

@@ -46,6 +46,15 @@ def _page_to_floor_map(ai_floor_result: dict | None) -> dict[int, dict]:
     return mapping
 
 
+def _split_slab_label_context(label: str | None) -> tuple[str, str]:
+    """Extract Building / Level from labels like 'Building B - Ground'."""
+    value = (label or "").strip()
+    parts = re.split(r"\s+(?:—|–|-|â€”|â€“)\s+", value, maxsplit=1)
+    if len(parts) == 2:
+        return _clean_building_name(parts[0]), parts[1].strip()
+    return "(unknown)", value
+
+
 def _geom_area_m2(poly) -> float:
     if poly is None or poly.is_empty:
         return 0.0

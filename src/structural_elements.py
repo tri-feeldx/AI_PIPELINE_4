@@ -43,3 +43,20 @@ class FoundationRegion:
     thickness_mm: float = 0.0
     detection_confidence: float = 0.0
     source: str = "geometry"
+
+
+@dataclass
+class WallRegion:
+    id: int
+    polygon: Polygon
+    label: str = ""
+    wall_type: str = "wall"
+    width_mm: float = 200.0
+    height_mm: float = 3000.0
+    building: str = ""
+    level: str = ""
+    page_index: int = 0
+    real_polygon: Optional[Polygon] = None
+    area_m2: float = 0.0
+    detection_confidence: float = 0.0
+    source: str = "semantic_wall"

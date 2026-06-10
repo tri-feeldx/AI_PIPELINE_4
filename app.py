@@ -120,6 +120,7 @@ DEBUG_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 SLAB_THICKNESS_MM = 200
+VISION_MAX_WORKERS = 6
 
 
 # ── session helpers ─────────────────────────────────────────────────────────────
@@ -147,12 +148,28 @@ def init_session():
         "document_intelligence": None,
         "document_intelligence_path": None,
         "document_intelligence_raw_path": None,
+        "document_intelligence_parse_report_path": None,
         "column_validation": {},
         "storey_height_overrides": {},
         "storey_height_report": [],
         "storey_height_by_page_mm": {},
         "building_model_registry": {},
         "building_polygon_image": None,
+        "floor_alignment_report": [],
+        "floor_alignment_offsets": {},
+        "floor_alignment_preview": None,
+        "legend_semantics": None,
+        "legend_semantics_path": None,
+        "legend_semantics_raw_path": None,
+        "legend_semantics_report_path": None,
+        "legend_semantics_cache_key": None,
+        "slab_semantic_previews": {},
+        "slab_semantic_surface_images": {},
+        "slab_semantic_boundary_images": {},
+        "slab_semantic_cut_images": {},
+        "wall_regions": [],
+        "wall_polygon_images": {},
+        "semantic_wall_images": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -246,12 +263,28 @@ def step1_upload():
         st.session_state["document_intelligence"] = None
         st.session_state["document_intelligence_path"] = None
         st.session_state["document_intelligence_raw_path"] = None
+        st.session_state["document_intelligence_parse_report_path"] = None
         st.session_state["column_validation"] = {}
         st.session_state["storey_height_overrides"] = {}
         st.session_state["storey_height_report"] = []
         st.session_state["storey_height_by_page_mm"] = {}
         st.session_state["building_model_registry"] = {}
         st.session_state["building_polygon_image"] = None
+        st.session_state["floor_alignment_report"] = []
+        st.session_state["floor_alignment_offsets"] = {}
+        st.session_state["floor_alignment_preview"] = None
+        st.session_state["legend_semantics"] = None
+        st.session_state["legend_semantics_path"] = None
+        st.session_state["legend_semantics_raw_path"] = None
+        st.session_state["legend_semantics_report_path"] = None
+        st.session_state["legend_semantics_cache_key"] = None
+        st.session_state["slab_semantic_previews"] = {}
+        st.session_state["slab_semantic_surface_images"] = {}
+        st.session_state["slab_semantic_boundary_images"] = {}
+        st.session_state["slab_semantic_cut_images"] = {}
+        st.session_state["wall_regions"] = []
+        st.session_state["wall_polygon_images"] = {}
+        st.session_state["semantic_wall_images"] = {}
 
         with st.spinner("Reading PDF..."):
             import fitz
@@ -983,6 +1016,44 @@ def _render_storey_height_report(all_slabs: list, editable: bool = False) -> tup
     return rows, height_by_page_mm
 
 
+def _semantic_mapping_ready() -> bool:
+    """Only trust Gemini building/floor mapping when Document Intelligence parsed cleanly."""
+    intel = st.session_state.get("document_intelligence")
+    if not intel:
+        return False
+    metadata = intel.get("_metadata", {}) or {}
+    status = intel.get("_parse_status") or metadata.get("parse_status")
+    return status == "ok"
+
+
+def _trusted_ai_floor_result():
+    return st.session_state.get("ai_floor_result") if _semantic_mapping_ready() else None
+
+
+def _is_reliable_visible_slab_fill(color, polygons: list, page) -> bool:
+    """True only for visible material fills, not white/gray PDF masks."""
+    if color is None or not polygons:
+        return False
+    if len(color) < 3:
+        return False
+    r, g, b = [float(v) for v in color[:3]]
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    chroma = max_c - min_c
+    brightness = (r + g + b) / 3.0
+    if brightness > 0.92:
+        return False
+    if brightness < 0.08:
+        return False
+    if chroma < 0.045:
+        return False
+    page_area = max(page.rect.width * page.rect.height, 1.0)
+    fill_area = sum(p.area for p in polygons)
+    if fill_area / page_area < 0.01:
+        return False
+    return True
+
+
 def _refresh_building_registry(all_slabs: list, all_columns: list | None = None,
                                all_foundations: list | None = None) -> dict:
     from src.building_registry import build_building_registry
@@ -992,8 +1063,12 @@ def _refresh_building_registry(all_slabs: list, all_columns: list | None = None,
         all_slabs,
         all_columns or st.session_state.get("column_regions", []),
         all_foundations or st.session_state.get("foundation_regions", []),
-        st.session_state.get("ai_floor_result"),
+        _trusted_ai_floor_result(),
     )
+    if st.session_state.get("ai_floor_result") and not _semantic_mapping_ready():
+        registry.setdefault("warnings", []).append(
+            "Building/floor mapping disabled because Document Intelligence parse_status is not ok."
+        )
     st.session_state["building_model_registry"] = registry
     out = sess_debug_dir / "building_footprints.png"
     try:
@@ -1002,6 +1077,45 @@ def _refresh_building_registry(all_slabs: list, all_columns: list | None = None,
         st.session_state["building_polygon_image"] = None
         registry.setdefault("warnings", []).append(f"Building footprint preview failed: {exc}")
     return registry
+
+
+def _apply_floor_alignment(all_slabs: list, all_columns: list | None = None,
+                           all_foundations: list | None = None) -> tuple[list[dict], dict]:
+    from src.floor_alignment import align_floors
+    from src.visualizer import save_floor_alignment_preview
+
+    rows, offsets = align_floors(
+        all_slabs,
+        all_columns or st.session_state.get("column_regions", []),
+        all_foundations or st.session_state.get("foundation_regions", []),
+        _trusted_ai_floor_result(),
+    )
+    st.session_state["floor_alignment_report"] = rows
+    st.session_state["floor_alignment_offsets"] = offsets
+    out = sess_debug_dir / "floor_alignment_report.png"
+    try:
+        st.session_state["floor_alignment_preview"] = save_floor_alignment_preview(rows, str(out))
+    except Exception:
+        st.session_state["floor_alignment_preview"] = None
+    return rows, offsets
+
+
+def _render_floor_alignment_report(expanded: bool = True) -> None:
+    rows = st.session_state.get("floor_alignment_report") or []
+    with st.expander("Floor Alignment Report", expanded=expanded):
+        applied = sum(1 for r in rows if r.get("Applied"))
+        warnings = sum(1 for r in rows if r.get("Warning") and r.get("Warning") != "reference floor")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Alignment rows", len(rows))
+        c2.metric("Offsets applied", applied)
+        c3.metric("Warnings", warnings)
+        img_path = st.session_state.get("floor_alignment_preview")
+        if img_path and Path(img_path).exists():
+            st.image(img_path, use_container_width=True)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No alignment rows yet. Run Step 3 detection first.")
 
 
 def _render_building_registry(registry: dict | None = None, expanded: bool = True) -> None:
@@ -1065,18 +1179,25 @@ def _process_page_worker(args: tuple) -> tuple:
     Worker for parallel page processing.
     Opens its own fitz document — fitz.Document is NOT thread-safe when shared.
     """
-    pdf_path, page_idx, scale, debug_base = args
+    if len(args) >= 5:
+        pdf_path, page_idx, scale, debug_base, legend_semantics = args[:5]
+    else:
+        pdf_path, page_idx, scale, debug_base = args
+        legend_semantics = None
 
     import fitz
     from src.pdf_processor import extract_text_blocks, extract_ffl_values, extract_slab_labels
     from src.slab_extractor import (
         extract_slabs_from_page, build_polygons_from_drawings,
-        reconstruct_closed_polygons, filter_slab_candidates_structured,
+        reconstruct_closed_polygons, filter_slab_candidates_structured, assign_labels,
     )
+    from src.boundary_slab_extractor import extract_boundary_first_slabs
     from src.coordinate_mapper import transform_all_slabs
     from src.visualizer import (
         save_step1_raw_paths, save_step2_polygons, save_step3_filtered,
         save_step4_labeled, save_step5_final, save_gross_net_slab_debug,
+        save_boundary_first_debug, save_wall_evidence_only,
+        save_slab_candidates_only, save_wall_guided_final,
     )
 
     doc = fitz.open(pdf_path)
@@ -1105,17 +1226,79 @@ def _process_page_worker(args: tuple) -> tuple:
             min_void_confidence=0.75,
         )
         filtered = extraction_result.net_slabs
-        has_fill = bool(slab_regions and extraction_result.dominant_fill is not None)
+        reliable_visible_fill = _is_reliable_visible_slab_fill(
+            extraction_result.dominant_fill,
+            filtered,
+            page,
+        )
+        has_fill = bool(slab_regions and reliable_visible_fill)
+        extraction_mode = "fill_first" if reliable_visible_fill else "boundary_first"
+        if reliable_visible_fill:
+            mode_reason = "visible_dominant_fill"
+            fill_confidence = 0.85
+        elif extraction_result.dominant_fill is not None:
+            mode_reason = "dominant_fill_not_visible_or_neutral"
+            fill_confidence = 0.35
+        else:
+            mode_reason = "no_dominant_fill"
+            fill_confidence = 0.25
+
+        boundary_result = extract_boundary_first_slabs(
+            page,
+            drawings,
+            text_blocks=text_blocks,
+            legend_semantics=legend_semantics,
+        )
+        boundary_confidence = getattr(boundary_result, "confidence", 0.0)
+        structural_debug = getattr(getattr(boundary_result, "structural_objects", None), "debug", {}) or {}
+        fill_area = sum(p.area for p in filtered)
+        boundary_area = sum(p.area for p in getattr(boundary_result, "final_regions", []) or [])
+        use_boundary = (
+            boundary_result.final_regions
+            and (
+                not reliable_visible_fill
+                or not filtered
+                or (boundary_confidence >= 0.70 and boundary_area > fill_area * 1.15)
+            )
+        )
+        if use_boundary:
+            filtered = boundary_result.final_regions
+            extraction_mode = "evidence_guided_no_fill_boundary" if not reliable_visible_fill else "hybrid"
+            mode_reason = boundary_result.mode_reason
+            slab_regions = assign_labels(filtered, text_blocks, ffl_values, slab_labels)
+            for i, r in enumerate(slab_regions):
+                r.source = extraction_mode
+                r.page_index = page.number
+            slab_regions = transform_all_slabs(slab_regions, page, scale)
+        elif reliable_visible_fill and boundary_result.final_regions:
+            extraction_mode = "hybrid"
+            mode_reason = "dominant_fill_with_boundary_evidence"
 
         slab_stats = {
             "gross_slab_count": len(extraction_result.gross_slabs),
             "net_slab_count": len(extraction_result.net_slabs),
+            "final_slab_count": len(filtered),
             "gross_area_pdf": float(sum(p.area for p in extraction_result.gross_slabs)),
             "net_area_pdf": float(sum(p.area for p in extraction_result.net_slabs)),
+            "final_area_pdf": float(sum(p.area for p in filtered)),
             "recovered_appendage_count": len(extraction_result.appendages),
             "void_candidate_count": len(extraction_result.void_candidates),
             "auto_cut_count": sum(1 for c in extraction_result.void_candidates if c.get("auto_cut")),
             "dominant_fill": extraction_result.dominant_fill,
+            "reliable_visible_fill": reliable_visible_fill,
+            "extraction_mode": extraction_mode,
+            "mode_reason": mode_reason,
+            "fill_confidence": fill_confidence,
+            "boundary_confidence": boundary_confidence,
+            "boundary_signature_count": boundary_result.debug.get("boundary_signature_count", 0),
+            "boundary_evidence_count": boundary_result.debug.get("boundary_evidence_count", 0),
+            "wall_count": structural_debug.get("walls", 0),
+            "core_count": structural_debug.get("cores", 0),
+            "stair_count": structural_debug.get("stairs", 0),
+            "opening_count": structural_debug.get("openings", 0),
+            "boundary_cut_count": structural_debug.get("cut_candidates", 0),
+            "ignored_boundary_count": len(getattr(getattr(boundary_result, "structural_objects", None), "ignored_regions", []) or []),
+            "boundary_debug": boundary_result.debug,
             "debug": extraction_result.debug,
         }
 
@@ -1127,6 +1310,10 @@ def _process_page_worker(args: tuple) -> tuple:
             (save_step2_polygons,  "step2", (page, filled_polys + recon, f"{debug_base}_step2_polys.png")),
             (save_step3_filtered,  "step3", (page, filtered,             f"{debug_base}_step3_filtered.png")),
             (save_gross_net_slab_debug, "gross_net", (page, extraction_result, f"{debug_base}_gross_net.png")),
+            (save_boundary_first_debug, "boundary", (page, boundary_result, f"{debug_base}_boundary_first.png")),
+            (save_wall_evidence_only, "wall_evidence", (page, boundary_result, f"{debug_base}_wall_evidence.png")),
+            (save_slab_candidates_only, "wall_candidates", (page, boundary_result, f"{debug_base}_wall_candidates.png")),
+            (save_wall_guided_final, "wall_final", (page, boundary_result, f"{debug_base}_wall_final.png")),
             (save_step4_labeled,   "step4", (page, slab_regions,   f"{debug_base}_step4_labeled.png")),
             (save_step5_final,     "step5", (page, slab_regions,   f"{debug_base}_step5_final.png")),
         ]:
@@ -1141,6 +1328,414 @@ def _process_page_worker(args: tuple) -> tuple:
         doc.close()
 
 
+def _run_legend_detection(pdf_path: str, pages_to_process: list[int]) -> dict:
+    """Detect and render review crops for side-strip legends."""
+    from collections import defaultdict
+    import fitz
+    from src.legend_locator import locate_legends_for_pages
+    from src.visualizer import save_legend_crop, save_legend_overlay
+
+    if len(pages_to_process) > 12:
+        step = max(1, len(pages_to_process) // 12)
+        sampled_pages = list(pages_to_process[::step][:12])
+    else:
+        sampled_pages = list(pages_to_process)
+
+    cache_key = {
+        "pdf_path": str(pdf_path),
+        "pages": sampled_pages,
+    }
+    if st.session_state.get("legend_detection_cache_key") == cache_key:
+        cached = st.session_state.get("legend_detection")
+        if cached:
+            return cached
+
+    result = locate_legends_for_pages(pdf_path, sampled_pages, dpi=144)
+    result["sampled_pages"] = [p + 1 for p in sampled_pages]
+    out_dir = sess_debug_dir / "legend_detection"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidates_by_page: dict[int, list[dict]] = defaultdict(list)
+    for cand in result.get("candidates", []):
+        candidates_by_page[int(cand.get("page_index", -1))].append(cand)
+
+    overlays: dict[int, str] = {}
+    crops: dict[int, list[dict]] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_idx, candidates in sorted(candidates_by_page.items()):
+            if page_idx < 0 or page_idx >= doc.page_count:
+                continue
+            page = doc[page_idx]
+            overlay_path = out_dir / f"p{page_idx + 1:02d}_legend_overlay.png"
+            save_legend_overlay(page, candidates, str(overlay_path), dpi=100)
+            overlays[page_idx] = str(overlay_path)
+            page_crops = []
+            for i, cand in enumerate(candidates, start=1):
+                crop_path = out_dir / f"p{page_idx + 1:02d}_legend_{cand.get('side', 'side')}_{i}.png"
+                save_legend_crop(page, cand.get("bbox", []), str(crop_path), dpi=160)
+                crop_item = dict(cand)
+                crop_item["image_path"] = str(crop_path)
+                page_crops.append(crop_item)
+            crops[page_idx] = page_crops
+    finally:
+        doc.close()
+
+    result["overlays"] = overlays
+    result["crops"] = crops
+    st.session_state["legend_detection"] = result
+    st.session_state["legend_detection_cache_key"] = cache_key
+    return result
+
+
+def _sample_pages_for_semantics(pages_to_process: list[int]) -> list[int]:
+    if len(pages_to_process) > 6:
+        step = max(1, len(pages_to_process) // 6)
+        return list(pages_to_process[::step][:6])
+    return list(pages_to_process)
+
+
+def _run_legend_semantics(pdf_path: str, pages_to_process: list[int]) -> dict:
+    """Call Gemini on indexed legend crop text and cache semantic rules."""
+    from src.legend_semantic_analyzer import analyze_legend_semantics
+
+    sampled_pages = _sample_pages_for_semantics(pages_to_process)
+    cache_key = {"pdf_path": str(pdf_path), "pages": sampled_pages}
+    if st.session_state.get("legend_semantics_cache_key") == cache_key:
+        cached = st.session_state.get("legend_semantics")
+        if cached:
+            return cached
+
+    result, json_path, raw_path, report_path = analyze_legend_semantics(
+        pdf_path,
+        sampled_pages,
+        OUTPUT_DIR,
+    )
+    st.session_state["legend_semantics"] = result
+    st.session_state["legend_semantics_path"] = json_path
+    st.session_state["legend_semantics_raw_path"] = raw_path
+    st.session_state["legend_semantics_report_path"] = report_path
+    st.session_state["legend_semantics_cache_key"] = cache_key
+    return result
+
+
+def _run_wall_detection_preview(pdf_path: str, pages_to_process: list[int], scale: int) -> list:
+    """Detect semantic wall objects and render review overlays."""
+    import fitz
+    from src.wall_detector import detect_walls_for_pages
+    from src.visualizer import save_semantic_wall_overlay, save_wall_polygons
+
+    sem_result = st.session_state.get("legend_semantics") or {}
+    legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
+    if not legend_semantics:
+        st.session_state["wall_regions"] = []
+        return []
+
+    walls, structural_by_page = detect_walls_for_pages(
+        pdf_path,
+        pages_to_process,
+        scale,
+        legend_semantics=legend_semantics,
+    )
+    page_context: dict[int, tuple[str, str]] = {}
+    ai_floor = _trusted_ai_floor_result()
+    if ai_floor:
+        for b in ai_floor.get("buildings", []) if isinstance(ai_floor, dict) else []:
+            for floor in b.get("floors", []):
+                for p1 in floor.get("slab_plan_pages", []) or []:
+                    if isinstance(p1, int):
+                        page_context[p1 - 1] = (b.get("name", ""), floor.get("level_name", ""))
+    for wall in walls:
+        bld, lvl = page_context.get(wall.page_index, ("(unknown)", "(unknown)"))
+        wall.building = wall.building or bld
+        wall.level = wall.level or lvl
+    out_dir = sess_debug_dir / "walls"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    walls_by_page: dict[int, list] = {}
+    for wall in walls:
+        walls_by_page.setdefault(wall.page_index, []).append(wall)
+
+    semantic_imgs: dict[int, str] = {}
+    wall_imgs: dict[int, str] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_idx in pages_to_process:
+            if page_idx < 0 or page_idx >= doc.page_count:
+                continue
+            page = doc[page_idx]
+            structural = structural_by_page.get(page_idx)
+            if structural is not None:
+                p = out_dir / f"p{page_idx + 1:02d}_semantic_wall_overlay.png"
+                semantic_imgs[page_idx] = save_semantic_wall_overlay(page, structural, str(p), dpi=130)
+            page_walls = walls_by_page.get(page_idx, [])
+            if page_walls:
+                p = out_dir / f"p{page_idx + 1:02d}_wall_model_polygons.png"
+                wall_imgs[page_idx] = save_wall_polygons(page, page_walls, str(p), dpi=150)
+    finally:
+        doc.close()
+
+    st.session_state["wall_regions"] = walls
+    st.session_state["semantic_wall_images"] = semantic_imgs
+    st.session_state["wall_polygon_images"] = wall_imgs
+    return walls
+
+
+def _run_slab_semantic_preview(pdf_path: str, pages_to_process: list[int]) -> dict:
+    """Render Step 2.1 slab semantic overlays for review."""
+    import fitz
+    from src.slab_semantic_detector import detect_slab_semantics_for_pages
+    from src.visualizer import (
+        save_slab_semantic_boundary_cues,
+        save_slab_semantic_cut_candidates,
+        save_slab_semantic_surface,
+    )
+
+    sem_result = st.session_state.get("legend_semantics") or {}
+    legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
+    if not legend_semantics:
+        st.session_state["slab_semantic_previews"] = {}
+        return {}
+
+    previews = detect_slab_semantics_for_pages(
+        pdf_path,
+        pages_to_process,
+        legend_semantics=legend_semantics,
+    )
+    out_dir = sess_debug_dir / "slab_semantics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    surface_imgs: dict[int, str] = {}
+    boundary_imgs: dict[int, str] = {}
+    cut_imgs: dict[int, str] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_idx, preview in previews.items():
+            if page_idx < 0 or page_idx >= doc.page_count:
+                continue
+            page = doc[page_idx]
+            p = out_dir / f"p{page_idx + 1:02d}_slab_surface.png"
+            surface_imgs[page_idx] = save_slab_semantic_surface(page, preview, str(p), dpi=130)
+            p = out_dir / f"p{page_idx + 1:02d}_slab_boundary_cues.png"
+            boundary_imgs[page_idx] = save_slab_semantic_boundary_cues(page, preview, str(p), dpi=130)
+            p = out_dir / f"p{page_idx + 1:02d}_slab_cut_candidates.png"
+            cut_imgs[page_idx] = save_slab_semantic_cut_candidates(page, preview, str(p), dpi=130)
+    finally:
+        doc.close()
+
+    st.session_state["slab_semantic_previews"] = previews
+    st.session_state["slab_semantic_surface_images"] = surface_imgs
+    st.session_state["slab_semantic_boundary_images"] = boundary_imgs
+    st.session_state["slab_semantic_cut_images"] = cut_imgs
+    return previews
+
+
+def _render_legend_detection():
+    legend = st.session_state.get("legend_detection")
+    if not legend:
+        return
+    rows = legend.get("rows", []) or []
+    consensus = legend.get("consensus", {}) or {}
+    overlays = legend.get("overlays", {}) or {}
+    crops = legend.get("crops", {}) or {}
+
+    with st.expander("Legend Detection / Crop Preview", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Candidates", len(legend.get("candidates", []) or []))
+        c2.metric("Consensus side", consensus.get("side") or "N/A")
+        c3.metric("Coverage", consensus.get("coverage", 0))
+        c4.metric("Status", consensus.get("status", "unknown"))
+        if legend.get("sampled_pages"):
+            st.caption(f"Sampled pages: {', '.join(map(str, legend.get('sampled_pages', [])))}")
+        if consensus.get("status") == "weak":
+            st.warning("Legend consensus is weak across selected pages. Review crops before using this as a template.")
+        elif consensus.get("status") == "missing":
+            st.warning("No reliable legend crop found on selected pages.")
+
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        for page_idx in sorted(set(list(overlays.keys()) + list(crops.keys()))):
+            with st.expander(f"Legend crop - Page {page_idx + 1}", expanded=False):
+                overlay_path = overlays.get(page_idx)
+                if overlay_path and Path(overlay_path).exists():
+                    st.markdown("##### Overlay")
+                    st.image(overlay_path, use_container_width=True)
+                    with open(overlay_path, "rb") as f:
+                        st.download_button(
+                            f"Download legend overlay P{page_idx + 1}",
+                            f.read(),
+                            file_name=Path(overlay_path).name,
+                            mime="image/png",
+                            key=f"dl_legend_overlay_{page_idx}",
+                        )
+                for i, item in enumerate(crops.get(page_idx, []), start=1):
+                    img_path = item.get("image_path")
+                    if img_path and Path(img_path).exists():
+                        st.markdown(
+                            f"##### Crop {i}: {item.get('side')} | "
+                            f"confidence={item.get('confidence')}"
+                        )
+                        st.image(img_path, use_container_width=True)
+                        st.caption(item.get("text_preview", ""))
+                        with open(img_path, "rb") as f:
+                            st.download_button(
+                                f"Download legend crop P{page_idx + 1}-{i}",
+                                f.read(),
+                                file_name=Path(img_path).name,
+                                mime="image/png",
+                                key=f"dl_legend_crop_{page_idx}_{i}",
+                            )
+
+
+def _render_legend_semantics_and_walls():
+    sem = st.session_state.get("legend_semantics")
+    walls = st.session_state.get("wall_regions", []) or []
+    if not sem and not walls:
+        return
+    metadata = (sem or {}).get("_metadata", {}) if isinstance(sem, dict) else {}
+    parsed = (sem or {}).get("gemini_result", {}) if isinstance(sem, dict) else {}
+
+    with st.expander("Step 2.2 - Legend Semantics / Wall Preview", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Legend parse", metadata.get("parse_status", "N/A"))
+        c2.metric("Wall rules", len((parsed.get("rules_for_code") or {}).get("wall_keywords", []) if parsed else []))
+        c3.metric("Walls for model", len(walls))
+        c4.metric("Cut rules", len((parsed.get("rules_for_code") or {}).get("net_slab_cut_keywords", []) if parsed else []))
+
+        tabs = st.tabs(["Rules", "Wall Evidence", "Wall Model Polygons", "Raw JSON"])
+        with tabs[0]:
+            rules = parsed.get("rules_for_code", {}) if parsed else {}
+            if rules:
+                st.json(rules)
+            if parsed.get("wall_detection_items"):
+                st.markdown("##### Wall Detection Items")
+                st.dataframe(pd.DataFrame(parsed.get("wall_detection_items", [])), use_container_width=True, hide_index=True)
+            if parsed.get("slab_detection_items"):
+                st.markdown("##### Slab Detection Items")
+                st.dataframe(pd.DataFrame(parsed.get("slab_detection_items", [])), use_container_width=True, hide_index=True)
+            if parsed.get("warnings"):
+                for w in parsed.get("warnings", []):
+                    st.warning(w)
+        with tabs[1]:
+            _render_element_overlay_gallery(
+                "Semantic Wall Evidence",
+                st.session_state.get("semantic_wall_images", {}) or {},
+                "No semantic wall evidence overlays yet.",
+                "dl_semantic_wall_overlay",
+            )
+        with tabs[2]:
+            _render_element_overlay_gallery(
+                "Wall Model Polygons",
+                st.session_state.get("wall_polygon_images", {}) or {},
+                "No wall polygons selected for model export yet.",
+                "dl_wall_model_overlay",
+            )
+        with tabs[3]:
+            st.json(sem or {})
+            for label, path_key, mime in [
+                ("Download legend semantics JSON", "legend_semantics_path", "application/json"),
+                ("Download legend semantics raw", "legend_semantics_raw_path", "text/plain"),
+                ("Download legend semantics parse report", "legend_semantics_report_path", "application/json"),
+            ]:
+                p = st.session_state.get(path_key)
+                if p and Path(p).exists():
+                    with open(p, "rb") as f:
+                        st.download_button(
+                            label,
+                            f.read(),
+                            file_name=Path(p).name,
+                            mime=mime,
+                            key=f"dl_{path_key}",
+                        )
+
+
+def _render_slab_semantic_preview():
+    sem = st.session_state.get("legend_semantics")
+    previews = st.session_state.get("slab_semantic_previews") or {}
+    if not sem and not previews:
+        return
+    metadata = (sem or {}).get("_metadata", {}) if isinstance(sem, dict) else {}
+    parsed = (sem or {}).get("gemini_result", {}) if isinstance(sem, dict) else {}
+    rules = parsed.get("rules_for_code", {}) if parsed else {}
+    surface_count = sum(len(getattr(p, "surface_regions", []) or []) for p in previews.values())
+    cue_count = sum(len(getattr(p, "boundary_cues", []) or []) for p in previews.values())
+    cut_count = sum(len(getattr(p, "cut_candidates", []) or []) for p in previews.values())
+    page_rows = []
+    for page_idx, preview in sorted(previews.items()):
+        warnings = getattr(preview, "warnings", []) or []
+        page_rows.append({
+            "Page": page_idx + 1,
+            "Surface Count": len(getattr(preview, "surface_regions", []) or []),
+            "Boundary Cue Count": len(getattr(preview, "boundary_cues", []) or []),
+            "Cut Candidate Count": len(getattr(preview, "cut_candidates", []) or []),
+            "Gemini Policy": getattr(preview, "gemini_fallback_policy", None) or rules.get("fallback_policy"),
+            "Effective Source": getattr(preview, "effective_surface_source", "unknown"),
+            "Fallback Policy": getattr(preview, "fallback_policy", "unknown"),
+            "Warning / Status": " | ".join(warnings) if warnings else "ok",
+        })
+    uses_no_fill_boundary = any(
+        getattr(p, "effective_surface_source", "") in (
+            "white_no_fill_boundary",
+            "evidence_guided_no_fill_boundary",
+        )
+        for p in previews.values()
+    )
+
+    with st.expander("Step 2.1 - Legend Slab Semantics Preview", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Legend parse", metadata.get("parse_status", "N/A"))
+        c2.metric("Slab surfaces", surface_count)
+        c3.metric("Boundary cues", cue_count)
+        c4.metric("Cut candidates", cut_count)
+        fallback = rules.get("fallback_policy")
+        if fallback in ("use_white_no_fill_boundary", "use_evidence_guided_no_fill_boundary") or uses_no_fill_boundary:
+            st.warning("One or more pages use evidence-guided no-fill boundary slab candidates for review. This uses learned boundary signatures/wall evidence, not the full white page background.")
+
+        tabs = st.tabs(["Rules", "Slab Surface Evidence", "Slab Boundary Cues", "Slab Cut Candidates", "Raw JSON"])
+        with tabs[0]:
+            st.json({
+                "slab_surface_keywords": rules.get("slab_surface_keywords", []),
+                "slab_fill_keywords": rules.get("slab_fill_keywords", []),
+                "slab_boundary_keywords": rules.get("slab_boundary_keywords", []),
+                "net_slab_cut_keywords": rules.get("net_slab_cut_keywords", []),
+                "gemini_fallback_policy": rules.get("fallback_policy"),
+                "notes": rules.get("notes"),
+            })
+            if page_rows:
+                st.markdown("##### Page Slab Semantic Source Report")
+                st.dataframe(pd.DataFrame(page_rows), use_container_width=True, hide_index=True)
+            for key, title in [
+                ("slab_surface_items", "Slab Surface Items"),
+                ("slab_boundary_items", "Slab Boundary Items"),
+                ("slab_cut_items", "Slab Cut Items"),
+                ("slab_detection_items", "Legacy Slab Detection Items"),
+            ]:
+                if parsed.get(key):
+                    st.markdown(f"##### {title}")
+                    st.dataframe(pd.DataFrame(parsed.get(key, [])), use_container_width=True, hide_index=True)
+        with tabs[1]:
+            _render_element_overlay_gallery(
+                "Slab Surface Evidence",
+                st.session_state.get("slab_semantic_surface_images", {}) or {},
+                "No slab surface semantic overlays yet.",
+                "dl_slab_semantic_surface",
+            )
+        with tabs[2]:
+            _render_element_overlay_gallery(
+                "Slab Boundary Cues",
+                st.session_state.get("slab_semantic_boundary_images", {}) or {},
+                "No slab boundary cue overlays yet.",
+                "dl_slab_semantic_boundary",
+            )
+        with tabs[3]:
+            _render_element_overlay_gallery(
+                "Slab Cut Candidates",
+                st.session_state.get("slab_semantic_cut_images", {}) or {},
+                "No slab cut candidate overlays yet.",
+                "dl_slab_semantic_cut",
+            )
+        with tabs[4]:
+            st.json(sem or {})
+
+
 def _render_document_intelligence():
     intel = st.session_state.get("document_intelligence")
     if not intel:
@@ -1149,15 +1744,27 @@ def _render_document_intelligence():
     schedule_pages = intel.get("schedule_pages", {})
     column_symbols = intel.get("column_symbols", {})
     foundation_symbols = intel.get("foundation_symbols", {})
+    metadata = intel.get("_metadata", {}) or {}
+    parse_status = intel.get("_parse_status") or metadata.get("parse_status", "unknown")
+    parse_error = intel.get("_parse_error") or metadata.get("parse_error")
 
     with st.expander("Document Intelligence (Gemini full PDF)", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Confidence", summary.get("detection_confidence", "N/A"))
-        c2.metric("Column symbols", len(column_symbols))
-        c3.metric("Foundation symbols", len(foundation_symbols))
-        c4.metric("PDF pages", summary.get("page_count", "N/A"))
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Parse", parse_status)
+        c2.metric("Confidence", summary.get("detection_confidence", "N/A"))
+        c3.metric("Column symbols", len(column_symbols))
+        c4.metric("Foundation symbols", len(foundation_symbols))
+        c5.metric("PDF pages", summary.get("page_count", "N/A"))
 
-        tabs = st.tabs(["Summary", "Columns", "Foundations", "Heights", "Buildings/Floors", "Warnings", "Raw JSON"])
+        if parse_status != "ok":
+            st.error(
+                "Gemini raw response saved, but JSON parse failed or semantic schema is empty. "
+                "Do not trust empty building/column/foundation results until the raw response is reviewed."
+            )
+            if parse_error:
+                st.code(str(parse_error), language="text")
+
+        tabs = st.tabs(["Summary", "Audit", "Columns", "Foundations", "Heights", "Buildings/Floors", "Warnings", "Raw JSON"])
         with tabs[0]:
             st.json({
                 "project_name": summary.get("project_name"),
@@ -1165,7 +1772,23 @@ def _render_document_intelligence():
                 "schedule_pages": schedule_pages,
                 "legend_rules": intel.get("legend_rules", {}),
             })
+        with tabs[1]:
             intel_path = st.session_state.get("document_intelligence_path")
+            raw_path = st.session_state.get("document_intelligence_raw_path") or metadata.get("raw_response_path")
+            report_path = (
+                st.session_state.get("document_intelligence_parse_report_path")
+                or metadata.get("parse_report_path")
+            )
+            st.json({
+                "parse_status": parse_status,
+                "parse_error": parse_error,
+                "raw_response_length": metadata.get("raw_response_length"),
+                "cleaned_response_length": metadata.get("cleaned_response_length"),
+                "response_ended_cleanly": metadata.get("response_ended_cleanly"),
+                "parsed_json_path": intel_path or metadata.get("parsed_json_path"),
+                "raw_response_path": raw_path,
+                "parse_report_path": report_path,
+            })
             if intel_path and Path(intel_path).exists():
                 with open(intel_path, "rb") as f:
                     st.download_button(
@@ -1175,7 +1798,30 @@ def _render_document_intelligence():
                         mime="application/json",
                         key="dl_document_intelligence_json",
                     )
-        with tabs[1]:
+            if raw_path and Path(raw_path).exists():
+                raw_text = Path(raw_path).read_text(encoding="utf-8", errors="replace")
+                with open(raw_path, "rb") as f:
+                    st.download_button(
+                        "Download Gemini raw response",
+                        f.read(),
+                        file_name=Path(raw_path).name,
+                        mime="text/plain",
+                        key="dl_document_intelligence_raw",
+                    )
+                st.markdown("##### Raw preview - first 3000 chars")
+                st.code(raw_text[:3000], language="json")
+                st.markdown("##### Raw preview - last 3000 chars")
+                st.code(raw_text[-3000:], language="json")
+            if report_path and Path(report_path).exists():
+                with open(report_path, "rb") as f:
+                    st.download_button(
+                        "Download parse report",
+                        f.read(),
+                        file_name=Path(report_path).name,
+                        mime="application/json",
+                        key="dl_document_intelligence_parse_report",
+                    )
+        with tabs[2]:
             rows = []
             for sym, info in column_symbols.items():
                 rows.append({
@@ -1189,7 +1835,7 @@ def _render_document_intelligence():
                     "Pages": ", ".join(map(str, info.get("source_pages", []))),
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        with tabs[2]:
+        with tabs[3]:
             rows = []
             for sym, info in foundation_symbols.items():
                 rows.append({
@@ -1208,7 +1854,7 @@ def _render_document_intelligence():
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.info(f"No foundation symbols extracted yet. Foundation schedule pages: {schedule_pages.get('foundation_schedule_pages', [])}")
-        with tabs[3]:
+        with tabs[4]:
             height_sources = intel.get("height_sources", []) or []
             storey_heights = intel.get("storey_heights", []) or []
             if height_sources:
@@ -1232,7 +1878,7 @@ def _render_document_intelligence():
                 st.markdown("##### Storey heights")
                 st.dataframe(pd.DataFrame(storey_heights), use_container_width=True, hide_index=True)
 
-        with tabs[4]:
+        with tabs[5]:
             floor_rows = []
             for b in intel.get("buildings", []):
                 for f in b.get("floors", []):
@@ -1247,14 +1893,14 @@ def _render_document_intelligence():
                         "Foundation total": fdn_summary.get("total_foundations"),
                     })
             st.dataframe(pd.DataFrame(floor_rows), use_container_width=True, hide_index=True)
-        with tabs[5]:
+        with tabs[6]:
             warnings = intel.get("warnings", [])
             if warnings:
                 for w in warnings:
                     st.warning(w)
             else:
                 st.success("No document-intelligence warnings.")
-        with tabs[6]:
+        with tabs[7]:
             st.json(intel)
 
 
@@ -1316,8 +1962,31 @@ def _render_step3_results():
         c2.metric("Recovered appendages", appendage_count)
         c3.metric("Void candidates", void_count)
         c4.metric("Auto cuts", auto_cut_count)
+        mode_rows = []
+        for page_idx, stats in sorted(slab_stats.items()):
+            mode_rows.append({
+                "Page": page_idx + 1,
+                "Mode": stats.get("extraction_mode", "fill_first"),
+                "Reason": stats.get("mode_reason", ""),
+                "Reliable fill": bool(stats.get("reliable_visible_fill", False)),
+                "Fill confidence": round(float(stats.get("fill_confidence", 0.0)), 2),
+                "Boundary confidence": round(float(stats.get("boundary_confidence", 0.0)), 2),
+                "Walls": stats.get("wall_count", 0),
+                "Cores": stats.get("core_count", 0),
+                "Stairs": stats.get("stair_count", 0),
+                "Openings": stats.get("opening_count", 0),
+                "Boundary cuts": stats.get("boundary_cut_count", 0),
+                "Ignored zones": stats.get("ignored_boundary_count", 0),
+                "Final slabs": stats.get("final_slab_count", stats.get("net_slab_count", 0)),
+            })
+        with st.expander("Extraction Mode Report", expanded=True):
+            st.dataframe(pd.DataFrame(mode_rows), use_container_width=True, hide_index=True)
 
+    _render_legend_detection()
+    _render_slab_semantic_preview()
+    _render_legend_semantics_and_walls()
     _render_document_intelligence()
+    _render_floor_alignment_report(expanded=True)
     _render_building_registry(expanded=True)
 
     col_validation = st.session_state.get("column_validation") or {}
@@ -1386,12 +2055,36 @@ def _render_step3_results():
                         f"voids={stats.get('void_candidate_count', 0)}",
                         f"auto_cuts={stats.get('auto_cut_count', 0)}",
                         f"dominant_fill={stats.get('dominant_fill')}",
+                        f"mode={stats.get('extraction_mode')}",
+                        f"boundary_signatures={stats.get('boundary_signature_count', 0)}",
+                        f"boundary_evidence={stats.get('boundary_evidence_count', 0)}",
                     ])
                 )
-            tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "Gross/Net", "④ Labeled", "⑤ Final"])
-            step_keys = ["step1", "step2", "step3", "gross_net", "step4", "step5"]
+            tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "Gross/Net", "Wall/Boundary", "④ Labeled", "⑤ Final"])
+            step_keys = ["step1", "step2", "step3", "gross_net", "boundary", "step4", "step5"]
             for tab, key in zip(tabs, step_keys):
                 with tab:
+                    if key == "boundary":
+                        wall_items = [
+                            ("Wall Evidence Only", "wall_evidence"),
+                            ("Slab Candidates Only", "wall_candidates"),
+                            ("Final Wall-Guided Result", "wall_final"),
+                            ("Combined Legacy Overlay", "boundary"),
+                        ]
+                        for label, wall_key in wall_items:
+                            st.markdown(f"##### {label}")
+                            img_path = page_imgs.get(wall_key)
+                            if img_path and Path(img_path).exists():
+                                st.image(img_path, use_container_width=True)
+                                with open(img_path, "rb") as f:
+                                    st.download_button(
+                                        f"Download {wall_key}.png", f.read(),
+                                        file_name=Path(img_path).name, mime="image/png",
+                                        key=f"dl_{page_idx}_{wall_key}",
+                                    )
+                            else:
+                                st.info(f"{label} image not available.")
+                        continue
                     img_path = page_imgs.get(key)
                     if img_path and Path(img_path).exists():
                         st.image(img_path, use_container_width=True)
@@ -1448,6 +2141,20 @@ def step3_detect():
     else:
         pages_to_process = selected_pages
 
+    try:
+        _run_legend_detection(pdf_path, pages_to_process)
+    except Exception as le:
+        st.warning(f"Legend detection preview failed: {le}")
+
+    try:
+        if not st.session_state.get("legend_semantics"):
+            with st.spinner("Step 2.2 - Gemini reading legend rules..."):
+                _run_legend_semantics(pdf_path, pages_to_process)
+        _run_slab_semantic_preview(pdf_path, pages_to_process)
+        _run_wall_detection_preview(pdf_path, pages_to_process, scale)
+    except Exception as we:
+        st.warning(f"Legend semantic / wall preview failed: {we}")
+
     # BUG 0 FIX: Cache guard — skip re-processing if all pages already done
     existing = st.session_state.get("slab_results", {})
     if existing and all(idx in existing for idx in pages_to_process):
@@ -1467,8 +2174,10 @@ def step3_detect():
     progress = st.progress(0, text=f"Processing {n} pages in parallel...")
     status_placeholder = st.empty()
 
+    sem_result = st.session_state.get("legend_semantics") or {}
+    legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
     worker_args = [
-        (pdf_path, page_idx, scale, str(sess_debug_dir / f"p{page_idx + 1:02d}"))
+        (pdf_path, page_idx, scale, str(sess_debug_dir / f"p{page_idx + 1:02d}"), legend_semantics)
         for page_idx in pages_to_process
     ]
 
@@ -1538,22 +2247,65 @@ def step3_detect():
             )
 
         if no_fill_pages:
-            try:
-                v_client, v_model = get_vision_client(backend)
-                doc_v = _fitz.open(pdf_path)
-                v_prog = st.progress(0, text="Vision Refinement (Stage 4)...")
-                to_refine = [(idx, slabs) for idx, slabs in pages_with_slabs if idx in no_fill_pages]
-                for vi, (page_idx, page_slabs) in enumerate(to_refine):
-                    results[page_idx] = refine_page_slabs(
+            to_refine = [(idx, slabs) for idx, slabs in pages_with_slabs if idx in no_fill_pages]
+            max_workers = min(len(to_refine), VISION_MAX_WORKERS)
+            v_prog = st.progress(
+                0,
+                text=f"Vision Refinement (Stage 4) parallel x{max_workers}...",
+            )
+
+            def _vision_refine_worker(page_idx: int, page_slabs: list) -> tuple[int, list, str | None]:
+                doc_v = None
+                try:
+                    v_client, v_model = get_vision_client(backend)
+                    doc_v = _fitz.open(pdf_path)
+                    refined = refine_page_slabs(
                         page_slabs, doc_v[page_idx], v_client, v_model, backend
                     )
-                    v_prog.progress((vi + 1) / len(to_refine),
-                                    text=f"Vision: page {page_idx + 1} done ({vi+1}/{len(to_refine)})")
-                doc_v.close()
-                v_prog.empty()
-                st.session_state["slab_results"] = results
-            except Exception as ve:
-                st.warning(f"Vision Refinement failed: {ve} — using standard detection results")
+                    return page_idx, refined, None
+                except Exception as exc:
+                    return page_idx, page_slabs, str(exc)
+                finally:
+                    if doc_v is not None:
+                        try:
+                            doc_v.close()
+                        except Exception:
+                            pass
+
+            done_v = 0
+            vision_errors = []
+            with ThreadPoolExecutor(max_workers=max_workers) as v_executor:
+                v_futures = {
+                    v_executor.submit(_vision_refine_worker, page_idx, page_slabs): page_idx
+                    for page_idx, page_slabs in to_refine
+                }
+                for v_future in as_completed(v_futures):
+                    page_idx = v_futures[v_future]
+                    try:
+                        refined_page_idx, refined_slabs, err = v_future.result()
+                    except Exception as exc:
+                        refined_page_idx, refined_slabs, err = page_idx, results.get(page_idx, []), str(exc)
+                    results[refined_page_idx] = refined_slabs
+                    done_v += 1
+                    if err:
+                        vision_errors.append((refined_page_idx, err))
+                    v_prog.progress(
+                        done_v / len(to_refine),
+                        text=(
+                            f"Vision parallel: page {refined_page_idx + 1} done "
+                            f"({done_v}/{len(to_refine)})"
+                        ),
+                    )
+            v_prog.empty()
+            st.session_state["slab_results"] = results
+            if vision_errors:
+                for page_idx, err in vision_errors[:5]:
+                    st.warning(
+                        f"Vision refinement failed on page {page_idx + 1}: {err} "
+                        "— kept standard/boundary-first polygon."
+                    )
+                if len(vision_errors) > 5:
+                    st.warning(f"Vision refinement had {len(vision_errors) - 5} more page error(s).")
         else:
             st.markdown(
                 '<div class="success-box">✅ All pages have fill-based slab detection — '
@@ -1584,8 +2336,21 @@ def step3_detect():
                 st.session_state["document_intelligence"] = document_intelligence
                 st.session_state["document_intelligence_path"] = intel_path
                 st.session_state["document_intelligence_raw_path"] = raw_path
+                st.session_state["document_intelligence_parse_report_path"] = (
+                    (document_intelligence.get("_metadata") or {}).get("parse_report_path")
+                )
 
             c_prog.progress(0.35, text="Preparing column/foundation symbols...")
+            intel_status = (
+                document_intelligence.get("_parse_status")
+                or (document_intelligence.get("_metadata") or {}).get("parse_status")
+                or "ok"
+            )
+            if intel_status != "ok":
+                raise RuntimeError(
+                    "Document Intelligence JSON is not valid/usable. "
+                    "Raw Gemini response and parse report were saved for audit."
+                )
             col_types = build_column_types_from_intelligence(document_intelligence)
             fdn_types = build_foundation_types_from_intelligence(document_intelligence)
             schedule_pages = document_intelligence.get("schedule_pages", {})
@@ -1726,15 +2491,22 @@ def step3_detect():
     # AI floor merge: combine all polygons from the same Gemini floor group.
     # Handles: (1) cross-page duplicates (same polygon on pages 9+10 → union = one),
     # (2) zone splits (A+B → full floor shape), (3) non-rectangular/L-shape floors.
-    ai_floor_result = st.session_state.get("ai_floor_result")
+    ai_floor_result = _trusted_ai_floor_result()
     merge_msg = ""
     if ai_floor_result and st.session_state.get("smart_detect_done"):
         before_merge = len(all_slabs)
         all_slabs = _merge_slabs_by_ai_floors(all_slabs, ai_floor_result)
         merge_msg = f"✅ AI merge: {before_merge} raw slabs → {len(all_slabs)} floor slab(s)"
+    elif st.session_state.get("ai_floor_result") and not _semantic_mapping_ready():
+        merge_msg = "Document Intelligence parse is not ok - skipped AI building/floor merge to avoid wrong grouping."
 
     # Assign FFL values from elevation drawing storey heights when FFL annotations are absent
     _assign_ffl_from_elevation(all_slabs, pdf_path, st.session_state.get("page_infos", []))
+    _apply_floor_alignment(
+        all_slabs,
+        st.session_state.get("column_regions", []),
+        st.session_state.get("foundation_regions", []),
+    )
     _refresh_building_registry(
         all_slabs,
         st.session_state.get("column_regions", []),
@@ -1977,8 +2749,10 @@ def step4_review():
 
     # Final images
     st.markdown("---")
+    _render_floor_alignment_report(expanded=False)
+    st.markdown("---")
     st.markdown("#### Final Result Images")
-    tabs = st.tabs(["Slabs", "Buildings", "Columns", "Foundations"])
+    tabs = st.tabs(["Slabs", "Slab Semantics", "Buildings", "Walls", "Columns", "Foundations"])
     with tabs[0]:
         for page_idx in selected_pages:
             img_path = debug_imgs.get(page_idx, {}).get("step5")
@@ -1986,15 +2760,19 @@ def step4_review():
                 with st.expander(f"Page {page_idx+1}", expanded=True):
                     st.image(img_path, use_container_width=True)
     with tabs[1]:
-        _render_building_registry(expanded=True)
+        _render_slab_semantic_preview()
     with tabs[2]:
+        _render_building_registry(expanded=True)
+    with tabs[3]:
+        _render_legend_semantics_and_walls()
+    with tabs[4]:
         _render_element_overlay_gallery(
             "Columns",
             st.session_state.get("column_polygon_images", {}) or {},
             "No column polygon overlay images. Column detection may be disabled or detected 0 columns.",
             "dl_step4_col_overlay",
         )
-    with tabs[3]:
+    with tabs[5]:
         _render_element_overlay_gallery(
             "Foundations",
             st.session_state.get("foundation_polygon_images", {}) or {},
@@ -2033,6 +2811,7 @@ def step5_generate():
     storey_heights_map = st.session_state.get("storey_heights_map", {})
     all_columns     = st.session_state.get("column_regions", [])
     all_foundations = st.session_state.get("foundation_regions", [])
+    all_walls       = st.session_state.get("wall_regions", [])
     height_report, height_by_page_mm = _build_storey_height_report(
         all_slabs,
         st.session_state.get("page_infos", []) or [],
@@ -2051,6 +2830,7 @@ def step5_generate():
             single_model=True,
             preserve_native_building_position=True,
             generated_by="Feeldx Structural Pipeline",
+            wall_regions=all_walls,
         )
         generate_slab_csv(all_slabs, csv_path, storey_heights=storey_heights_map)
 
@@ -2079,15 +2859,18 @@ def step5_generate():
             generate_foundations_ruby(all_foundations, fdn_rb_path)
             st.session_state["fdn_ruby_path"] = fdn_rb_path
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Slabs in script", len(all_slabs))
     c2.metric("Columns", len(all_columns))
     c3.metric("Foundations", len(all_foundations))
-    c4.metric("Script size", f"{len(ruby_content)/1024:.1f} KB")
+    c4.metric("Walls", len(all_walls))
+    c5.metric("Script size", f"{len(ruby_content)/1024:.1f} KB")
 
     st.markdown("---")
     st.markdown("#### Final Model Readiness Report")
+    _render_floor_alignment_report(expanded=True)
     _render_building_registry(building_registry, expanded=True)
+    _render_legend_semantics_and_walls()
 
     st.markdown("---")
     st.markdown("#### Storey Height Report")

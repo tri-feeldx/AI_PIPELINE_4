@@ -465,3 +465,343 @@ def save_building_footprints(registry: dict, save_path: str, dpi: int = 140) -> 
     fig.savefig(save_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return save_path
+
+
+def save_boundary_first_debug(page: fitz.Page, boundary_result, save_path: str, dpi: int = 150) -> str:
+    """Overlay wall-guided boundary evidence on the PDF page."""
+    img = _page_to_image(page, dpi)
+    h, w = img.shape[:2]
+    fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img, origin="upper")
+
+    for poly in getattr(boundary_result, "gross_regions", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="#00C853", edgecolor="#00C853", alpha=0.22, linewidth=2.0)
+    for poly in getattr(boundary_result, "wall_core_candidates", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="#00BCD4", edgecolor="#00BCD4", alpha=0.16, linewidth=0.9)
+    for poly in getattr(boundary_result, "boundary_evidence", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="none", edgecolor="#2962FF", alpha=0.95, linewidth=1.4)
+    structural = getattr(boundary_result, "structural_objects", None)
+    if structural:
+        for obj in getattr(structural, "walls", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#00BCD4", edgecolor="#00BCD4", alpha=0.18, linewidth=1.0)
+        for obj in getattr(structural, "cut_candidates", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#F44336", edgecolor="#F44336", alpha=0.20, linewidth=1.4)
+            if obj.label:
+                c = obj.polygon.centroid
+                ax.text(c.x * dpi / 72, c.y * dpi / 72, obj.kind, color="white", fontsize=6,
+                        bbox=dict(facecolor="#B71C1C", alpha=0.75, pad=1, edgecolor="none"))
+        for obj in getattr(structural, "uncertain_regions", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#FF9800", edgecolor="#FF9800", alpha=0.14, linewidth=0.9)
+        for obj in getattr(structural, "ignored_regions", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#9E9E9E", edgecolor="#9E9E9E", alpha=0.10, linewidth=0.6)
+    for poly in getattr(boundary_result, "grid_column_anchors", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="#2962FF", edgecolor="#2962FF", alpha=0.18, linewidth=0.8)
+    for poly in getattr(boundary_result, "uncertain_candidates", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="#FFAB00", edgecolor="#FFAB00", alpha=0.13, linewidth=0.8)
+
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    ax.set_title(
+        f"Wall/Boundary: {len(getattr(boundary_result, 'final_regions', []) or [])} slab candidates | "
+        f"signatures={len(getattr(boundary_result, 'boundary_signatures', []) or [])} | "
+        f"confidence={getattr(boundary_result, 'confidence', 0.0):.2f}",
+        fontsize=8,
+        color="white",
+        backgroundcolor="black",
+    )
+    fig.tight_layout(pad=0)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight", facecolor="black")
+    plt.close(fig)
+    return save_path
+
+
+def _label_poly(ax, poly, page: fitz.Page, dpi: int, text: str, color: str) -> None:
+    try:
+        c = poly.centroid
+        ax.text(
+            c.x * dpi / 72,
+            c.y * dpi / 72,
+            text,
+            color="white",
+            fontsize=6,
+            ha="center",
+            va="center",
+            bbox=dict(facecolor=color, alpha=0.78, pad=1, edgecolor="none"),
+        )
+    except Exception:
+        pass
+
+
+def _base_wall_fig(page: fitz.Page, dpi: int):
+    img = _page_to_image(page, dpi)
+    h, w = img.shape[:2]
+    fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
+    ax.imshow(img, origin="upper")
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.axis("off")
+    return fig, ax
+
+
+def _finish_wall_fig(fig, ax, title: str, save_path: str) -> str:
+    ax.set_title(title, fontsize=8, color="white", backgroundcolor="black")
+    fig.tight_layout(pad=0)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight", facecolor="black")
+    plt.close(fig)
+    return save_path
+
+
+def save_wall_evidence_only(page: fitz.Page, boundary_result, save_path: str, dpi: int = 170) -> str:
+    """Show only structural boundary evidence, without slab fills hiding it."""
+    fig, ax = _base_wall_fig(page, dpi)
+    structural = getattr(boundary_result, "structural_objects", None)
+    wall_count = 0
+    if structural:
+        for obj in getattr(structural, "ignored_regions", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#9E9E9E", edgecolor="#616161", alpha=0.18, linewidth=1.0)
+            _label_poly(ax, obj.polygon, page, dpi, "ignored", "#616161")
+        for obj in getattr(structural, "walls", []) or []:
+            wall_count += 1
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00E5FF", alpha=1.0, linewidth=2.0)
+        for obj in getattr(structural, "cores", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#AA00FF", alpha=1.0, linewidth=2.2)
+            _label_poly(ax, obj.polygon, page, dpi, "core", "#6A1B9A")
+        for obj in getattr(structural, "stairs", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#F44336", alpha=1.0, linewidth=2.2)
+            _label_poly(ax, obj.polygon, page, dpi, "stair", "#B71C1C")
+        for obj in getattr(structural, "openings", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#FF5722", alpha=1.0, linewidth=2.2)
+            _label_poly(ax, obj.polygon, page, dpi, "opening", "#BF360C")
+        for obj in getattr(structural, "penetrations", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#FF1744", alpha=1.0, linewidth=2.2)
+            _label_poly(ax, obj.polygon, page, dpi, "pen", "#B71C1C")
+    boundary_count = 0
+    for poly in getattr(boundary_result, "boundary_evidence", []) or []:
+        boundary_count += 1
+        _draw_poly(ax, poly, page, dpi, facecolor="none", edgecolor="#2962FF", alpha=0.95, linewidth=1.8)
+    sig_count = len(getattr(boundary_result, "boundary_signatures", []) or [])
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Boundary Evidence Only | walls={wall_count} | signatures={sig_count} | evidence={boundary_count}",
+        save_path,
+    )
+
+
+def save_slab_candidates_only(page: fitz.Page, boundary_result, save_path: str, dpi: int = 150) -> str:
+    """Show gross/uncertain polygon candidates separately from wall evidence."""
+    fig, ax = _base_wall_fig(page, dpi)
+    for i, poly in enumerate(getattr(boundary_result, "gross_regions", []) or [], start=1):
+        color = SLAB_PALETTE[(i - 1) % len(SLAB_PALETTE)]
+        _draw_poly(ax, poly, page, dpi, facecolor=color, edgecolor="#00C853", alpha=0.28, linewidth=2.0)
+        _label_poly(ax, poly, page, dpi, f"keep {i}", "#00A152")
+    for poly in getattr(boundary_result, "uncertain_candidates", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="#FFAB00", edgecolor="#FFAB00", alpha=0.12, linewidth=1.2)
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Slab Candidates Only | kept={len(getattr(boundary_result, 'gross_regions', []) or [])}",
+        save_path,
+    )
+
+
+def save_wall_guided_final(page: fitz.Page, boundary_result, save_path: str, dpi: int = 150) -> str:
+    """Show final wall-guided slab result with cuts, but lighter than combined debug."""
+    fig, ax = _base_wall_fig(page, dpi)
+    for i, poly in enumerate(getattr(boundary_result, "final_regions", []) or [], start=1):
+        _draw_poly(ax, poly, page, dpi, facecolor="#00C853", edgecolor="#00C853", alpha=0.20, linewidth=2.4)
+        _label_poly(ax, poly, page, dpi, f"final {i}", "#00A152")
+    structural = getattr(boundary_result, "structural_objects", None)
+    if structural:
+        for obj in getattr(structural, "cut_candidates", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#F44336", edgecolor="#F44336", alpha=0.18, linewidth=2.0)
+            _label_poly(ax, obj.polygon, page, dpi, obj.kind, "#B71C1C")
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Final Wall-Guided Result | final={len(getattr(boundary_result, 'final_regions', []) or [])}",
+        save_path,
+    )
+
+
+def _legend_bbox(candidate) -> fitz.Rect:
+    if hasattr(candidate, "bbox"):
+        bbox = candidate.bbox
+    else:
+        bbox = candidate.get("bbox", [])
+    return fitz.Rect(*bbox)
+
+
+def save_legend_overlay(page: fitz.Page, candidates: list, save_path: str, dpi: int = 140) -> str:
+    """Show detected legend crop regions on the full page."""
+    fig, ax = _base_wall_fig(page, dpi)
+    scale = dpi / 72.0
+    colors = {"left": "#00B0FF", "right": "#FF6D00"}
+    for cand in candidates or []:
+        rect = _legend_bbox(cand)
+        side = getattr(cand, "side", None) or cand.get("side", "legend")
+        conf = getattr(cand, "confidence", None) or cand.get("confidence", 0)
+        color = colors.get(side, "#00E676")
+        patch = plt.Rectangle(
+            (rect.x0 * scale, rect.y0 * scale),
+            rect.width * scale,
+            rect.height * scale,
+            fill=False,
+            edgecolor=color,
+            linewidth=3.0,
+        )
+        ax.add_patch(patch)
+        ax.text(
+            rect.x0 * scale,
+            max(0, rect.y0 * scale - 4),
+            f"legend {side} {float(conf):.2f}",
+            color="white",
+            fontsize=7,
+            bbox=dict(facecolor=color, alpha=0.85, pad=2, edgecolor="none"),
+        )
+    return _finish_wall_fig(fig, ax, f"Legend Crop Overlay | candidates={len(candidates or [])}", save_path)
+
+
+def save_legend_crop(page: fitz.Page, bbox, save_path: str, dpi: int = 220) -> str:
+    """Save a high-resolution crop of the detected legend region."""
+    rect = fitz.Rect(*bbox)
+    rect = fitz.Rect(
+        max(page.rect.x0, rect.x0),
+        max(page.rect.y0, rect.y0),
+        min(page.rect.x1, rect.x1),
+        min(page.rect.y1, rect.y1),
+    )
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    img.save(save_path)
+    return save_path
+
+
+def save_semantic_wall_overlay(page: fitz.Page, structural_result, save_path: str, dpi: int = 170) -> str:
+    """Show wall evidence after applying Gemini legend semantic rules."""
+    fig, ax = _base_wall_fig(page, dpi)
+    semantic_walls = 0
+    geometry_walls = 0
+    for obj in getattr(structural_result, "ignored_regions", []) or []:
+        _draw_poly(ax, obj.polygon, page, dpi, facecolor="#9E9E9E", edgecolor="#616161", alpha=0.12, linewidth=0.8)
+    for obj in getattr(structural_result, "walls", []) or []:
+        source = str(getattr(obj, "source", ""))
+        if source.startswith("legend_semantic") or source == "wall_label":
+            semantic_walls += 1
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#FF00FF", edgecolor="#FF00FF", alpha=0.18, linewidth=2.4)
+            _label_poly(ax, obj.polygon, page, dpi, "wall label", "#AD1457")
+        else:
+            geometry_walls += 1
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00E5FF", alpha=0.95, linewidth=1.5)
+    for obj in getattr(structural_result, "uncertain_regions", []) or []:
+        if getattr(obj, "kind", "") == "slab_boundary_evidence":
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="#FFAB00", edgecolor="#FFAB00", alpha=0.18, linewidth=2.0)
+            _label_poly(ax, obj.polygon, page, dpi, "slab cue", "#E65100")
+    for obj in getattr(structural_result, "cut_candidates", []) or []:
+        _draw_poly(ax, obj.polygon, page, dpi, facecolor="#F44336", edgecolor="#F44336", alpha=0.20, linewidth=2.2)
+        _label_poly(ax, obj.polygon, page, dpi, obj.kind, "#B71C1C")
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Semantic Wall Overlay | semantic={semantic_walls} geometry={geometry_walls}",
+        save_path,
+    )
+
+
+def save_wall_polygons(page: fitz.Page, walls: list, save_path: str, dpi: int = 170) -> str:
+    """Show only wall polygons that will be exported to the model."""
+    fig, ax = _base_wall_fig(page, dpi)
+    for i, wall in enumerate(walls or [], start=1):
+        poly = getattr(wall, "polygon", None)
+        if poly is None or poly.is_empty:
+            continue
+        _draw_poly(ax, poly, page, dpi, facecolor="#8E24AA", edgecolor="#D500F9", alpha=0.22, linewidth=2.6)
+        label = getattr(wall, "label", "") or f"wall {i}"
+        _label_poly(ax, poly, page, dpi, label[:18], "#6A1B9A")
+    return _finish_wall_fig(fig, ax, f"Wall Model Polygons | walls={len(walls or [])}", save_path)
+
+
+def _draw_semantic_objects(ax, objects: list, page: fitz.Page, dpi: int,
+                           facecolor: str, edgecolor: str, label_prefix: str) -> int:
+    count = 0
+    for obj in objects or []:
+        poly = getattr(obj, "polygon", None)
+        if poly is None or poly.is_empty:
+            continue
+        count += 1
+        _draw_poly(ax, poly, page, dpi, facecolor=facecolor, edgecolor=edgecolor, alpha=0.22, linewidth=2.2)
+        label = getattr(obj, "label", "") or label_prefix
+        _label_poly(ax, poly, page, dpi, label[:18], edgecolor)
+    return count
+
+
+def save_slab_semantic_surface(page: fitz.Page, preview, save_path: str, dpi: int = 150) -> str:
+    fig, ax = _base_wall_fig(page, dpi)
+    n = _draw_semantic_objects(
+        ax,
+        getattr(preview, "surface_regions", []) or [],
+        page,
+        dpi,
+        "#00C853",
+        "#00A152",
+        "slab surface",
+    )
+    fallback = getattr(preview, "fallback_policy", "unknown")
+    source = getattr(preview, "effective_surface_source", "unknown")
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Slab Surface Evidence | regions={n} | source={source} | fallback={fallback}",
+        save_path,
+    )
+
+
+def save_slab_semantic_boundary_cues(page: fitz.Page, preview, save_path: str, dpi: int = 150) -> str:
+    fig, ax = _base_wall_fig(page, dpi)
+    n = _draw_semantic_objects(
+        ax,
+        getattr(preview, "boundary_cues", []) or [],
+        page,
+        dpi,
+        "#FFAB00",
+        "#E65100",
+        "slab cue",
+    )
+    return _finish_wall_fig(fig, ax, f"Slab Boundary Cues | cues={n} | no auto-cut", save_path)
+
+
+def save_slab_semantic_cut_candidates(page: fitz.Page, preview, save_path: str, dpi: int = 150) -> str:
+    fig, ax = _base_wall_fig(page, dpi)
+    n = _draw_semantic_objects(
+        ax,
+        getattr(preview, "cut_candidates", []) or [],
+        page,
+        dpi,
+        "#F44336",
+        "#B71C1C",
+        "slab cut",
+    )
+    return _finish_wall_fig(fig, ax, f"Slab Cut Candidates | cuts={n}", save_path)
+
+
+def save_floor_alignment_preview(rows: list[dict], save_path: str, dpi: int = 140) -> str:
+    """Create a compact text/table preview for floor alignment offsets."""
+    fig, ax = plt.subplots(figsize=(10, max(3, 0.38 * max(len(rows), 1) + 1.5)), dpi=dpi)
+    ax.axis("off")
+    ax.set_title("Floor Alignment Report", fontsize=12, weight="bold")
+    if not rows:
+        ax.text(0.5, 0.5, "No floor alignment rows", ha="center", va="center")
+    else:
+        cols = ["Building", "Page", "Reference", "dx_mm", "dy_mm", "Confidence", "Applied", "Warning"]
+        table_data = [[str(r.get(c, "")) for c in cols] for r in rows]
+        table = ax.table(cellText=table_data, colLabels=cols, loc="center", cellLoc="left")
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1, 1.35)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return save_path

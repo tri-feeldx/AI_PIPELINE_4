@@ -341,6 +341,22 @@ def refine_page_slabs(slabs: list, page: fitz.Page, client, model: str,
         slabs[largest_idx].source  = "vision"
         print(f"[VisionRefiner] Replaced slab[{largest_idx}].polygon with vision result "
               f"({vision_poly.area:.0f} pt²)")
+        if len(slabs) > 1:
+            others = [s for i, s in enumerate(slabs) if i != largest_idx and getattr(s, "polygon", None)]
+            max_other = max((s.polygon.area for s in others), default=0)
+            if max_other > 0 and vision_poly.area >= max_other * 2.5:
+                cleaned = [slabs[largest_idx]]
+                for s in others:
+                    keep_large_external = (
+                        s.polygon.area >= vision_poly.area * 0.20
+                        and not vision_poly.buffer(8).contains(s.polygon.centroid)
+                    )
+                    if keep_large_external:
+                        cleaned.append(s)
+                dropped = len(slabs) - len(cleaned)
+                if dropped:
+                    print(f"[VisionRefiner] Dropped {dropped} small boundary fragments after vision cleanup")
+                    slabs = cleaned
 
     except Exception as exc:
         print(f"[VisionRefiner] Error: {exc} — keeping original polygons")

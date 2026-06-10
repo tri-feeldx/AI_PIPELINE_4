@@ -23,7 +23,7 @@ You are a principal structural engineer and construction-document analyst.
 You will receive FULL extracted text from every page of one structural PDF.
 Your job is DOCUMENT INTELLIGENCE, not geometry. Do not invent coordinates.
 
-Return ONLY valid JSON. No markdown, no explanation.
+Return ONLY valid JSON. No markdown, no explanation. Keep the response compact.
 
 Critical reading rules:
 - Read legends, schedules, plan notes, title blocks, and slab/floor plan text.
@@ -43,6 +43,9 @@ Critical reading rules:
   text, and elevation/section pages with LEVEL/ROOF labels. Do not invent heights.
 - If a page appears useful for measuring heights but lacks explicit numeric elevations, return it as an elevation/section source
   with recommended_action="measure_level_spacing_from_drawing".
+- Avoid generating duplicate symbol variants that only repeat the same schedule information. Prefer compact canonical symbols
+  and put detailed ambiguity in warnings. If output would be too large, prioritize buildings/floors/page mapping,
+  schedule pages, column/foundation symbol families, and warnings.
 
 Required JSON schema:
 {
@@ -184,25 +187,94 @@ def _load_gemini_client():
     return client, model
 
 
-def _parse_json_response(raw: str) -> dict:
+def _strip_json_fence(raw: str) -> str:
     cleaned = (raw or "").strip()
-    cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned, flags=re.MULTILINE).strip()
-    cleaned = re.sub(r"```$", "", cleaned, flags=re.MULTILINE).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned, count=1).strip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+    return cleaned
+
+
+def _looks_truncated(raw: str, cleaned: str) -> bool:
+    text = (cleaned or "").rstrip()
+    if not text:
+        return True
+    if (raw or "").strip().startswith("```") and not (raw or "").strip().endswith("```"):
+        return True
+    if not text.endswith(("}", "]")):
+        return True
+    return text.count("{") != text.count("}") or text.count("[") != text.count("]")
+
+
+def _parse_json_response(raw: str) -> tuple[dict, dict]:
+    cleaned = _strip_json_fence(raw)
+    report = {
+        "parse_status": "ok",
+        "parse_error": None,
+        "raw_response_length": len(raw or ""),
+        "cleaned_response_length": len(cleaned or ""),
+        "response_ended_cleanly": not _looks_truncated(raw or "", cleaned),
+    }
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        parsed = json.loads(cleaned)
+        if not any(parsed.get(k) for k in ("buildings", "column_symbols", "foundation_symbols", "schedule_pages", "height_sources")):
+            report["parse_status"] = "schema_empty"
+            report["parse_error"] = "Valid JSON parsed, but semantic schema is empty."
+        return parsed, report
+    except json.JSONDecodeError as exc:
+        report["parse_status"] = "truncated" if _looks_truncated(raw or "", cleaned) else "invalid_json"
+        report["parse_error"] = f"{exc.msg} at line {exc.lineno} column {exc.colno}"
         m = re.search(r"\{[\s\S]*\}", cleaned)
         if m:
             try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
+                parsed = json.loads(m.group(0))
+                report["parse_status"] = "ok"
+                report["parse_error"] = None
+                return parsed, report
+            except json.JSONDecodeError as inner_exc:
+                report["parse_error"] = (
+                    f"{report['parse_error']}; object-slice parse failed: "
+                    f"{inner_exc.msg} at line {inner_exc.lineno} column {inner_exc.colno}"
+                )
                 pass
-    return {"_parse_error": "Gemini response was not valid JSON", "raw_response": raw}
+    return {
+        "_parse_error": "Gemini response was not valid JSON",
+        "_parse_status": report["parse_status"],
+    }, report
 
 
-def normalize_document_intelligence(raw: dict, page_count: int = 0) -> dict:
+def normalize_document_intelligence(raw: dict, page_count: int = 0, parse_report: dict | None = None) -> dict:
     """Ensure expected top-level keys exist."""
     raw = raw or {}
+    parse_report = parse_report or {"parse_status": "ok"}
+    if raw.get("_parse_error"):
+        summary = {
+            "project_name": None,
+            "page_count": page_count,
+            "detection_confidence": "low",
+            "notes": raw.get("_parse_error"),
+        }
+        return {
+            "_parse_error": raw.get("_parse_error"),
+            "_parse_status": parse_report.get("parse_status", "invalid_json"),
+            "_metadata": dict(parse_report),
+            "document_summary": summary,
+            "legend_rules": {"columns": [], "foundations": []},
+            "column_symbols": {},
+            "foundation_symbols": {},
+            "buildings": [],
+            "schedule_pages": {
+                "column_schedule_pages": [],
+                "foundation_schedule_pages": [],
+                "footing_plan_pages": [],
+                "legend_pages": [],
+                "detail_pages": [],
+            },
+            "height_sources": [],
+            "storey_heights": [],
+            "warnings": [raw.get("_parse_error")],
+        }
     summary = raw.get("document_summary") or {}
     summary.setdefault("project_name", None)
     summary.setdefault("page_count", page_count)
@@ -211,7 +283,9 @@ def normalize_document_intelligence(raw: dict, page_count: int = 0) -> dict:
     schedule_pages = raw.get("schedule_pages") or {}
     for key in ("column_schedule_pages", "foundation_schedule_pages", "footing_plan_pages", "legend_pages", "detail_pages"):
         schedule_pages.setdefault(key, [])
-    return {
+    parsed = {
+        "_parse_status": parse_report.get("parse_status", "ok"),
+        "_metadata": dict(parse_report),
         "document_summary": summary,
         "legend_rules": raw.get("legend_rules") or {"columns": [], "foundations": []},
         "column_symbols": raw.get("column_symbols") or {},
@@ -222,6 +296,9 @@ def normalize_document_intelligence(raw: dict, page_count: int = 0) -> dict:
         "storey_heights": raw.get("storey_heights") or [],
         "warnings": raw.get("warnings") or [],
     }
+    if parse_report.get("parse_status") != "ok":
+        parsed.setdefault("warnings", []).append(parse_report.get("parse_error") or parse_report.get("parse_status"))
+    return parsed
 
 
 def analyze_document_intelligence(pdf_path: str, output_dir: str | Path) -> tuple[dict, str, Optional[str]]:
@@ -237,12 +314,20 @@ def analyze_document_intelligence(pdf_path: str, output_dir: str | Path) -> tupl
             f"PDF page_count={page_count}\nFULL_TEXT:\n{full_text}",
         ],
     )
-    raw_text = (response.text or "").strip()
-    parsed = normalize_document_intelligence(_parse_json_response(raw_text), page_count=page_count)
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"document_intelligence_{ts}.json"
     raw_path = output_dir / f"document_intelligence_{ts}_raw.txt"
-    json_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
+    report_path = output_dir / f"document_intelligence_{ts}_parse_report.json"
+    raw_text = (response.text or "").strip()
     raw_path.write_text(raw_text, encoding="utf-8")
+    raw_parsed, parse_report = _parse_json_response(raw_text)
+    parse_report.update({
+        "raw_response_path": str(raw_path),
+        "parsed_json_path": str(json_path),
+        "parse_report_path": str(report_path),
+    })
+    parsed = normalize_document_intelligence(raw_parsed, page_count=page_count, parse_report=parse_report)
+    parsed["_metadata"].update(parse_report)
+    report_path.write_text(json.dumps(parse_report, indent=2, ensure_ascii=False), encoding="utf-8")
+    json_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8")
     return parsed, str(json_path), str(raw_path)
