@@ -170,6 +170,7 @@ def init_session():
         "line_semantics_catalog_path": None,
         "line_semantics_cache_key": None,
         "line_semantic_policy_images": {},
+        "step5_back_target": 3,
         "slab_semantic_previews": {},
         "slab_semantic_surface_images": {},
         "slab_semantic_boundary_images": {},
@@ -211,7 +212,7 @@ with st.sidebar:
         ("1", "Upload PDF"),
         ("2", "Select Pages"),
         ("3", "Detect Slabs"),
-        ("4", "Review"),
+        ("4", "Optional Review"),
         ("5", "Generate 3D"),
         ("6", "Export to SketchUp"),
     ]
@@ -2294,17 +2295,24 @@ def _render_step3_results():
                         st.info("Image not available.")
 
     st.markdown("---")
-    col_back, col_next = st.columns(2)
+    col_back, col_review, col_next = st.columns(3)
     with col_back:
         if st.button("← Back", use_container_width=True):
             # Clear cache so re-entering step 3 will re-process with any new settings
             st.session_state["slab_results"] = {}
             st.session_state["step"] = 2
             _rerun()
+    with col_review:
+        if total > 0:
+            if st.button("Advanced Review/Edit", use_container_width=True):
+                st.session_state["step5_back_target"] = 4
+                st.session_state["step"] = 4
+                _rerun()
     with col_next:
         if total > 0:
-            if st.button("Next: Review →", type="primary", use_container_width=True):
-                st.session_state["step"] = 4
+            if st.button("Generate 3D →", type="primary", use_container_width=True):
+                st.session_state["step5_back_target"] = 3
+                st.session_state["step"] = 5
                 _rerun()
         else:
             st.markdown(
@@ -2998,6 +3006,7 @@ def step4_review():
             _rerun()
     with col_next:
         if st.button("Next: Generate 3D Model →", type="primary", use_container_width=True):
+            st.session_state["step5_back_target"] = 4
             st.session_state["step"] = 5
             _rerun()
 
@@ -3148,7 +3157,7 @@ def step5_generate():
     col_back, col_next = st.columns(2)
     with col_back:
         if st.button("← Back", use_container_width=True):
-            st.session_state["step"] = 4
+            st.session_state["step"] = st.session_state.get("step5_back_target", 3)
             _rerun()
     with col_next:
         if st.button("Next: SketchUp Guide →", type="primary", use_container_width=True):
