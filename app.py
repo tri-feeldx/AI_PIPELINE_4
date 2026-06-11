@@ -1248,6 +1248,7 @@ def _process_page_worker(args: tuple) -> tuple:
             drawings,
             text_blocks=text_blocks,
             legend_semantics=legend_semantics,
+            polygonize_slabs=not reliable_visible_fill,
         )
         boundary_confidence = getattr(boundary_result, "confidence", 0.0)
         structural_debug = getattr(getattr(boundary_result, "structural_objects", None), "debug", {}) or {}
@@ -1292,7 +1293,11 @@ def _process_page_worker(args: tuple) -> tuple:
             "boundary_confidence": boundary_confidence,
             "boundary_signature_count": boundary_result.debug.get("boundary_signature_count", 0),
             "boundary_evidence_count": boundary_result.debug.get("boundary_evidence_count", 0),
+            "excluded_non_boundary_count": boundary_result.debug.get("excluded_non_boundary_count", 0),
             "wall_count": structural_debug.get("walls", 0),
+            "load_bearing_count": structural_debug.get("load_bearing_elements", 0),
+            "column_or_pile_count": structural_debug.get("columns_or_piles", 0),
+            "footing_count": structural_debug.get("footings", 0),
             "core_count": structural_debug.get("cores", 0),
             "stair_count": structural_debug.get("stairs", 0),
             "opening_count": structural_debug.get("openings", 0),
@@ -2058,6 +2063,8 @@ def _render_step3_results():
                         f"mode={stats.get('extraction_mode')}",
                         f"boundary_signatures={stats.get('boundary_signature_count', 0)}",
                         f"boundary_evidence={stats.get('boundary_evidence_count', 0)}",
+                        f"walls={stats.get('wall_count', 0)}",
+                        f"excluded={stats.get('excluded_non_boundary_count', 0)}",
                     ])
                 )
             tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "Gross/Net", "Wall/Boundary", "④ Labeled", "⑤ Final"])

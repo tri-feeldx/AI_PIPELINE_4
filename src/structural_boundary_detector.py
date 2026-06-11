@@ -30,6 +30,9 @@ class BoundaryObject:
 class StructuralBoundaryResult:
     walls: list[BoundaryObject] = field(default_factory=list)
     cores: list[BoundaryObject] = field(default_factory=list)
+    load_bearing_elements: list[BoundaryObject] = field(default_factory=list)
+    columns_or_piles: list[BoundaryObject] = field(default_factory=list)
+    footings: list[BoundaryObject] = field(default_factory=list)
     stairs: list[BoundaryObject] = field(default_factory=list)
     openings: list[BoundaryObject] = field(default_factory=list)
     penetrations: list[BoundaryObject] = field(default_factory=list)
@@ -51,6 +54,12 @@ _STAIR_RE = re.compile(r"\b(STAIR|STAIRS|ST)\s*\d*\b", re.I)
 _CORE_RE = re.compile(r"\b(LIFT|CORE|SHAFT|RISER|ELEVATOR)\b", re.I)
 _OPENING_RE = re.compile(r"\b(OPENING|VOID|PENETRATION|PEN|HATCH|HOLE)\b", re.I)
 _IGNORE_RE = re.compile(r"\b(LEGEND|NOTES?|SCHEDULE|TITLE|REVISION|KEYPLAN|SCALE)\b", re.I)
+_COLUMN_PILE_RE = re.compile(
+    r"\b([A-Z]-)?C{1,2}\d{1,3}\b|\bPC\d+\b|\bPILE\s*CAP\b|\bCONCRETE\s+COLUMN\b",
+    re.I,
+)
+_FOOTING_RE = re.compile(r"\bPF\d+\b|\bPAD\s+FOOTING\b|\bSTRIP\s+FOOTING\b|\bFOOTING\b", re.I)
+_LOAD_BEARING_RE = re.compile(r"\bLOAD[-\s]*BEARING\b|\bCONCRETE\s+ELEMENT\b", re.I)
 _WALL_LABEL_RE = re.compile(
     r"\b((R\.?\s*C\.?|RC|CONCRETE|MASONRY|PRECAST|BLOCKWORK|LOAD\s*BEARING|LOAD-BEARING|RETAINING)\s+WALL|WALL\s+(W\d+|BW\d+))\b",
     re.I,
@@ -137,6 +146,16 @@ def _looks_like_note_text(text: str) -> bool:
     return any(token in upper for token in ("REFER TO", "DRAWING", "ARCHITECT", "NOTES", "SCHEDULE"))
 
 
+def _looks_like_round_or_square_symbol(poly: Polygon) -> bool:
+    minx, miny, maxx, maxy = poly.bounds
+    w = maxx - minx
+    h = maxy - miny
+    if w <= 0 or h <= 0:
+        return False
+    ratio = max(w, h) / max(min(w, h), 1)
+    return 0.55 <= min(w, h) <= 45 and ratio <= 1.45
+
+
 def _extract_vector_evidence(drawings: list[dict], drawing_area: Polygon) -> tuple[list[Polygon], list[Polygon]]:
     walls: list[Polygon] = []
     rects: list[Polygon] = []
@@ -194,7 +213,10 @@ def detect_structural_boundary_objects(
 
     result = StructuralBoundaryResult()
     for poly in wall_polys:
-        result.walls.append(BoundaryObject("wall", poly, confidence=0.65, source="thick_line_or_rect"))
+        if _looks_like_round_or_square_symbol(poly):
+            result.columns_or_piles.append(BoundaryObject("column_or_pile", poly, confidence=0.58, source="compact_symbol"))
+        else:
+            result.walls.append(BoundaryObject("wall", poly, confidence=0.65, source="thick_line_or_rect"))
 
     for block in blocks:
         text = block.get("text", "")
@@ -209,14 +231,41 @@ def detect_structural_boundary_objects(
         never_cut_hit = _keyword_hit(text, never_cut_keywords)
         slab_hit = _keyword_hit(text, slab_boundary_keywords)
         generic_wall_hit = _WALL_LABEL_RE.search(text)
+        column_hit = _COLUMN_PILE_RE.search(text)
+        footing_hit = _FOOTING_RE.search(text)
+        load_bearing_hit = _LOAD_BEARING_RE.search(text)
         in_drawing_area = drawing_area.buffer(5).contains(center)
-        if (wall_hit or generic_wall_hit) and in_drawing_area and not _looks_like_note_text(text):
+        if footing_hit and in_drawing_area:
+            result.footings.append(BoundaryObject(
+                "footing",
+                target,
+                text,
+                0.82,
+                "footing_label",
+            ))
+        elif column_hit and in_drawing_area:
+            result.columns_or_piles.append(BoundaryObject(
+                "column_or_pile",
+                target,
+                text,
+                0.84,
+                "column_or_pile_label",
+            ))
+        elif (wall_hit or generic_wall_hit) and in_drawing_area and not _looks_like_note_text(text):
             result.walls.append(BoundaryObject(
                 "wall",
                 target,
                 text,
                 0.88 if wall_hit else 0.82,
                 f"legend_semantic:{wall_hit}" if wall_hit else "wall_label",
+            ))
+        elif load_bearing_hit and in_drawing_area and not _looks_like_note_text(text):
+            result.load_bearing_elements.append(BoundaryObject(
+                "load_bearing_element",
+                target,
+                text,
+                0.78,
+                "load_bearing_label",
             ))
         elif cut_hit and not never_cut_hit:
             result.penetrations.append(BoundaryObject(
@@ -249,6 +298,9 @@ def detect_structural_boundary_objects(
     wall_union = unary_union([w.polygon for w in result.walls]) if result.walls else None
     result.debug = {
         "walls": len(result.walls),
+        "load_bearing_elements": len(result.load_bearing_elements),
+        "columns_or_piles": len(result.columns_or_piles),
+        "footings": len(result.footings),
         "cores": len(result.cores),
         "stairs": len(result.stairs),
         "openings": len(result.openings),

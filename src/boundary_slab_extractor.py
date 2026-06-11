@@ -14,6 +14,7 @@ from typing import Optional
 
 import fitz
 from shapely.geometry import LineString, Polygon, box
+from shapely.prepared import prep
 from shapely.ops import polygonize, unary_union
 
 from src.structural_boundary_detector import StructuralBoundaryResult, detect_structural_boundary_objects
@@ -160,13 +161,45 @@ def _extract_linework(drawings: list[dict]) -> tuple[list[LineString], list[Poly
     return lines, wall_like, anchors, styled
 
 
-def _learn_boundary_signatures(page: fitz.Page, styled: list[StyledSegment]) -> tuple[list[dict], list[LineString]]:
+def _line_midpoint(line: LineString) -> Polygon:
+    p0, p1 = list(line.coords)[0], list(line.coords)[-1]
+    x = (p0[0] + p1[0]) / 2.0
+    y = (p0[1] + p1[1]) / 2.0
+    return box(x - 0.5, y - 0.5, x + 0.5, y + 0.5)
+
+
+def _build_exclusion_geometry(exclusion_polys: list[Polygon]):
+    if not exclusion_polys:
+        return None
+    try:
+        return prep(unary_union([p.buffer(4) for p in exclusion_polys if p is not None and not p.is_empty]))
+    except Exception:
+        return None
+
+
+def _is_excluded_line(line: LineString, exclusion_geom) -> bool:
+    if exclusion_geom is None:
+        return False
+    mid = _line_midpoint(line)
+    probe = line.buffer(1.5, cap_style=2, join_style=2)
+    return bool(exclusion_geom.contains(mid) or exclusion_geom.intersects(probe))
+
+
+def _learn_boundary_signatures(
+    page: fitz.Page,
+    styled: list[StyledSegment],
+    exclusion_polys: list[Polygon] | None = None,
+) -> tuple[list[dict], list[LineString]]:
     """Learn likely boundary styles from this page without hardcoding colors."""
     page_area = page.rect.width * page.rect.height
     page_diag = math.sqrt(max(page_area, 1.0))
+    exclusion_polys = exclusion_polys or []
+    exclusion_geom = _build_exclusion_geometry(exclusion_polys)
     groups: dict[str, dict] = {}
     for item in styled:
         line = item.line
+        if _is_excluded_line(line, exclusion_geom):
+            continue
         if line.length < max(8.0, page_diag * 0.006):
             continue
         if not _is_axis_aligned(line, tol=2.0):
@@ -198,7 +231,7 @@ def _learn_boundary_signatures(page: fitz.Page, styled: list[StyledSegment]) -> 
             g.get("color"),
             page_area,
         )
-        if g["score"] >= 0.38 and g["total_length"] >= page_diag * 0.20:
+        if g["score"] >= 0.38 and g["total_length"] >= page_diag * 0.20 and g["long_count"] >= 2:
             signatures.append(g)
     signatures.sort(key=lambda x: (x["score"], x["total_length"]), reverse=True)
     signatures = signatures[:8]
@@ -206,7 +239,11 @@ def _learn_boundary_signatures(page: fitz.Page, styled: list[StyledSegment]) -> 
     evidence_lines = [
         item.line for item in styled
         if item.style_key in keys
-        and item.line.length >= max(8.0, page_diag * 0.006)
+        and not _is_excluded_line(item.line, exclusion_geom)
+        and (
+            item.line.length >= max(18.0, page_diag * 0.018)
+            or any(s["style_key"] == item.style_key and s.get("dashed") for s in signatures)
+        )
         and _is_axis_aligned(item.line, tol=2.0)
     ]
     return signatures, evidence_lines
@@ -240,10 +277,12 @@ def _score_region(poly: Polygon, page: fitz.Page, drawing_area: Polygon, anchors
     if drawing_area.contains(poly.centroid):
         score += 0.15
         reasons.append("inside_drawing_area")
+    anchor_hits = 0
     if anchors:
         nearby = sum(1 for a in anchors if poly.buffer(3).intersects(a))
         if nearby:
-            score += min(0.20, nearby * 0.025)
+            anchor_hits = nearby
+            score += min(0.08, nearby * 0.010)
             reasons.append(f"anchors={nearby}")
     if wall_evidence:
         hits = sum(1 for w in wall_evidence if poly.boundary.buffer(4).intersects(w))
@@ -262,22 +301,89 @@ def _score_region(poly: Polygon, page: fitz.Page, drawing_area: Polygon, anchors
             reasons.append("rectangularity_ok")
     except Exception:
         pass
+    if anchor_hits and not any(r.startswith(("walls=", "boundary_signature=")) for r in reasons):
+        score = min(score, 0.42)
+        reasons.append("anchors_only_not_enough")
     return min(score, 0.95), reasons
+
+
+def _polygonize_lines(lines: list[LineString]) -> list[Polygon]:
+    if not lines:
+        return []
+    merged = unary_union(lines)
+    return [p.buffer(0) for p in polygonize(merged) if p.area > 1]
+
+
+def _score_polygons(polygons: list[Polygon], page: fitz.Page, drawing_area: Polygon,
+                    anchors: list[Polygon], wall_evidence: list[Polygon],
+                    boundary_evidence: list[Polygon]) -> tuple[list[tuple[float, Polygon, list[str]]], list[dict]]:
+    scored = []
+    ignored = []
+    for poly in polygons:
+        if poly.is_empty or not poly.is_valid:
+            continue
+        score, reasons = _score_region(
+            poly, page, drawing_area, anchors, wall_evidence, boundary_evidence
+        )
+        has_evidence = any(r.startswith(("walls=", "boundary_signature=")) for r in reasons)
+        if not has_evidence:
+            score = 0.0
+            reasons.append("no_wall_or_boundary_evidence")
+        if score <= 0:
+            ignored.append({"polygon": poly, "reason": ",".join(reasons)})
+            continue
+        scored.append((score, poly, reasons))
+    return scored, ignored
+
+
+def _select_polygonize_lines(page: fitz.Page, boundary_lines: list[LineString], lines: list[LineString]) -> list[LineString]:
+    page_diag = math.sqrt(page.rect.width * page.rect.height)
+    polygonize_lines = boundary_lines if len(boundary_lines) >= 4 else lines
+    if boundary_lines:
+        min_len = max(6.0, page_diag * 0.005)
+        polygonize_lines = [line for line in boundary_lines if line.length >= min_len]
+    if len(polygonize_lines) > 4500:
+        polygonize_lines = sorted(polygonize_lines, key=lambda s: s.length, reverse=True)[:4500]
+    return polygonize_lines
 
 
 def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
                                  text_blocks: list[dict] | None = None,
-                                 legend_semantics: dict | None = None) -> BoundaryExtractionResult:
+                                 legend_semantics: dict | None = None,
+                                 polygonize_slabs: bool = True) -> BoundaryExtractionResult:
     """Build slab candidates from closed vector boundary regions."""
     drawing_area = _drawing_area(page)
     lines, wall_like, anchors, styled = _extract_linework(drawings)
-    boundary_signatures, boundary_lines = _learn_boundary_signatures(page, styled)
-    boundary_evidence = [line.buffer(2.0, cap_style=2, join_style=2) for line in boundary_lines]
     structural_objects = detect_structural_boundary_objects(
         page, drawings, text_blocks=text_blocks, auto_cut_voids=True,
         legend_semantics=legend_semantics,
     )
-    wall_evidence = wall_like + [w.polygon for w in structural_objects.walls]
+    non_boundary_objects = [
+        *getattr(structural_objects, "columns_or_piles", []),
+        *getattr(structural_objects, "footings", []),
+        *getattr(structural_objects, "ignored_regions", []),
+    ]
+    exclusion_polys = [obj.polygon for obj in non_boundary_objects if obj.polygon is not None and not obj.polygon.is_empty]
+    if not polygonize_slabs:
+        return BoundaryExtractionResult(
+            wall_core_candidates=wall_like,
+            grid_column_anchors=anchors,
+            structural_objects=structural_objects,
+            mode_reason="structural_evidence_only",
+            debug={
+                "raw_line_segments": len(lines),
+                "excluded_non_boundary_count": len(exclusion_polys),
+                **structural_objects.debug,
+            },
+        )
+    boundary_signatures, boundary_lines = _learn_boundary_signatures(page, styled, exclusion_polys=exclusion_polys)
+    boundary_evidence = [line.buffer(2.0, cap_style=2, join_style=2) for line in boundary_lines]
+    wall_evidence = (
+        wall_like
+        + [w.polygon for w in structural_objects.walls]
+        + [w.polygon for w in getattr(structural_objects, "load_bearing_elements", [])]
+        + [w.polygon for w in getattr(structural_objects, "cores", [])]
+    )
     semantic_boundary_evidence = [
         obj.polygon for obj in structural_objects.uncertain_regions
         if obj.kind == "slab_boundary_evidence"
@@ -292,20 +398,10 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             debug=structural_objects.debug,
         )
     raw_line_count = len(lines)
-    polygonize_lines = boundary_lines if len(boundary_lines) >= 4 else lines
-    if boundary_lines:
-        # Signature-first is both more general and much faster on dense PDFs:
-        # polygonize the page-learned boundary graph instead of every text/grid tick.
-        min_len = max(6.0, math.sqrt(page.rect.width * page.rect.height) * 0.005)
-        polygonize_lines = [line for line in boundary_lines if line.length >= min_len]
-    if len(polygonize_lines) > 4500:
-        # Dense drawings can make polygonize explode. Keep the longest structural
-        # linework first; short ticks/text fragments rarely define slab extent.
-        polygonize_lines = sorted(polygonize_lines, key=lambda s: s.length, reverse=True)[:4500]
+    polygonize_lines = _select_polygonize_lines(page, boundary_lines, lines)
 
     try:
-        merged = unary_union(polygonize_lines)
-        polygons = [p.buffer(0) for p in polygonize(merged) if p.area > 1]
+        polygons = _polygonize_lines(polygonize_lines)
     except Exception as exc:
         return BoundaryExtractionResult(
             structural_objects=structural_objects,
@@ -313,22 +409,36 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             debug=structural_objects.debug,
         )
 
-    scored = []
-    ignored = []
-    for poly in polygons:
-        if poly.is_empty or not poly.is_valid:
-            continue
-        score, reasons = _score_region(
-            poly, page, drawing_area, anchors, wall_evidence, all_boundary_evidence
-        )
-        has_evidence = any(r.startswith(("walls=", "boundary_signature=", "anchors=")) for r in reasons)
-        if not has_evidence:
-            score = 0.0
-            reasons.append("no_boundary_evidence")
-        if score <= 0:
-            ignored.append({"polygon": poly, "reason": ",".join(reasons)})
-            continue
-        scored.append((score, poly, reasons))
+    scored, ignored = _score_polygons(polygons, page, drawing_area, anchors, wall_evidence, all_boundary_evidence)
+    fallback_used = False
+    if not scored and exclusion_polys:
+        # If object exclusion removed the only closing segments, retry the learned
+        # signature graph without exclusion. Region scoring still requires wall or
+        # boundary support, so columns/footings cannot accept slabs by themselves.
+        fallback_signatures, fallback_lines = _learn_boundary_signatures(page, styled, exclusion_polys=[])
+        fallback_polygonize_lines = _select_polygonize_lines(page, fallback_lines, lines)
+        try:
+            fallback_polygons = _polygonize_lines(fallback_polygonize_lines)
+            fallback_evidence = [line.buffer(2.0, cap_style=2, join_style=2) for line in fallback_lines]
+            fallback_scored, fallback_ignored = _score_polygons(
+                fallback_polygons,
+                page,
+                drawing_area,
+                anchors,
+                wall_evidence,
+                fallback_evidence + semantic_boundary_evidence,
+            )
+        except Exception:
+            fallback_scored, fallback_ignored = [], []
+        if fallback_scored:
+            fallback_used = True
+            boundary_signatures = fallback_signatures
+            boundary_lines = fallback_lines
+            all_boundary_evidence = fallback_evidence + semantic_boundary_evidence
+            polygonize_lines = fallback_polygonize_lines
+            polygons = fallback_polygons
+            scored = fallback_scored
+            ignored.extend(fallback_ignored)
 
     if not scored:
         return BoundaryExtractionResult(
@@ -343,6 +453,8 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
                 "polygonized_regions": len(polygons),
                 "boundary_signature_count": len(boundary_signatures),
                 "boundary_evidence_count": len(all_boundary_evidence),
+                "excluded_non_boundary_count": len(exclusion_polys),
+                "fallback_signature_graph_used": fallback_used,
                 **structural_objects.debug,
             },
         )
@@ -393,6 +505,8 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             "raw_line_segments": raw_line_count,
             "boundary_signature_count": len(boundary_signatures),
             "boundary_evidence_count": len(all_boundary_evidence),
+            "excluded_non_boundary_count": len(exclusion_polys),
+            "fallback_signature_graph_used": fallback_used,
             "boundary_signatures": boundary_signatures,
             "polygonized_regions": len(polygons),
             "scored_regions": len(scored),

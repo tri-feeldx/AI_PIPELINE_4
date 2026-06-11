@@ -564,9 +564,20 @@ def save_wall_evidence_only(page: fitz.Page, boundary_result, save_path: str, dp
         for obj in getattr(structural, "walls", []) or []:
             wall_count += 1
             _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00E5FF", alpha=1.0, linewidth=2.0)
+            _label_poly(ax, obj.polygon, page, dpi, "wall", "#00838F")
+        for obj in getattr(structural, "load_bearing_elements", []) or []:
+            wall_count += 1
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00BFA5", alpha=1.0, linewidth=2.2)
+            _label_poly(ax, obj.polygon, page, dpi, "load", "#00796B")
         for obj in getattr(structural, "cores", []) or []:
             _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#AA00FF", alpha=1.0, linewidth=2.2)
             _label_poly(ax, obj.polygon, page, dpi, "core", "#6A1B9A")
+        for obj in getattr(structural, "columns_or_piles", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#607D8B", alpha=0.9, linewidth=1.6)
+            _label_poly(ax, obj.polygon, page, dpi, "exclude", "#455A64")
+        for obj in getattr(structural, "footings", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#795548", alpha=0.9, linewidth=1.6)
+            _label_poly(ax, obj.polygon, page, dpi, "footing", "#5D4037")
         for obj in getattr(structural, "stairs", []) or []:
             _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#F44336", alpha=1.0, linewidth=2.2)
             _label_poly(ax, obj.polygon, page, dpi, "stair", "#B71C1C")
@@ -584,7 +595,7 @@ def save_wall_evidence_only(page: fitz.Page, boundary_result, save_path: str, dp
     return _finish_wall_fig(
         fig,
         ax,
-        f"Boundary Evidence Only | walls={wall_count} | signatures={sig_count} | evidence={boundary_count}",
+        f"Wall/Core First | walls+load={wall_count} | signatures={sig_count} | evidence={boundary_count}",
         save_path,
     )
 
@@ -614,6 +625,14 @@ def save_wall_guided_final(page: fitz.Page, boundary_result, save_path: str, dpi
         _label_poly(ax, poly, page, dpi, f"final {i}", "#00A152")
     structural = getattr(boundary_result, "structural_objects", None)
     if structural:
+        for obj in getattr(structural, "walls", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00E5FF", alpha=0.95, linewidth=1.8)
+        for obj in getattr(structural, "load_bearing_elements", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#00BFA5", alpha=0.95, linewidth=1.8)
+        for obj in getattr(structural, "columns_or_piles", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#607D8B", alpha=0.65, linewidth=1.0)
+        for obj in getattr(structural, "footings", []) or []:
+            _draw_poly(ax, obj.polygon, page, dpi, facecolor="none", edgecolor="#795548", alpha=0.65, linewidth=1.0)
         for obj in getattr(structural, "cut_candidates", []) or []:
             _draw_poly(ax, obj.polygon, page, dpi, facecolor="#F44336", edgecolor="#F44336", alpha=0.18, linewidth=2.0)
             _label_poly(ax, obj.polygon, page, dpi, obj.kind, "#B71C1C")
