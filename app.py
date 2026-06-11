@@ -1214,7 +1214,7 @@ def _process_page_worker(args: tuple) -> tuple:
         save_step1_raw_paths, save_step2_polygons, save_step3_filtered,
         save_step4_labeled, save_step5_final, save_gross_net_slab_debug,
         save_boundary_first_debug, save_wall_evidence_only,
-        save_slab_candidates_only, save_wall_guided_final,
+        save_slab_candidates_only, save_wall_guided_final, save_interior_resolver_debug,
     )
 
     doc = fitz.open(pdf_path)
@@ -1312,6 +1312,13 @@ def _process_page_worker(args: tuple) -> tuple:
             "boundary_signature_count": boundary_result.debug.get("boundary_signature_count", 0),
             "boundary_evidence_count": boundary_result.debug.get("boundary_evidence_count", 0),
             "line_semantic_rule_count": boundary_result.debug.get("line_semantic_rule_count", 0),
+            "interior_candidate_count": boundary_result.debug.get("interior_candidate_count", 0),
+            "interior_selected_count": boundary_result.debug.get("interior_selected_count", 0),
+            "interior_rejected_count": boundary_result.debug.get("interior_rejected_count", 0),
+            "interior_seed_count": boundary_result.debug.get("interior_seed_count", 0),
+            "interior_outside_mask_count": boundary_result.debug.get("interior_outside_mask_count", 0),
+            "interior_confidence": boundary_result.debug.get("interior_confidence", 0),
+            "interior_warnings": boundary_result.debug.get("interior_warnings", []),
             "excluded_non_boundary_count": boundary_result.debug.get("excluded_non_boundary_count", 0),
             "wall_count": structural_debug.get("walls", 0),
             "load_bearing_count": structural_debug.get("load_bearing_elements", 0),
@@ -1337,6 +1344,7 @@ def _process_page_worker(args: tuple) -> tuple:
             (save_boundary_first_debug, "boundary", (page, boundary_result, f"{debug_base}_boundary_first.png")),
             (save_wall_evidence_only, "wall_evidence", (page, boundary_result, f"{debug_base}_wall_evidence.png")),
             (save_slab_candidates_only, "wall_candidates", (page, boundary_result, f"{debug_base}_wall_candidates.png")),
+            (save_interior_resolver_debug, "interior", (page, boundary_result, f"{debug_base}_interior_resolver.png")),
             (save_wall_guided_final, "wall_final", (page, boundary_result, f"{debug_base}_wall_final.png")),
             (save_step4_labeled,   "step4", (page, slab_regions,   f"{debug_base}_step4_labeled.png")),
             (save_step5_final,     "step5", (page, slab_regions,   f"{debug_base}_step5_final.png")),
@@ -2134,6 +2142,12 @@ def _render_step3_results():
                 "Fill confidence": round(float(stats.get("fill_confidence", 0.0)), 2),
                 "Boundary confidence": round(float(stats.get("boundary_confidence", 0.0)), 2),
                 "Line semantic rules": stats.get("line_semantic_rule_count", 0),
+                "Interior candidates": stats.get("interior_candidate_count", 0),
+                "Interior selected": stats.get("interior_selected_count", 0),
+                "Interior seeds": stats.get("interior_seed_count", 0),
+                "Outside masks": stats.get("interior_outside_mask_count", 0),
+                "Interior confidence": round(float(stats.get("interior_confidence", 0.0)), 2),
+                "Interior warning": " | ".join(stats.get("interior_warnings", []) or []),
                 "Walls": stats.get("wall_count", 0),
                 "Cores": stats.get("core_count", 0),
                 "Stairs": stats.get("stair_count", 0),
@@ -2222,12 +2236,15 @@ def _render_step3_results():
                         f"mode={stats.get('extraction_mode')}",
                         f"boundary_signatures={stats.get('boundary_signature_count', 0)}",
                         f"boundary_evidence={stats.get('boundary_evidence_count', 0)}",
+                        f"interior={stats.get('interior_selected_count', 0)}/{stats.get('interior_candidate_count', 0)}",
+                        f"seeds={stats.get('interior_seed_count', 0)}",
+                        f"outside_masks={stats.get('interior_outside_mask_count', 0)}",
                         f"walls={stats.get('wall_count', 0)}",
                         f"excluded={stats.get('excluded_non_boundary_count', 0)}",
                     ])
                 )
-            tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "Gross/Net", "Wall/Boundary", "④ Labeled", "⑤ Final"])
-            step_keys = ["step1", "step2", "step3", "gross_net", "boundary", "step4", "step5"]
+            tabs = st.tabs(["① Raw Paths", "② Polygons", "③ Filtered", "Gross/Net", "Wall/Boundary", "Interior Resolver", "④ Labeled", "⑤ Final"])
+            step_keys = ["step1", "step2", "step3", "gross_net", "boundary", "interior", "step4", "step5"]
             for tab, key in zip(tabs, step_keys):
                 with tab:
                     if key == "boundary":
@@ -2250,6 +2267,19 @@ def _render_step3_results():
                                     )
                             else:
                                 st.info(f"{label} image not available.")
+                        continue
+                    if key == "interior":
+                        img_path = page_imgs.get("interior")
+                        if img_path and Path(img_path).exists():
+                            st.image(img_path, use_container_width=True)
+                            with open(img_path, "rb") as f:
+                                st.download_button(
+                                    "Download interior_resolver.png", f.read(),
+                                    file_name=Path(img_path).name, mime="image/png",
+                                    key=f"dl_{page_idx}_interior_resolver",
+                                )
+                        else:
+                            st.info("Interior Resolver image not available.")
                         continue
                     img_path = page_imgs.get(key)
                     if img_path and Path(img_path).exists():

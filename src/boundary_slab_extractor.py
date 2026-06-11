@@ -17,6 +17,7 @@ from shapely.geometry import LineString, Polygon, box
 from shapely.prepared import prep
 from shapely.ops import polygonize, unary_union
 
+from src.interior_slab_resolver import InteriorSlabResolution, resolve_interior_slabs
 from src.structural_boundary_detector import StructuralBoundaryResult, detect_structural_boundary_objects
 
 
@@ -29,6 +30,7 @@ class BoundaryExtractionResult:
     boundary_signatures: list[dict] = field(default_factory=list)
     grid_column_anchors: list[Polygon] = field(default_factory=list)
     structural_objects: StructuralBoundaryResult | None = None
+    interior_resolution: InteriorSlabResolution | None = None
     uncertain_candidates: list[Polygon] = field(default_factory=list)
     ignored_regions: list[dict] = field(default_factory=list)
     confidence: float = 0.0
@@ -620,11 +622,22 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
     scored.sort(key=lambda x: (x[0], x[1].area), reverse=True)
     top_score = scored[0][0]
     top_area = scored[0][1].area
-    kept = [
+    initial_kept = [
         poly for score, poly, _ in scored
         if score >= max(0.55, top_score - 0.14) and poly.area >= top_area * 0.08
     ]
     uncertain = [poly for score, poly, _ in scored if 0.35 <= score < max(0.55, top_score - 0.18)]
+    interior = resolve_interior_slabs(
+        page,
+        scored,
+        text_blocks=text_blocks,
+        structural_objects=structural_objects,
+    )
+    kept = (
+        interior.selected_inside_slabs
+        if interior.debug.get("candidate_count", 0)
+        else initial_kept
+    )
 
     try:
         gross = [g for g in getattr(unary_union(kept), "geoms", [unary_union(kept)]) if not g.is_empty]
@@ -651,9 +664,10 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
         boundary_signatures=boundary_signatures,
         grid_column_anchors=anchors,
         structural_objects=structural_objects,
+        interior_resolution=interior,
         uncertain_candidates=uncertain,
         ignored_regions=ignored,
-        confidence=top_score,
+        confidence=max(top_score, interior.confidence),
         mode_reason=(
             "evidence_guided_no_fill_boundary"
             if boundary_signatures or structural_objects.walls else "linework_polygonize"
@@ -672,6 +686,14 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             "kept_regions": len(gross),
             "net_regions": len(final),
             "top_reasons": scored[0][2],
+            "interior_candidate_count": interior.debug.get("candidate_count", 0),
+            "interior_selected_count": interior.debug.get("selected_count", 0),
+            "interior_rejected_count": interior.debug.get("rejected_count", 0),
+            "interior_seed_count": interior.debug.get("inside_seed_count", 0),
+            "interior_outside_mask_count": interior.debug.get("outside_mask_count", 0),
+            "interior_confidence": interior.confidence,
+            "interior_warnings": interior.warnings,
+            "interior_top_reasons": interior.debug.get("top_reasons", []),
             **structural_objects.debug,
         },
     )

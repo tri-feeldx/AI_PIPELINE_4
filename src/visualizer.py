@@ -645,6 +645,47 @@ def save_wall_guided_final(page: fitz.Page, boundary_result, save_path: str, dpi
     )
 
 
+def save_interior_resolver_debug(page: fitz.Page, boundary_result, save_path: str, dpi: int = 150) -> str:
+    """Show inside/outside evidence used to choose no-fill slab interiors."""
+    fig, ax = _base_wall_fig(page, dpi)
+    resolution = getattr(boundary_result, "interior_resolution", None)
+    if resolution:
+        for mask in getattr(resolution, "outside_masks", []) or []:
+            poly = getattr(mask, "polygon", None)
+            if poly is not None and not poly.is_empty:
+                _draw_poly(ax, poly, page, dpi, facecolor="#F44336", edgecolor="#B71C1C", alpha=0.16, linewidth=1.4)
+                label = getattr(mask, "kind", "outside")
+                _label_poly(ax, poly, page, dpi, label[:16], "#B71C1C")
+        for decision in getattr(resolution, "rejected_candidates", []) or []:
+            poly = getattr(decision, "polygon", None)
+            if poly is not None and not poly.is_empty:
+                _draw_poly(ax, poly, page, dpi, facecolor="#FFD600", edgecolor="#FF8F00", alpha=0.10, linewidth=1.4)
+        for poly in getattr(resolution, "selected_inside_slabs", []) or []:
+            if poly is not None and not poly.is_empty:
+                _draw_poly(ax, poly, page, dpi, facecolor="#00C853", edgecolor="#00C853", alpha=0.24, linewidth=2.8)
+                _label_poly(ax, poly, page, dpi, "inside slab", "#00A152")
+        for seed in getattr(resolution, "inside_seeds", []) or []:
+            poly = getattr(seed, "polygon", None)
+            if poly is not None and not poly.is_empty:
+                _draw_poly(ax, poly, page, dpi, facecolor="#2962FF", edgecolor="#0039CB", alpha=0.22, linewidth=1.2)
+                label = getattr(seed, "kind", "seed")
+                _label_poly(ax, poly, page, dpi, label[:14], "#0039CB")
+    for poly in getattr(boundary_result, "boundary_evidence", []) or []:
+        _draw_poly(ax, poly, page, dpi, facecolor="none", edgecolor="#00E5FF", alpha=0.75, linewidth=1.1)
+    debug = getattr(boundary_result, "debug", {}) or {}
+    return _finish_wall_fig(
+        fig,
+        ax,
+        "Interior Resolver | "
+        f"selected={debug.get('interior_selected_count', 0)} "
+        f"rejected={debug.get('interior_rejected_count', 0)} "
+        f"seeds={debug.get('interior_seed_count', 0)} "
+        f"masks={debug.get('interior_outside_mask_count', 0)} "
+        f"conf={debug.get('interior_confidence', 0):.2f}",
+        save_path,
+    )
+
+
 def _legend_bbox(candidate) -> fitz.Rect:
     if hasattr(candidate, "bbox"):
         bbox = candidate.bbox
