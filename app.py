@@ -163,6 +163,13 @@ def init_session():
         "legend_semantics_raw_path": None,
         "legend_semantics_report_path": None,
         "legend_semantics_cache_key": None,
+        "line_semantics": None,
+        "line_semantics_path": None,
+        "line_semantics_raw_path": None,
+        "line_semantics_report_path": None,
+        "line_semantics_catalog_path": None,
+        "line_semantics_cache_key": None,
+        "line_semantic_policy_images": {},
         "slab_semantic_previews": {},
         "slab_semantic_surface_images": {},
         "slab_semantic_boundary_images": {},
@@ -278,6 +285,13 @@ def step1_upload():
         st.session_state["legend_semantics_raw_path"] = None
         st.session_state["legend_semantics_report_path"] = None
         st.session_state["legend_semantics_cache_key"] = None
+        st.session_state["line_semantics"] = None
+        st.session_state["line_semantics_path"] = None
+        st.session_state["line_semantics_raw_path"] = None
+        st.session_state["line_semantics_report_path"] = None
+        st.session_state["line_semantics_catalog_path"] = None
+        st.session_state["line_semantics_cache_key"] = None
+        st.session_state["line_semantic_policy_images"] = {}
         st.session_state["slab_semantic_previews"] = {}
         st.session_state["slab_semantic_surface_images"] = {}
         st.session_state["slab_semantic_boundary_images"] = {}
@@ -1179,7 +1193,10 @@ def _process_page_worker(args: tuple) -> tuple:
     Worker for parallel page processing.
     Opens its own fitz document — fitz.Document is NOT thread-safe when shared.
     """
-    if len(args) >= 5:
+    line_semantics = None
+    if len(args) >= 6:
+        pdf_path, page_idx, scale, debug_base, legend_semantics, line_semantics = args[:6]
+    elif len(args) >= 5:
         pdf_path, page_idx, scale, debug_base, legend_semantics = args[:5]
     else:
         pdf_path, page_idx, scale, debug_base = args
@@ -1248,6 +1265,7 @@ def _process_page_worker(args: tuple) -> tuple:
             drawings,
             text_blocks=text_blocks,
             legend_semantics=legend_semantics,
+            line_semantics=line_semantics,
             polygonize_slabs=not reliable_visible_fill,
         )
         boundary_confidence = getattr(boundary_result, "confidence", 0.0)
@@ -1293,6 +1311,7 @@ def _process_page_worker(args: tuple) -> tuple:
             "boundary_confidence": boundary_confidence,
             "boundary_signature_count": boundary_result.debug.get("boundary_signature_count", 0),
             "boundary_evidence_count": boundary_result.debug.get("boundary_evidence_count", 0),
+            "line_semantic_rule_count": boundary_result.debug.get("line_semantic_rule_count", 0),
             "excluded_non_boundary_count": boundary_result.debug.get("excluded_non_boundary_count", 0),
             "wall_count": structural_debug.get("walls", 0),
             "load_bearing_count": structural_debug.get("load_bearing_elements", 0),
@@ -1423,6 +1442,63 @@ def _run_legend_semantics(pdf_path: str, pages_to_process: list[int]) -> dict:
     return result
 
 
+def _run_line_semantics(pdf_path: str, pages_to_process: list[int]) -> dict:
+    """Call Gemini on compact line-style catalog and render policy overlays."""
+    import fitz
+    from src.line_semantic_analyzer import analyze_line_semantics
+    from src.visualizer import save_line_semantic_policy_overlay
+
+    sampled_pages = _sample_pages_for_semantics(pages_to_process)
+    sem_result = st.session_state.get("legend_semantics") or {}
+    legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
+    cache_key = {"pdf_path": str(pdf_path), "pages": sampled_pages}
+    if st.session_state.get("line_semantics_cache_key") == cache_key:
+        cached = st.session_state.get("line_semantics")
+        if cached:
+            return cached
+
+    out_dir = OUTPUT_DIR / "line_semantics"
+    result, json_path, raw_path, report_path, catalog_path = analyze_line_semantics(
+        pdf_path,
+        sampled_pages,
+        out_dir,
+        legend_semantics=legend_semantics,
+    )
+    st.session_state["line_semantics"] = result
+    st.session_state["line_semantics_path"] = json_path
+    st.session_state["line_semantics_raw_path"] = raw_path
+    st.session_state["line_semantics_report_path"] = report_path
+    st.session_state["line_semantics_catalog_path"] = catalog_path
+    st.session_state["line_semantics_cache_key"] = cache_key
+
+    style_rules = (result.get("gemini_result") or {}).get("style_rules", []) if isinstance(result, dict) else []
+    catalog_pages = {
+        int(p.get("page_index")): p
+        for p in (result.get("line_catalog", {}) or {}).get("pages", [])
+        if isinstance(p, dict) and p.get("page_index") is not None
+    }
+    img_dir = sess_debug_dir / "line_semantics"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    images: dict[int, str] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_idx, page_catalog in catalog_pages.items():
+            if page_idx < 0 or page_idx >= doc.page_count:
+                continue
+            p = img_dir / f"p{page_idx + 1:02d}_line_semantic_policy.png"
+            images[page_idx] = save_line_semantic_policy_overlay(
+                doc[page_idx],
+                page_catalog,
+                style_rules,
+                str(p),
+                dpi=130,
+            )
+    finally:
+        doc.close()
+    st.session_state["line_semantic_policy_images"] = images
+    return result
+
+
 def _run_wall_detection_preview(pdf_path: str, pages_to_process: list[int], scale: int) -> list:
     """Detect semantic wall objects and render review overlays."""
     import fitz
@@ -1496,6 +1572,8 @@ def _run_slab_semantic_preview(pdf_path: str, pages_to_process: list[int]) -> di
 
     sem_result = st.session_state.get("legend_semantics") or {}
     legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
+    line_result = st.session_state.get("line_semantics") or {}
+    line_semantics = line_result if isinstance(line_result, dict) else None
     if not legend_semantics:
         st.session_state["slab_semantic_previews"] = {}
         return {}
@@ -1504,6 +1582,7 @@ def _run_slab_semantic_preview(pdf_path: str, pages_to_process: list[int]) -> di
         pdf_path,
         pages_to_process,
         legend_semantics=legend_semantics,
+        line_semantics=line_semantics,
     )
     out_dir = sess_debug_dir / "slab_semantics"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1639,6 +1718,84 @@ def _render_legend_semantics_and_walls():
                 ("Download legend semantics JSON", "legend_semantics_path", "application/json"),
                 ("Download legend semantics raw", "legend_semantics_raw_path", "text/plain"),
                 ("Download legend semantics parse report", "legend_semantics_report_path", "application/json"),
+            ]:
+                p = st.session_state.get(path_key)
+                if p and Path(p).exists():
+                    with open(p, "rb") as f:
+                        st.download_button(
+                            label,
+                            f.read(),
+                            file_name=Path(p).name,
+                            mime=mime,
+                            key=f"dl_{path_key}",
+                        )
+
+
+def _render_line_semantics():
+    sem = st.session_state.get("line_semantics")
+    if not sem:
+        return
+    metadata = (sem or {}).get("_metadata", {}) if isinstance(sem, dict) else {}
+    parsed = (sem or {}).get("gemini_result", {}) if isinstance(sem, dict) else {}
+    catalog = (sem or {}).get("line_catalog", {}) if isinstance(sem, dict) else {}
+    rules = parsed.get("style_rules", []) if isinstance(parsed, dict) else []
+    parse_status = metadata.get("parse_status", "N/A")
+    semantic_counts: dict[str, int] = {}
+    for rule in rules or []:
+        semantic = str(rule.get("semantic") or "unknown")
+        semantic_counts[semantic] = semantic_counts.get(semantic, 0) + 1
+
+    with st.expander("Step 2.x - Line Semantic Intelligence", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Parse", parse_status)
+        c2.metric("Style rules", len(rules or []))
+        c3.metric("Catalog pages", len(catalog.get("pages", []) or []))
+        c4.metric("Overlay pages", len(st.session_state.get("line_semantic_policy_images", {}) or {}))
+        if parse_status not in ("ok", "N/A"):
+            st.warning("Gemini line semantic response is not valid/complete. Pipeline will fall back to existing wall/core-first geometry.")
+
+        tabs = st.tabs(["Line Catalog", "Gemini Line Semantics", "Boundary/Wall Policy Overlay", "Raw JSON"])
+        with tabs[0]:
+            rows = []
+            for page in catalog.get("pages", []) or []:
+                for style in page.get("line_styles", []) or []:
+                    rows.append({
+                        "Page": page.get("page"),
+                        "Style ID": style.get("style_id"),
+                        "Color": style.get("color_bucket"),
+                        "Width": style.get("width"),
+                        "Dashed": style.get("dashed"),
+                        "Segments": style.get("segment_count"),
+                        "Long Segments": style.get("long_segment_count"),
+                        "Total Length": style.get("total_length"),
+                        "Nearby Text": " | ".join((style.get("nearby_text") or [])[:3]),
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No line catalog rows available.")
+        with tabs[1]:
+            if semantic_counts:
+                st.json({"semantic_counts": semantic_counts})
+            if rules:
+                st.dataframe(pd.DataFrame(rules), use_container_width=True, hide_index=True)
+            if parsed.get("warnings"):
+                for w in parsed.get("warnings", []):
+                    st.warning(w)
+        with tabs[2]:
+            _render_element_overlay_gallery(
+                "Line Semantic Policy",
+                st.session_state.get("line_semantic_policy_images", {}) or {},
+                "No line semantic policy overlays yet.",
+                "dl_line_semantic_policy",
+            )
+        with tabs[3]:
+            st.json(sem or {})
+            for label, path_key, mime in [
+                ("Download line semantics JSON", "line_semantics_path", "application/json"),
+                ("Download line semantics raw", "line_semantics_raw_path", "text/plain"),
+                ("Download line semantics parse report", "line_semantics_report_path", "application/json"),
+                ("Download line catalog", "line_semantics_catalog_path", "application/json"),
             ]:
                 p = st.session_state.get(path_key)
                 if p and Path(p).exists():
@@ -1976,6 +2133,7 @@ def _render_step3_results():
                 "Reliable fill": bool(stats.get("reliable_visible_fill", False)),
                 "Fill confidence": round(float(stats.get("fill_confidence", 0.0)), 2),
                 "Boundary confidence": round(float(stats.get("boundary_confidence", 0.0)), 2),
+                "Line semantic rules": stats.get("line_semantic_rule_count", 0),
                 "Walls": stats.get("wall_count", 0),
                 "Cores": stats.get("core_count", 0),
                 "Stairs": stats.get("stair_count", 0),
@@ -1989,6 +2147,7 @@ def _render_step3_results():
 
     _render_legend_detection()
     _render_slab_semantic_preview()
+    _render_line_semantics()
     _render_legend_semantics_and_walls()
     _render_document_intelligence()
     _render_floor_alignment_report(expanded=True)
@@ -2157,10 +2316,21 @@ def step3_detect():
         if not st.session_state.get("legend_semantics"):
             with st.spinner("Step 2.2 - Gemini reading legend rules..."):
                 _run_legend_semantics(pdf_path, pages_to_process)
+    except Exception as we:
+        st.warning(f"Legend semantic preview failed: {we}")
+
+    try:
+        if not st.session_state.get("line_semantics"):
+            with st.spinner("Step 2.x - Gemini classifying line styles..."):
+                _run_line_semantics(pdf_path, pages_to_process)
+    except Exception as le:
+        st.warning(f"Line semantic intelligence failed; falling back to wall/core-first geometry: {le}")
+
+    try:
         _run_slab_semantic_preview(pdf_path, pages_to_process)
         _run_wall_detection_preview(pdf_path, pages_to_process, scale)
     except Exception as we:
-        st.warning(f"Legend semantic / wall preview failed: {we}")
+        st.warning(f"Slab/wall semantic preview failed: {we}")
 
     # BUG 0 FIX: Cache guard — skip re-processing if all pages already done
     existing = st.session_state.get("slab_results", {})
@@ -2183,8 +2353,10 @@ def step3_detect():
 
     sem_result = st.session_state.get("legend_semantics") or {}
     legend_semantics = sem_result.get("gemini_result") if isinstance(sem_result, dict) else None
+    line_result = st.session_state.get("line_semantics") or {}
+    line_semantics = line_result if isinstance(line_result, dict) else None
     worker_args = [
-        (pdf_path, page_idx, scale, str(sess_debug_dir / f"p{page_idx + 1:02d}"), legend_semantics)
+        (pdf_path, page_idx, scale, str(sess_debug_dir / f"p{page_idx + 1:02d}"), legend_semantics, line_semantics)
         for page_idx in pages_to_process
     ]
 
@@ -2768,6 +2940,7 @@ def step4_review():
                     st.image(img_path, use_container_width=True)
     with tabs[1]:
         _render_slab_semantic_preview()
+        _render_line_semantics()
     with tabs[2]:
         _render_building_registry(expanded=True)
     with tabs[3]:
@@ -2878,6 +3051,7 @@ def step5_generate():
     _render_floor_alignment_report(expanded=True)
     _render_building_registry(building_registry, expanded=True)
     _render_legend_semantics_and_walls()
+    _render_line_semantics()
 
     st.markdown("---")
     st.markdown("#### Storey Height Report")

@@ -127,6 +127,7 @@ def detect_slab_semantics_on_page(
     page: fitz.Page,
     drawings: list[dict],
     legend_semantics: dict | None = None,
+    line_semantics: dict | None = None,
     text_blocks: list[dict] | None = None,
 ) -> SlabSemanticPreview:
     rules = _rules(legend_semantics)
@@ -153,6 +154,7 @@ def detect_slab_semantics_on_page(
             drawings,
             text_blocks=blocks,
             legend_semantics=legend_semantics,
+            line_semantics=line_semantics,
         )
         boundary_debug = boundary.debug or {}
         boundary_confidence = getattr(boundary, "confidence", 0.0)
@@ -232,6 +234,7 @@ def detect_slab_semantics_on_page(
         "effective_surface_source": preview.effective_surface_source,
         "boundary_evidence_count": boundary_debug.get("boundary_evidence_count", 0),
         "boundary_signature_count": boundary_debug.get("boundary_signature_count", 0),
+        "line_semantic_rule_count": boundary_debug.get("line_semantic_rule_count", 0),
         "boundary_envelope_confidence": boundary_confidence,
         "excluded_non_boundary_count": boundary_debug.get("excluded_non_boundary_count", 0),
         "wall_count": boundary_debug.get("walls", 0),
@@ -250,6 +253,7 @@ def detect_slab_semantics_for_pages(
     pdf_path: str,
     page_indices: list[int],
     legend_semantics: dict | None = None,
+    line_semantics: dict | None = None,
 ) -> dict[int, SlabSemanticPreview]:
     previews: dict[int, SlabSemanticPreview] = {}
     doc = fitz.open(pdf_path)
@@ -262,6 +266,7 @@ def detect_slab_semantics_for_pages(
                 page,
                 page.get_drawings(),
                 legend_semantics=legend_semantics,
+                line_semantics=line_semantics,
             )
     finally:
         doc.close()

@@ -11,6 +11,7 @@ from typing import Optional
 
 import fitz
 from shapely.geometry import MultiPolygon as _MultiPolygon
+from shapely.geometry import box as _box
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -804,6 +805,75 @@ def save_slab_semantic_cut_candidates(page: fitz.Page, preview, save_path: str, 
         "slab cut",
     )
     return _finish_wall_fig(fig, ax, f"Slab Cut Candidates | cuts={n}", save_path)
+
+
+def save_line_semantic_policy_overlay(
+    page: fitz.Page,
+    page_catalog: dict,
+    style_rules: list[dict],
+    save_path: str,
+    dpi: int = 150,
+) -> str:
+    """Show Gemini line-style policies using compact catalog sample bboxes."""
+    fig, ax = _base_wall_fig(page, dpi)
+    rule_by_style = {
+        str(r.get("style_id") or r.get("style_key")): r
+        for r in (style_rules or [])
+        if isinstance(r, dict) and (r.get("style_id") or r.get("style_key"))
+    }
+    colors = {
+        "building_boundary": "#00C853",
+        "slab_edge": "#64DD17",
+        "wall": "#00BCD4",
+        "site_boundary": "#D50000",
+        "grid": "#9E9E9E",
+        "dimension": "#757575",
+        "annotation": "#607D8B",
+        "joint": "#FF9800",
+        "reference": "#795548",
+        "unknown": "#FFD600",
+    }
+    counts: dict[str, int] = {}
+    for style in page_catalog.get("line_styles", []) or []:
+        style_id = str(style.get("style_id"))
+        rule = rule_by_style.get(style_id, {})
+        semantic = str(rule.get("semantic") or "unknown")
+        color = colors.get(semantic, colors["unknown"])
+        counts[semantic] = counts.get(semantic, 0) + 1
+        for bbox in style.get("sample_bboxes", [])[:5]:
+            try:
+                poly = _box(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])).buffer(4)
+                _draw_poly(ax, poly, page, dpi, facecolor=None, edgecolor=color, alpha=0.20, linewidth=2.0)
+            except Exception:
+                continue
+        if style.get("sample_bboxes"):
+            try:
+                bbox = style["sample_bboxes"][0]
+                poly = _box(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+                cx = poly.centroid.x * dpi / 72.0
+                cy = poly.centroid.y * dpi / 72.0
+                use_for = ",".join(rule.get("use_for", []) or [])
+                conf = float(rule.get("confidence") or 0)
+                ax.text(
+                    cx, cy, f"{semantic}\n{use_for}\n{conf:.2f}",
+                    ha="center", va="center", fontsize=5, color="white",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.65, edgecolor=color),
+                )
+            except Exception:
+                pass
+    handles = [
+        mpatches.Patch(color=color, alpha=0.55, label=f"{semantic} ({counts.get(semantic, 0)})")
+        for semantic, color in colors.items()
+        if counts.get(semantic, 0)
+    ]
+    if handles:
+        ax.legend(handles=handles, loc="lower right", fontsize=5, framealpha=0.75)
+    return _finish_wall_fig(
+        fig,
+        ax,
+        f"Line Semantic Policy | styles={len(page_catalog.get('line_styles', []) or [])}",
+        save_path,
+    )
 
 
 def save_floor_alignment_preview(rows: list[dict], save_path: str, dpi: int = 140) -> str:

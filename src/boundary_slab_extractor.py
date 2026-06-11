@@ -51,6 +51,61 @@ class StyledSegment:
     dashed: bool = False
 
 
+def _line_semantic_rules(line_semantics: dict | None) -> dict[str, dict]:
+    """Return Gemini line style rules keyed by style_id/style_key."""
+    if not isinstance(line_semantics, dict):
+        return {}
+    payload = line_semantics.get("gemini_result") if "gemini_result" in line_semantics else line_semantics
+    if not isinstance(payload, dict):
+        return {}
+    rules: dict[str, dict] = {}
+    for rule in payload.get("style_rules", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        style_id = rule.get("style_id") or rule.get("style_key")
+        if style_id:
+            rules[str(style_id)] = rule
+    return rules
+
+
+def _semantic_policy(rule: dict | None) -> tuple[bool, float, list[str]]:
+    """Return (suppress, score_boost, reasons) for a style semantic rule."""
+    if not rule:
+        return False, 0.0, []
+    semantic = str(rule.get("semantic") or "unknown")
+    use_for = rule.get("use_for") or []
+    if isinstance(use_for, str):
+        use_for = [use_for]
+    use_for = [str(v) for v in use_for]
+    draw_policy = str(rule.get("draw_policy") or "review")
+    try:
+        confidence = float(rule.get("confidence") or 0)
+    except Exception:
+        confidence = 0.0
+    reasons = [f"line_semantic={semantic}:{confidence:.2f}"]
+
+    suppress_semantics = {"site_boundary", "grid", "dimension", "annotation", "reference"}
+    if confidence >= 0.60 and (
+        semantic in suppress_semantics
+        or "ignore" in use_for
+        or "context_only" in use_for
+        or draw_policy == "do_not_draw_from_this"
+    ):
+        return True, -0.35, reasons + ["semantic_suppressed"]
+
+    boost = 0.0
+    if confidence >= 0.55 and (semantic in {"building_boundary", "slab_edge"} or "slab_enclosure" in use_for):
+        boost += min(0.25, 0.12 + confidence * 0.12)
+        reasons.append("semantic_boost_slab_enclosure")
+    elif confidence >= 0.65 and (semantic == "wall" or "wall_detection" in use_for):
+        boost += 0.04
+        reasons.append("semantic_wall_context")
+    elif confidence >= 0.65 and semantic == "joint":
+        boost -= 0.08
+        reasons.append("semantic_joint_snap_only")
+    return False, boost, reasons
+
+
 def _segment_from_item(item) -> Optional[LineString]:
     if item[0] != "l":
         return None
@@ -189,14 +244,19 @@ def _learn_boundary_signatures(
     page: fitz.Page,
     styled: list[StyledSegment],
     exclusion_polys: list[Polygon] | None = None,
+    line_semantics: dict | None = None,
 ) -> tuple[list[dict], list[LineString]]:
     """Learn likely boundary styles from this page without hardcoding colors."""
     page_area = page.rect.width * page.rect.height
     page_diag = math.sqrt(max(page_area, 1.0))
     exclusion_polys = exclusion_polys or []
     exclusion_geom = _build_exclusion_geometry(exclusion_polys)
+    semantic_rules = _line_semantic_rules(line_semantics)
     groups: dict[str, dict] = {}
     for item in styled:
+        suppress, _, _ = _semantic_policy(semantic_rules.get(item.style_key))
+        if suppress:
+            continue
         line = item.line
         if _is_excluded_line(line, exclusion_geom):
             continue
@@ -231,6 +291,18 @@ def _learn_boundary_signatures(
             g.get("color"),
             page_area,
         )
+        rule = semantic_rules.get(g["style_key"])
+        suppress, semantic_boost, semantic_reasons = _semantic_policy(rule)
+        if suppress:
+            continue
+        g["score"] = max(0.0, min(0.98, g["score"] + semantic_boost))
+        if rule:
+            g["semantic"] = rule.get("semantic")
+            g["use_for"] = rule.get("use_for")
+            g["draw_policy"] = rule.get("draw_policy")
+            g["semantic_confidence"] = rule.get("confidence")
+            g["semantic_reason"] = rule.get("reason")
+            g["semantic_policy"] = semantic_reasons
         if g["score"] >= 0.38 and g["total_length"] >= page_diag * 0.20 and g["long_count"] >= 2:
             signatures.append(g)
     signatures.sort(key=lambda x: (x["score"], x["total_length"]), reverse=True)
@@ -239,6 +311,7 @@ def _learn_boundary_signatures(
     evidence_lines = [
         item.line for item in styled
         if item.style_key in keys
+        and not _semantic_policy(semantic_rules.get(item.style_key))[0]
         and not _is_excluded_line(item.line, exclusion_geom)
         and (
             item.line.length >= max(18.0, page_diag * 0.018)
@@ -247,6 +320,54 @@ def _learn_boundary_signatures(
         and _is_axis_aligned(item.line, tol=2.0)
     ]
     return signatures, evidence_lines
+
+
+def _semantic_enclosure_lines(
+    page: fitz.Page,
+    styled: list[StyledSegment],
+    exclusion_polys: list[Polygon] | None,
+    line_semantics: dict | None,
+) -> list[LineString]:
+    """Lines Gemini explicitly allows for slab enclosure."""
+    rules = _line_semantic_rules(line_semantics)
+    if not rules:
+        return []
+    page_diag = math.sqrt(max(page.rect.width * page.rect.height, 1.0))
+    exclusion_geom = _build_exclusion_geometry(exclusion_polys or [])
+    out: list[LineString] = []
+    seen: set[tuple] = set()
+    for item in styled:
+        rule = rules.get(item.style_key)
+        if not rule:
+            continue
+        suppress, _, _ = _semantic_policy(rule)
+        if suppress:
+            continue
+        use_for = rule.get("use_for") or []
+        if isinstance(use_for, str):
+            use_for = [use_for]
+        semantic = str(rule.get("semantic") or "unknown")
+        try:
+            confidence = float(rule.get("confidence") or 0)
+        except Exception:
+            confidence = 0.0
+        if confidence < 0.55:
+            continue
+        if semantic not in {"building_boundary", "slab_edge"} and "slab_enclosure" not in use_for:
+            continue
+        line = item.line
+        if line.length < max(8.0, page_diag * 0.006):
+            continue
+        if not _is_axis_aligned(line, tol=2.0):
+            continue
+        if _is_excluded_line(line, exclusion_geom):
+            continue
+        coords = tuple((round(x, 2), round(y, 2)) for x, y in line.coords)
+        if coords in seen:
+            continue
+        seen.add(coords)
+        out.append(line)
+    return out
 
 
 def _score_region(poly: Polygon, page: fitz.Page, drawing_area: Polygon, anchors: list[Polygon],
@@ -336,9 +457,16 @@ def _score_polygons(polygons: list[Polygon], page: fitz.Page, drawing_area: Poly
     return scored, ignored
 
 
-def _select_polygonize_lines(page: fitz.Page, boundary_lines: list[LineString], lines: list[LineString]) -> list[LineString]:
+def _select_polygonize_lines(
+    page: fitz.Page,
+    boundary_lines: list[LineString],
+    lines: list[LineString],
+    semantic_active: bool = False,
+) -> list[LineString]:
     page_diag = math.sqrt(page.rect.width * page.rect.height)
     polygonize_lines = boundary_lines if len(boundary_lines) >= 4 else lines
+    if semantic_active and len(boundary_lines) < 4:
+        polygonize_lines = []
     if boundary_lines:
         min_len = max(6.0, page_diag * 0.005)
         polygonize_lines = [line for line in boundary_lines if line.length >= min_len]
@@ -350,6 +478,7 @@ def _select_polygonize_lines(page: fitz.Page, boundary_lines: list[LineString], 
 def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
                                  text_blocks: list[dict] | None = None,
                                  legend_semantics: dict | None = None,
+                                 line_semantics: dict | None = None,
                                  polygonize_slabs: bool = True) -> BoundaryExtractionResult:
     """Build slab candidates from closed vector boundary regions."""
     drawing_area = _drawing_area(page)
@@ -364,6 +493,7 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
         *getattr(structural_objects, "ignored_regions", []),
     ]
     exclusion_polys = [obj.polygon for obj in non_boundary_objects if obj.polygon is not None and not obj.polygon.is_empty]
+    semantic_rule_count = len(_line_semantic_rules(line_semantics))
     if not polygonize_slabs:
         return BoundaryExtractionResult(
             wall_core_candidates=wall_like,
@@ -373,10 +503,19 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             debug={
                 "raw_line_segments": len(lines),
                 "excluded_non_boundary_count": len(exclusion_polys),
+                "line_semantic_rule_count": semantic_rule_count,
                 **structural_objects.debug,
             },
         )
-    boundary_signatures, boundary_lines = _learn_boundary_signatures(page, styled, exclusion_polys=exclusion_polys)
+    boundary_signatures, boundary_lines = _learn_boundary_signatures(
+        page,
+        styled,
+        exclusion_polys=exclusion_polys,
+        line_semantics=line_semantics,
+    )
+    semantic_lines = _semantic_enclosure_lines(page, styled, exclusion_polys, line_semantics)
+    if semantic_lines:
+        boundary_lines = boundary_lines + semantic_lines
     boundary_evidence = [line.buffer(2.0, cap_style=2, join_style=2) for line in boundary_lines]
     wall_evidence = (
         wall_like
@@ -398,7 +537,12 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             debug=structural_objects.debug,
         )
     raw_line_count = len(lines)
-    polygonize_lines = _select_polygonize_lines(page, boundary_lines, lines)
+    polygonize_lines = _select_polygonize_lines(
+        page,
+        boundary_lines,
+        lines,
+        semantic_active=semantic_rule_count > 0,
+    )
 
     try:
         polygons = _polygonize_lines(polygonize_lines)
@@ -415,8 +559,21 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
         # If object exclusion removed the only closing segments, retry the learned
         # signature graph without exclusion. Region scoring still requires wall or
         # boundary support, so columns/footings cannot accept slabs by themselves.
-        fallback_signatures, fallback_lines = _learn_boundary_signatures(page, styled, exclusion_polys=[])
-        fallback_polygonize_lines = _select_polygonize_lines(page, fallback_lines, lines)
+        fallback_signatures, fallback_lines = _learn_boundary_signatures(
+            page,
+            styled,
+            exclusion_polys=[],
+            line_semantics=line_semantics,
+        )
+        fallback_semantic_lines = _semantic_enclosure_lines(page, styled, [], line_semantics)
+        if fallback_semantic_lines:
+            fallback_lines = fallback_lines + fallback_semantic_lines
+        fallback_polygonize_lines = _select_polygonize_lines(
+            page,
+            fallback_lines,
+            lines,
+            semantic_active=semantic_rule_count > 0,
+        )
         try:
             fallback_polygons = _polygonize_lines(fallback_polygonize_lines)
             fallback_evidence = [line.buffer(2.0, cap_style=2, join_style=2) for line in fallback_lines]
@@ -455,6 +612,7 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
                 "boundary_evidence_count": len(all_boundary_evidence),
                 "excluded_non_boundary_count": len(exclusion_polys),
                 "fallback_signature_graph_used": fallback_used,
+                "line_semantic_rule_count": semantic_rule_count,
                 **structural_objects.debug,
             },
         )
@@ -508,6 +666,7 @@ def extract_boundary_first_slabs(page: fitz.Page, drawings: list[dict],
             "excluded_non_boundary_count": len(exclusion_polys),
             "fallback_signature_graph_used": fallback_used,
             "boundary_signatures": boundary_signatures,
+            "line_semantic_rule_count": semantic_rule_count,
             "polygonized_regions": len(polygons),
             "scored_regions": len(scored),
             "kept_regions": len(gross),
