@@ -46,6 +46,8 @@ Critical reading rules:
 - Avoid generating duplicate symbol variants that only repeat the same schedule information. Prefer compact canonical symbols
   and put detailed ambiguity in warnings. If output would be too large, prioritize buildings/floors/page mapping,
   schedule pages, column/foundation symbol families, and warnings.
+- Identify pages that can locate buildings relative to each other: keyplan, site plan, overall GA, overall carpark plan,
+  or title-block keyplans where Building A/B/C/D are visible together. Do not invent coordinates; only return source pages.
 
 Required JSON schema:
 {
@@ -116,6 +118,17 @@ Required JSON schema:
           }
         }
       ]
+    }
+  ],
+  "building_position_sources": [
+    {
+      "page": number,
+      "title": string|null,
+      "source_type": "keyplan"|"site_plan"|"overall_plan"|"ga_plan_overall"|"title_block_keyplan"|"unknown",
+      "buildings_visible": ["Building A"],
+      "recommended_for_site_placement": boolean,
+      "reason": string,
+      "confidence": number
     }
   ],
   "schedule_pages": {
@@ -218,7 +231,7 @@ def _parse_json_response(raw: str) -> tuple[dict, dict]:
     }
     try:
         parsed = json.loads(cleaned)
-        if not any(parsed.get(k) for k in ("buildings", "column_symbols", "foundation_symbols", "schedule_pages", "height_sources")):
+        if not any(parsed.get(k) for k in ("buildings", "building_position_sources", "column_symbols", "foundation_symbols", "schedule_pages", "height_sources")):
             report["parse_status"] = "schema_empty"
             report["parse_error"] = "Valid JSON parsed, but semantic schema is empty."
         return parsed, report
@@ -264,6 +277,7 @@ def normalize_document_intelligence(raw: dict, page_count: int = 0, parse_report
             "column_symbols": {},
             "foundation_symbols": {},
             "buildings": [],
+            "building_position_sources": [],
             "schedule_pages": {
                 "column_schedule_pages": [],
                 "foundation_schedule_pages": [],
@@ -291,6 +305,7 @@ def normalize_document_intelligence(raw: dict, page_count: int = 0, parse_report
         "column_symbols": raw.get("column_symbols") or {},
         "foundation_symbols": raw.get("foundation_symbols") or {},
         "buildings": raw.get("buildings") or [],
+        "building_position_sources": raw.get("building_position_sources") or [],
         "schedule_pages": schedule_pages,
         "height_sources": raw.get("height_sources") or [],
         "storey_heights": raw.get("storey_heights") or [],

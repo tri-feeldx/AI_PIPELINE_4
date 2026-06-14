@@ -134,6 +134,7 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
                               storey_height_by_page_mm=None,
                               storey_height_report=None,
                               building_registry=None,
+                              site_placement_report=None,
                               single_model=True,
                               preserve_native_building_position=True,
                               generated_by="Feeldx Pipeline",
@@ -146,6 +147,22 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
     storey_height_by_page_mm = storey_height_by_page_mm or {}
     storey_height_report = storey_height_report or []
     building_registry = building_registry or {"buildings": {}, "warnings": []}
+    site_placement_report = site_placement_report or {}
+    site_readiness = site_placement_report.get("readiness") or {}
+    site_transform = site_placement_report.get("site_transform") or {}
+    site_transform_map = site_transform.get("building_transforms") or {}
+    site_scale = site_transform.get("scale") or site_readiness.get("scale") or {}
+    site_verified = site_readiness.get("site_placement_status") == "verified"
+    building_offsets = {}
+    if site_verified:
+        for bld, transform in site_transform_map.items():
+            if transform.get("status") != "verified":
+                continue
+            dx = transform.get("dx_mm")
+            dy = transform.get("dy_mm")
+            if dx is None or dy is None:
+                continue
+            building_offsets[bld] = (float(dx), float(dy))
     building_count = len(building_registry.get("buildings", {}))
     floor_count = sum(
         sum(1 for lvl in b.get("levels", {}) if str(lvl).lower() != "foundation")
@@ -161,7 +178,10 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
         f"# Slabs: {len(slab_regions)} | Columns: {len(column_regions)} | Foundations: {len(foundation_regions)} | Walls: {len(wall_regions)}",
         f"# Total elements: {total}",
         f"# Model mode: {'single_model' if single_model else 'multi_export'} | Building position: "
-        f"{'native_coordinates' if preserve_native_building_position else 'presentation_offset'}",
+        f"{'site_keyplan_verified' if site_verified and building_offsets else ('native_coordinates' if preserve_native_building_position else 'presentation_offset')}",
+        f"# Site/keyplan source page: {site_readiness.get('primary_source_page', 'N/A')} | "
+        f"Scale: {site_scale.get('source') or 'N/A'} | "
+        f"Placed buildings: {len(building_offsets)}",
         "# Storey heights: "
         f"verified={height_status_counts.get('verified', 0)} | "
         f"inferred={height_status_counts.get('inferred', 0)} | "
@@ -244,6 +264,19 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
             lvl_name = fallback_type
         return bld or "(unknown)", lvl_name or fallback_type
 
+    def _offset_for_building(building):
+        if not site_verified:
+            return 0.0, 0.0
+        return building_offsets.get(building or "", (0.0, 0.0))
+
+    def _emit_points(var_name, coords, z_mm, building, indent="  "):
+        dx, dy = _offset_for_building(building)
+        lines.append(f"{indent}{var_name} = [")
+        for x, y in coords:
+            lines.append(f"{indent}  {_ruby_point(x + dx, y + dy, z_mm)},")
+        lines[-1] = lines[-1].rstrip(",")
+        lines.append(f"{indent}]")
+
     def _ensure_container(building, level, elem_type):
         nonlocal container_idx
         key = (building or "(unknown)", level or "Level", elem_type)
@@ -283,11 +316,9 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
         bld, lvl_name = _context_for_slab(slab)
         slab_entities = _ensure_container(bld, lvl_name, "Slabs")
         lines += ["", f"# Slab {i + 1}: {slab.label} | Area: {area_txt}", "begin",
-                  f"  pts_slab_{i} = ["]
-        for x, y in coords:
-            lines.append(f"    {_ruby_point(x, y, z_mm)},")
-        lines[-1] = lines[-1].rstrip(",")
-        lines += ["  ]", f"  grp_slab_{i} = {slab_entities}.add_group",
+                  f"  # building offset mm: dx={_offset_for_building(bld)[0]:.2f}, dy={_offset_for_building(bld)[1]:.2f}"]
+        _emit_points(f"pts_slab_{i}", coords, z_mm, bld)
+        lines += [f"  grp_slab_{i} = {slab_entities}.add_group",
                   f"  face_slab_{i} = grp_slab_{i}.entities.add_face(pts_slab_{i})",
                   f"  if face_slab_{i} && face_slab_{i}.valid?",
                   f"    hole_faces_{i} = []"]
@@ -295,12 +326,8 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
             hole_coords = _clean_hole_coords(interior)
             if len(hole_coords) < 3:
                 continue
-            lines += [f"    pts_slab_{i}_hole_{h_idx} = ["]
-            for x, y in hole_coords:
-                lines.append(f"      {_ruby_point(x, y, z_mm)},")
-            lines[-1] = lines[-1].rstrip(",")
+            _emit_points(f"pts_slab_{i}_hole_{h_idx}", hole_coords, z_mm, bld, indent="    ")
             lines += [
-                "    ]",
                 f"    hole_face_{i}_{h_idx} = grp_slab_{i}.entities.add_face(pts_slab_{i}_hole_{h_idx})",
                 f"    hole_faces_{i} << hole_face_{i}_{h_idx} if hole_face_{i}_{h_idx} && hole_face_{i}_{h_idx}.valid?",
             ]
@@ -353,11 +380,9 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
         if len(coords) < 3:
             continue
         lines += ["", f"# Col {col.symbol} Z={z_base:.0f}mm {w:.0f}x{d:.0f}mm H={col_height:.0f}mm", "begin",
-                  f"  pts_col_{col_idx} = ["]
-        for x, y in coords:
-            lines.append(f"    {_ruby_point(x, y, z_base)},")
-        lines[-1] = lines[-1].rstrip(",")
-        lines += ["  ]", f"  grp_col_{col_idx} = {col_entities}.add_group",
+                  f"  # building offset mm: dx={_offset_for_building(bld)[0]:.2f}, dy={_offset_for_building(bld)[1]:.2f}"]
+        _emit_points(f"pts_col_{col_idx}", coords, z_base, bld)
+        lines += [f"  grp_col_{col_idx} = {col_entities}.add_group",
                   f"  face_col_{col_idx} = grp_col_{col_idx}.entities.add_face(pts_col_{col_idx})",
                   f"  if face_col_{col_idx} && face_col_{col_idx}.valid?",
                   f"    face_col_{col_idx}.pushpull({col_height:.0f}.mm)",
@@ -391,11 +416,9 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
         if len(coords) < 3:
             continue
         lines += ["", f"# FDN {fdn.symbol} Ztop={z_top:.0f}mm Thk={thk:.0f}mm", "begin",
-                  f"  pts_fdn_{fdn_idx} = ["]
-        for x, y in coords:
-            lines.append(f"    {_ruby_point(x, y, z_top)},")
-        lines[-1] = lines[-1].rstrip(",")
-        lines += ["  ]", f"  grp_fdn_{fdn_idx} = {fdn_entities}.add_group",
+                  f"  # building offset mm: dx={_offset_for_building(bld)[0]:.2f}, dy={_offset_for_building(bld)[1]:.2f}"]
+        _emit_points(f"pts_fdn_{fdn_idx}", coords, z_top, bld)
+        lines += [f"  grp_fdn_{fdn_idx} = {fdn_entities}.add_group",
                   f"  face_fdn_{fdn_idx} = grp_fdn_{fdn_idx}.entities.add_face(pts_fdn_{fdn_idx})",
                   f"  if face_fdn_{fdn_idx} && face_fdn_{fdn_idx}.valid?",
                   f"    face_fdn_{fdn_idx}.pushpull(-{thk:.0f}.mm)",
@@ -427,11 +450,9 @@ def generate_full_ruby_script(slab_regions, column_regions, foundation_regions,
         if len(coords) < 3:
             continue
         lines += ["", f"# Wall {wall_idx + 1}: {safe} Z={z_base:.0f}mm H={wall_height:.0f}mm", "begin",
-                  f"  pts_wall_{wall_idx} = ["]
-        for x, y in coords:
-            lines.append(f"    {_ruby_point(x, y, z_base)},")
-        lines[-1] = lines[-1].rstrip(",")
-        lines += ["  ]", f"  grp_wall_{wall_idx} = {wall_entities}.add_group",
+                  f"  # building offset mm: dx={_offset_for_building(bld)[0]:.2f}, dy={_offset_for_building(bld)[1]:.2f}"]
+        _emit_points(f"pts_wall_{wall_idx}", coords, z_base, bld)
+        lines += [f"  grp_wall_{wall_idx} = {wall_entities}.add_group",
                   f"  face_wall_{wall_idx} = grp_wall_{wall_idx}.entities.add_face(pts_wall_{wall_idx})",
                   f"  if face_wall_{wall_idx} && face_wall_{wall_idx}.valid?",
                   f"    face_wall_{wall_idx}.pushpull({wall_height:.0f}.mm)",

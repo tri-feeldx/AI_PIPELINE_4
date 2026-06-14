@@ -1,0 +1,92 @@
+Level
+
+FFL (m)
+
+Height (mm)
+
+Confidence
+
+Sources
+
+level_01
+
+1.000
+
+3802
+
+high
+
+gemini=0.000, page_text=1.000, elevation=0.000
+
+level_02
+
+3.000
+
+4500
+
+high
+
+gemini=3.500, page_text=3.000, elevation=3.802
+
+level_03
+
+3.000
+
+4001
+
+high
+
+gemini=7.000, page_text=3.000, elevation=8.302
+
+level_04
+
+3.000
+
+3497
+
+high
+
+gemini=10.500, page_text=3.000, elevation=12.303
+
+level_05
+
+3.000
+
+0
+
+high
+
+gemini=14.000, page_text=3.000, elevation=15.800
+
+lower_roof
+
+3.000
+
+0
+
+high
+
+gemini=17.500, page_text=3.000
+
+upper_roof
+
+3.000
+
+0
+
+high
+
+gemini=21.000, page_text=3.000
+
+ 
+Height: level_05: storey height 0mm is suspiciously low (<2m) — check scale or FFL
+
+Height: lower_roof: storey height 0mm is suspiciously low (<2m) — check scale or FFL
+
+Height: upper_roof: storey height 0mm is suspiciously low (<2m) — check scale or FFL
+
+Height: Building 1: FFL not increasing — 3.000m ≥ 3.000m
+
+Height: Building 1: FFL not increasing — 3.000m ≥ 3.000m
+
+#cái prompt ô viết s nó trả về level 5, level 5 đúng , roof, nhưng nhiệm vụ của chúng ta chỉ lấy sàn thôi! phase 2 trả về đúng số sàn và page tương ứng! nên LƯU Ý 

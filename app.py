@@ -155,6 +155,10 @@ def init_session():
         "storey_height_by_page_mm": {},
         "building_model_registry": {},
         "building_polygon_image": None,
+        "building_audit_report": None,
+        "building_audit_dir": None,
+        "building_site_placement_report": None,
+        "building_site_placement_dir": None,
         "floor_alignment_report": [],
         "floor_alignment_offsets": {},
         "floor_alignment_preview": None,
@@ -170,6 +174,7 @@ def init_session():
         "line_semantics_catalog_path": None,
         "line_semantics_cache_key": None,
         "line_semantic_policy_images": {},
+        "render_debug_overlays": False,
         "step5_back_target": 3,
         "slab_semantic_previews": {},
         "slab_semantic_surface_images": {},
@@ -239,6 +244,12 @@ with st.sidebar:
         reset_session()
         _rerun()
 
+    st.session_state["render_debug_overlays"] = st.checkbox(
+        "Render debug overlays (slower)",
+        value=bool(st.session_state.get("render_debug_overlays", False)),
+        help="Turn this on only when auditing a page. The fast path skips hundreds of PNG overlays.",
+    )
+
     st.markdown(
         f'<div style="color:#37474F;font-size:0.75rem;margin-top:8px;">Session: {sid}</div>',
         unsafe_allow_html=True,
@@ -278,6 +289,10 @@ def step1_upload():
         st.session_state["storey_height_by_page_mm"] = {}
         st.session_state["building_model_registry"] = {}
         st.session_state["building_polygon_image"] = None
+        st.session_state["building_audit_report"] = None
+        st.session_state["building_audit_dir"] = None
+        st.session_state["building_site_placement_report"] = None
+        st.session_state["building_site_placement_dir"] = None
         st.session_state["floor_alignment_report"] = []
         st.session_state["floor_alignment_offsets"] = {}
         st.session_state["floor_alignment_preview"] = None
@@ -293,6 +308,7 @@ def step1_upload():
         st.session_state["line_semantics_catalog_path"] = None
         st.session_state["line_semantics_cache_key"] = None
         st.session_state["line_semantic_policy_images"] = {}
+        st.session_state["render_debug_overlays"] = False
         st.session_state["slab_semantic_previews"] = {}
         st.session_state["slab_semantic_surface_images"] = {}
         st.session_state["slab_semantic_boundary_images"] = {}
@@ -1094,6 +1110,190 @@ def _refresh_building_registry(all_slabs: list, all_columns: list | None = None,
     return registry
 
 
+def _run_building_audit(registry: dict | None = None) -> dict:
+    from src.building_audit import run_building_audit
+
+    all_slabs = st.session_state.get("final_slabs", [])
+    all_columns = st.session_state.get("column_regions", [])
+    all_foundations = st.session_state.get("foundation_regions", [])
+    all_walls = st.session_state.get("wall_regions", [])
+    registry = registry or st.session_state.get("building_model_registry") or _refresh_building_registry(
+        all_slabs, all_columns, all_foundations
+    )
+    report = run_building_audit(
+        st.session_state.get("pdf_path"),
+        OUTPUT_DIR,
+        all_slabs,
+        columns=all_columns,
+        foundations=all_foundations,
+        walls=all_walls,
+        document_intelligence=st.session_state.get("document_intelligence") or {},
+        ai_floor_result=_trusted_ai_floor_result(),
+        registry=registry,
+    )
+    st.session_state["building_audit_report"] = report
+    st.session_state["building_audit_dir"] = report.get("audit_dir")
+    return report
+
+
+def _render_building_audit(report: dict | None = None, expanded: bool = True) -> None:
+    report = report or st.session_state.get("building_audit_report")
+    with st.expander("Building Audit Outputs", expanded=expanded):
+        if st.button("Run Building Audit", use_container_width=True, key="run_building_audit_btn"):
+            with st.spinner("Writing building audit JSON/images..."):
+                report = _run_building_audit()
+            st.success(f"Building audit written to: {report.get('audit_dir')}")
+
+        if not report:
+            st.info("No building audit yet. Run it after Step 3 has detected slabs/elements.")
+            return
+
+        readiness = report.get("readiness") or {}
+        status = readiness.get("placement_status", "unknown")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Placement", status)
+        c2.metric("Expected buildings", readiness.get("expected_building_count", 0))
+        c3.metric("Detected buildings", readiness.get("detected_building_count", 0))
+        c4.metric("Review/orphan elements", readiness.get("review_element_count", 0) + readiness.get("orphan_element_count", 0))
+        if status != "verified":
+            st.warning("Building placement not verified. Treat the Ruby as a debug model until audit warnings are resolved.")
+        for warning in readiness.get("warnings", []) or []:
+            st.warning(warning)
+
+        audit_dir = report.get("audit_dir")
+        if audit_dir:
+            st.caption(f"Audit folder: {audit_dir}")
+
+        json_outputs = report.get("json_outputs") or {}
+        if json_outputs:
+            st.markdown("##### JSON outputs")
+            for name, path in json_outputs.items():
+                p = Path(path)
+                if p.exists():
+                    with open(p, "rb") as f:
+                        st.download_button(
+                            f"Download {name}.json",
+                            f.read(),
+                            file_name=p.name,
+                            mime="application/json",
+                            use_container_width=True,
+                            key=f"dl_building_audit_json_{name}_{p.name}",
+                        )
+
+        image_outputs = report.get("image_outputs") or {}
+        if image_outputs:
+            st.markdown("##### Image overlays")
+            for name, path in image_outputs.items():
+                if not path:
+                    continue
+                p = Path(path)
+                if p.exists():
+                    with st.expander(name, expanded=(name == "building_registry")):
+                        st.image(str(p), use_container_width=True)
+                        with open(p, "rb") as f:
+                            st.download_button(
+                                f"Download {p.name}",
+                                f.read(),
+                                file_name=p.name,
+                                mime="image/png",
+                                use_container_width=True,
+                                key=f"dl_building_audit_img_{name}_{p.name}",
+                            )
+
+
+def _run_building_site_placement_audit(registry: dict | None = None) -> dict:
+    from src.building_site_placement import run_building_site_placement_audit
+
+    registry = registry or st.session_state.get("building_model_registry") or {}
+    report = run_building_site_placement_audit(
+        st.session_state.get("pdf_path"),
+        OUTPUT_DIR,
+        existing_registry=registry,
+    )
+    st.session_state["building_site_placement_report"] = report
+    st.session_state["building_site_placement_dir"] = report.get("audit_dir")
+    return report
+
+
+def _render_building_site_placement(report: dict | None = None, expanded: bool = True) -> None:
+    report = report or st.session_state.get("building_site_placement_report")
+    with st.expander("Site/Keyplan Building Placement", expanded=expanded):
+        if st.button("Run Site/Keyplan Placement Audit", use_container_width=True, key="run_site_placement_audit_btn"):
+            with st.spinner("Finding keyplan/site placement pages with Gemini and polygon evidence..."):
+                report = _run_building_site_placement_audit()
+            st.success(f"Site placement audit written to: {report.get('audit_dir')}")
+
+        if not report:
+            st.info("No site/keyplan placement audit yet.")
+            return
+
+        readiness = report.get("readiness") or {}
+        status = readiness.get("site_placement_status", "unknown")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Site placement", status)
+        c2.metric("Found buildings", len(readiness.get("found_buildings", []) or []))
+        c3.metric("Source pages", ", ".join(map(str, readiness.get("source_pages", []) or [])) or "N/A")
+        if status != "verified":
+            st.warning("Site/keyplan placement is not verified. Do not use native page coordinates as final site coordinates.")
+        for warning in readiness.get("warnings", []) or []:
+            st.warning(warning)
+        if report.get("audit_dir"):
+            st.caption(f"Audit folder: {report.get('audit_dir')}")
+
+        transforms = ((report.get("site_transform") or {}).get("building_transforms") or {})
+        if transforms:
+            rows = []
+            for building, data in transforms.items():
+                rows.append({
+                    "Building": building,
+                    "Source page": data.get("source_page"),
+                    "Source centroid pt": data.get("source_centroid_pt"),
+                    "Site centroid mm": data.get("site_centroid_mm_relative"),
+                    "Model centroid mm": data.get("model_centroid_mm"),
+                    "dx mm": round(data.get("dx_mm"), 1) if data.get("dx_mm") is not None else None,
+                    "dy mm": round(data.get("dy_mm"), 1) if data.get("dy_mm") is not None else None,
+                    "Status": data.get("status"),
+                    "Reason": data.get("reason"),
+                })
+            st.markdown("##### Site placement transforms")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        json_outputs = report.get("json_outputs") or {}
+        if json_outputs:
+            st.markdown("##### JSON outputs")
+            for name, path in json_outputs.items():
+                p = Path(path)
+                if p.exists():
+                    with open(p, "rb") as f:
+                        mime = "text/plain" if p.suffix.lower() == ".txt" else "application/json"
+                        st.download_button(
+                            f"Download {name}",
+                            f.read(),
+                            file_name=p.name,
+                            mime=mime,
+                            use_container_width=True,
+                            key=f"dl_site_placement_json_{name}_{p.name}",
+                        )
+
+        image_outputs = report.get("image_outputs") or {}
+        if image_outputs:
+            st.markdown("##### Image overlays")
+            for name, path in image_outputs.items():
+                p = Path(path)
+                if p.exists():
+                    with st.expander(name, expanded=False):
+                        st.image(str(p), use_container_width=True)
+                        with open(p, "rb") as f:
+                            st.download_button(
+                                f"Download {p.name}",
+                                f.read(),
+                                file_name=p.name,
+                                mime="image/png",
+                                use_container_width=True,
+                                key=f"dl_site_placement_img_{name}_{p.name}",
+                            )
+
+
 def _apply_floor_alignment(all_slabs: list, all_columns: list | None = None,
                            all_foundations: list | None = None) -> tuple[list[dict], dict]:
     from src.floor_alignment import align_floors
@@ -1167,6 +1367,8 @@ def _render_building_registry(registry: dict | None = None, expanded: bool = Tru
 
         for warning in registry.get("warnings", []) or []:
             st.warning(warning)
+        _render_building_site_placement(expanded=False)
+        _render_building_audit(expanded=False)
 
 
 def _render_element_overlay_gallery(title: str, image_map: dict, empty_message: str,
@@ -1195,7 +1397,10 @@ def _process_page_worker(args: tuple) -> tuple:
     Opens its own fitz document — fitz.Document is NOT thread-safe when shared.
     """
     line_semantics = None
-    if len(args) >= 6:
+    render_debug = True
+    if len(args) >= 7:
+        pdf_path, page_idx, scale, debug_base, legend_semantics, line_semantics, render_debug = args[:7]
+    elif len(args) >= 6:
         pdf_path, page_idx, scale, debug_base, legend_semantics, line_semantics = args[:6]
     elif len(args) >= 5:
         pdf_path, page_idx, scale, debug_base, legend_semantics = args[:5]
@@ -1224,6 +1429,32 @@ def _process_page_worker(args: tuple) -> tuple:
         text_blocks = extract_text_blocks(page)
         ffl_values = extract_ffl_values(text_blocks)
         slab_labels = extract_slab_labels(text_blocks)
+
+        # ── slab_v2 opt-in path (SLAB_V2=1): deterministic vector kernel +
+        # AI selector. v1 path below remains the default and is untouched.
+        if os.environ.get("SLAB_V2") == "1":
+            from src.slab_v2 import extract_slabs_v2
+            from src.slab_v2.adapter import to_slab_regions
+            v2 = extract_slabs_v2(pdf_path, page_idx, scale=scale)
+            slab_regions = to_slab_regions(v2, page, ffl_values)
+            if slab_regions:
+                slab_regions = transform_all_slabs(slab_regions, page, scale)
+            page_debug = {}
+            v2_dir = Path(v2.debug_dir)
+            if v2_dir.exists():
+                for png in sorted(v2_dir.glob("step_*.png")):
+                    page_debug[png.stem] = str(png)
+            slab_stats = {
+                "extraction_mode": "slab_v2",
+                "mode_reason": v2.status,
+                "final_slab_count": len(slab_regions),
+                "final_area_pdf": float(sum(r.polygon.area for r in slab_regions)),
+                "gemini_calls": v2.gemini_calls,
+                "verification_passed": bool(
+                    v2.verification and v2.verification.passed),
+                "debug": {"slab_v2_dir": v2.debug_dir},
+            }
+            return page_idx, slab_regions, page_debug, bool(slab_regions), slab_stats
 
         slab_regions, drawings = extract_slabs_from_page(page, text_blocks, ffl_values, slab_labels)
 
@@ -1334,27 +1565,26 @@ def _process_page_worker(args: tuple) -> tuple:
             "debug": extraction_result.debug,
         }
 
-        filled_polys = [p for p, _ in filled_pairs]            # strip color for visualizer
-
         page_debug = {}
-        for step_fn, key, step_args in [
-            (save_step1_raw_paths, "step1", (page, drawings,             f"{debug_base}_step1_raw.png")),
-            (save_step2_polygons,  "step2", (page, filled_polys + recon, f"{debug_base}_step2_polys.png")),
-            (save_step3_filtered,  "step3", (page, filtered,             f"{debug_base}_step3_filtered.png")),
-            (save_gross_net_slab_debug, "gross_net", (page, extraction_result, f"{debug_base}_gross_net.png")),
-            (save_boundary_first_debug, "boundary", (page, boundary_result, f"{debug_base}_boundary_first.png")),
-            (save_wall_evidence_only, "wall_evidence", (page, boundary_result, f"{debug_base}_wall_evidence.png")),
-            (save_slab_candidates_only, "wall_candidates", (page, boundary_result, f"{debug_base}_wall_candidates.png")),
-            (save_interior_resolver_debug, "interior", (page, boundary_result, f"{debug_base}_interior_resolver.png")),
-            (save_wall_guided_final, "wall_final", (page, boundary_result, f"{debug_base}_wall_final.png")),
-            (save_step4_labeled,   "step4", (page, slab_regions,   f"{debug_base}_step4_labeled.png")),
-            (save_step5_final,     "step5", (page, slab_regions,   f"{debug_base}_step5_final.png")),
-        ]:
-            try:
-                page_debug[key] = step_fn(*step_args)
-            except Exception as dbg_err:
-                page_debug[f"{key}_error"] = str(dbg_err)
-                pass
+        if render_debug:
+            filled_polys = [p for p, _ in filled_pairs]            # strip color for visualizer
+            for step_fn, key, step_args in [
+                (save_step1_raw_paths, "step1", (page, drawings,             f"{debug_base}_step1_raw.png")),
+                (save_step2_polygons,  "step2", (page, filled_polys + recon, f"{debug_base}_step2_polys.png")),
+                (save_step3_filtered,  "step3", (page, filtered,             f"{debug_base}_step3_filtered.png")),
+                (save_gross_net_slab_debug, "gross_net", (page, extraction_result, f"{debug_base}_gross_net.png")),
+                (save_boundary_first_debug, "boundary", (page, boundary_result, f"{debug_base}_boundary_first.png")),
+                (save_wall_evidence_only, "wall_evidence", (page, boundary_result, f"{debug_base}_wall_evidence.png")),
+                (save_slab_candidates_only, "wall_candidates", (page, boundary_result, f"{debug_base}_wall_candidates.png")),
+                (save_interior_resolver_debug, "interior", (page, boundary_result, f"{debug_base}_interior_resolver.png")),
+                (save_wall_guided_final, "wall_final", (page, boundary_result, f"{debug_base}_wall_final.png")),
+                (save_step4_labeled,   "step4", (page, slab_regions,   f"{debug_base}_step4_labeled.png")),
+                (save_step5_final,     "step5", (page, slab_regions,   f"{debug_base}_step5_final.png")),
+            ]:
+                try:
+                    page_debug[key] = step_fn(*step_args)
+                except Exception as dbg_err:
+                    page_debug[f"{key}_error"] = str(dbg_err)
 
         return page_idx, slab_regions, page_debug, has_fill, slab_stats
     finally:
@@ -1480,6 +1710,10 @@ def _run_line_semantics(pdf_path: str, pages_to_process: list[int]) -> dict:
     st.session_state["line_semantics_catalog_path"] = catalog_path
     st.session_state["line_semantics_cache_key"] = cache_key
 
+    if not st.session_state.get("render_debug_overlays", False):
+        st.session_state["line_semantic_policy_images"] = {}
+        return result
+
     style_rules = (result.get("gemini_result") or {}).get("style_rules", []) if isinstance(result, dict) else []
     catalog_pages = {
         int(p.get("page_index")): p
@@ -1508,7 +1742,8 @@ def _run_line_semantics(pdf_path: str, pages_to_process: list[int]) -> dict:
     return result
 
 
-def _run_wall_detection_preview(pdf_path: str, pages_to_process: list[int], scale: int) -> list:
+def _run_wall_detection_preview(pdf_path: str, pages_to_process: list[int], scale: int,
+                                render_images: bool = True) -> list:
     """Detect semantic wall objects and render review overlays."""
     import fitz
     from src.wall_detector import detect_walls_for_pages
@@ -1538,6 +1773,13 @@ def _run_wall_detection_preview(pdf_path: str, pages_to_process: list[int], scal
         bld, lvl = page_context.get(wall.page_index, ("(unknown)", "(unknown)"))
         wall.building = wall.building or bld
         wall.level = wall.level or lvl
+
+    if not render_images:
+        st.session_state["wall_regions"] = walls
+        st.session_state["semantic_wall_images"] = {}
+        st.session_state["wall_polygon_images"] = {}
+        return walls
+
     out_dir = sess_debug_dir / "walls"
     out_dir.mkdir(parents=True, exist_ok=True)
     walls_by_page: dict[int, list] = {}
@@ -2364,9 +2606,17 @@ def step3_detect():
     except Exception as le:
         st.warning(f"Line semantic intelligence failed; falling back to wall/core-first geometry: {le}")
 
+    render_debug = bool(st.session_state.get("render_debug_overlays", False))
     try:
-        _run_slab_semantic_preview(pdf_path, pages_to_process)
-        _run_wall_detection_preview(pdf_path, pages_to_process, scale)
+        if render_debug:
+            _run_slab_semantic_preview(pdf_path, pages_to_process)
+            _run_wall_detection_preview(pdf_path, pages_to_process, scale, render_images=True)
+        else:
+            st.session_state["slab_semantic_previews"] = {}
+            st.session_state["slab_semantic_surface_images"] = {}
+            st.session_state["slab_semantic_boundary_images"] = {}
+            st.session_state["slab_semantic_cut_images"] = {}
+            _run_wall_detection_preview(pdf_path, pages_to_process, scale, render_images=False)
     except Exception as we:
         st.warning(f"Slab/wall semantic preview failed: {we}")
 
@@ -2394,7 +2644,15 @@ def step3_detect():
     line_result = st.session_state.get("line_semantics") or {}
     line_semantics = line_result if isinstance(line_result, dict) else None
     worker_args = [
-        (pdf_path, page_idx, scale, str(sess_debug_dir / f"p{page_idx + 1:02d}"), legend_semantics, line_semantics)
+        (
+            pdf_path,
+            page_idx,
+            scale,
+            str(sess_debug_dir / f"p{page_idx + 1:02d}"),
+            legend_semantics,
+            line_semantics,
+            render_debug,
+        )
         for page_idx in pages_to_process
     ]
 
@@ -3039,6 +3297,23 @@ def step5_generate():
     st.session_state["storey_height_report"] = height_report
     st.session_state["storey_height_by_page_mm"] = height_by_page_mm
     building_registry = _refresh_building_registry(all_slabs, all_columns, all_foundations)
+    building_audit = _run_building_audit(building_registry)
+    site_placement = st.session_state.get("building_site_placement_report")
+    if not site_placement and st.session_state.get("pdf_path"):
+        site_placement = _run_building_site_placement_audit(building_registry)
+    placement_status = (building_audit.get("readiness") or {}).get("placement_status", "unknown")
+    site_status = ((site_placement or {}).get("readiness") or {}).get("site_placement_status", "unknown")
+    model_ready = site_status == "verified"
+    if not model_ready:
+        ruby_path = str(OUTPUT_DIR / f"debug_model_{ts}.rb")
+        st.warning(
+            "Building/site placement not verified. This Ruby export is a DEBUG MODEL, not a final 4-building model."
+        )
+    elif placement_status != "verified":
+        st.info(
+            "Native page-coordinate building audit is not verified, but site/keyplan placement is verified. "
+            "Ruby export will use site/keyplan transforms."
+        )
 
     with st.spinner("Generating Ruby script for SketchUp..."):
         ruby_content = generate_full_ruby_script(
@@ -3046,9 +3321,10 @@ def step5_generate():
             storey_height_by_page_mm=height_by_page_mm,
             storey_height_report=height_report,
             building_registry=building_registry,
+            site_placement_report=site_placement,
             single_model=True,
-            preserve_native_building_position=True,
-            generated_by="Feeldx Structural Pipeline",
+            preserve_native_building_position=not model_ready,
+            generated_by="Feeldx Structural Pipeline" if model_ready else "Feeldx Structural Pipeline DEBUG",
             wall_regions=all_walls,
         )
         generate_slab_csv(all_slabs, csv_path, storey_heights=storey_heights_map)
