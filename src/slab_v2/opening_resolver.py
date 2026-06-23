@@ -1,0 +1,656 @@
+"""Resolve and semantically judge stair/core/shaft opening candidates.
+
+Geometry is always produced by PDF vectors.  Gemini may choose candidate IDs,
+but never supplies coordinates.  A deterministic decision remains available
+when the judge fails or returns low confidence.
+"""
+
+from __future__ import annotations
+
+import re
+import math
+from dataclasses import dataclass, field
+
+import fitz
+from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
+from shapely.ops import unary_union
+from shapely.strtree import STRtree
+
+from src.slab_v2.models import ElementFootprint, ResolvedPenetration
+
+PT_TO_MM = 25.4 / 72.0
+
+_STAIR_RE = re.compile(r"\bSTAIRS?\b|\bST[- ]?\d{1,2}\b", re.I)
+_CORE_RE = re.compile(r"\b(LIFT|ELEV|SHAFT|CORE|LV ?\d{1,2})\b", re.I)
+_EQUIPMENT_RE = re.compile(r"\b(FB|FLOOR\s*BOX)\b", re.I)
+_STEEL_LABEL_RE = re.compile(r"^(?:SH|CH|UC|UB|SHS|CHS|RHS)\w*$", re.I)
+
+
+@dataclass
+class OpeningResolution:
+    resolved_openings: list[ElementFootprint] = field(default_factory=list)
+    stair_footprints: list[ElementFootprint] = field(default_factory=list)
+    core_shaft_footprints: list[ElementFootprint] = field(default_factory=list)
+    resolved_penetrations: list[ResolvedPenetration] = field(default_factory=list)
+    candidates: list[dict] = field(default_factory=list)
+    judgement: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    report: dict = field(default_factory=dict)
+
+
+def _word_anchors(page: fitz.Page, rx: re.Pattern, content_rect: fitz.Rect):
+    anchors = []
+    words = list(page.get_text("words"))
+    for i, w in enumerate(words):
+        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if not content_rect.contains(fitz.Point(cx, cy)):
+            continue
+        if not rx.search(str(text)):
+            continue
+        label = str(text)
+        if label.upper() == "STAIR" and i + 1 < len(words):
+            nxt = str(words[i + 1][4])
+            if re.fullmatch(r"\d{1,2}", nxt):
+                label = f"{label} {nxt}"
+        anchors.append((label, (x0, y0, x1, y1), Point(cx, cy)))
+    return anchors
+
+
+def _nearby_text(page: fitz.Page, polygon, radius: float = 35.0) -> list[str]:
+    zone = polygon.buffer(radius)
+    hits = []
+    for w in page.get_text("words"):
+        cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+        if zone.contains(Point(cx, cy)):
+            hits.append(str(w[4]))
+        if len(hits) >= 12:
+            break
+    return hits
+
+
+def _is_stair_fill(fill: tuple | None) -> bool:
+    if not fill:
+        return False
+    r, g, b = fill
+    return b >= 0.72 and g >= 0.55 and r <= 0.75
+
+
+def _fill_polygons(paths: list, classes: list | None, predicate):
+    out = []
+    for p in paths:
+        if p.outside_content or p.fill_polygon is None:
+            continue
+        fill = None
+        if classes and 0 <= p.style_id < len(classes):
+            fill = classes[p.style_id].key.fill
+        if predicate(fill):
+            out.append(p.fill_polygon)
+    return out
+
+
+def _candidate(candidate_id: str, kind: str, label: str, source: str,
+               polygon, page: fitz.Page, confidence: float,
+               default_action: str) -> dict:
+    return {
+        "id": candidate_id,
+        "kind_hint": kind,
+        "label": label,
+        "source": source,
+        "polygon": polygon,
+        "area_pt2": float(polygon.area),
+        "bbox": tuple(float(x) for x in polygon.bounds),
+        "nearby_text": _nearby_text(page, polygon),
+        "confidence": float(confidence),
+        "default_action": default_action,
+    }
+
+
+def _connected_fill_cluster(fills: list, seed_idx: int,
+                            tolerance: float = 1.0) -> list[int]:
+    """Flood-fill touching/near-touching vector fills from one stair seed."""
+    tree = STRtree(fills)
+    seen = {seed_idx}
+    queue = [seed_idx]
+    while queue:
+        idx = queue.pop()
+        search = fills[idx].buffer(tolerance)
+        for nxt in tree.query(search):
+            nxt = int(nxt)
+            if nxt in seen:
+                continue
+            if search.intersects(fills[nxt]):
+                seen.add(nxt)
+                queue.append(nxt)
+    return sorted(seen)
+
+
+def _stair_candidates(page, paths, classes, content_rect, slab_union,
+                      scale) -> tuple[list[dict], list[str], list[str]]:
+    warnings: list[str] = []
+    default_ids: list[str] = []
+    anchors = _word_anchors(page, _STAIR_RE, content_rect)
+    fills = _fill_polygons(paths, classes, _is_stair_fill)
+    if not anchors or not fills:
+        return [], default_ids, warnings
+
+    tree = STRtree(fills)
+    to_mm = PT_TO_MM * (scale or 100)
+    slab_buffer = slab_union.buffer(80) if slab_union is not None else None
+    candidates: list[dict] = []
+    used_clusters: set[tuple[int, ...]] = set()
+    for ordinal, (label, _bbox, anchor) in enumerate(anchors, 1):
+        best_idx, best_score = None, float("inf")
+        for idx in tree.query(anchor.buffer(180)):
+            idx = int(idx)
+            poly = fills[idx]
+            bx = poly.bounds
+            w_mm = (bx[2] - bx[0]) * to_mm
+            h_mm = (bx[3] - bx[1]) * to_mm
+            short, long = min(w_mm, h_mm), max(w_mm, h_mm)
+            # A flight may be encoded as many narrow tread fills.  Seed from
+            # one small tread, then validate/use the connected union below.
+            if short < 100 or long < 150 or long > 9000:
+                continue
+            if slab_buffer is not None and not poly.intersects(slab_buffer):
+                continue
+            score = poly.distance(anchor)
+            if score < best_score:
+                best_idx, best_score = idx, score
+        if best_idx is None:
+            warnings.append(f"{label}: no qualifying blue stair fill")
+            continue
+
+        token = re.sub(r"[^A-Z0-9]+", "_", label.upper()).strip("_")
+        prefix = f"stair_{token or ordinal}"
+        landing = fills[best_idx]
+        candidates.append(_candidate(
+            f"{prefix}_landing", "STAIR_LANDING", label,
+            "nearest_blue_fill", landing, page, 0.55, "review"))
+
+        cluster_ids = tuple(_connected_fill_cluster(fills, best_idx))
+        cluster = unary_union([fills[i] for i in cluster_ids]).buffer(0)
+        if cluster.geom_type == "MultiPolygon":
+            cluster = max(cluster.geoms, key=lambda g: g.area)
+        full_cluster_area = cluster.area
+        if slab_union is not None:
+            clipped = cluster.intersection(slab_union)
+            if not clipped.is_empty:
+                if clipped.geom_type == "MultiPolygon":
+                    clipped = max(clipped.geoms, key=lambda g: g.area)
+                cluster = clipped
+        cluster_key = tuple(round(v, 1) for v in cluster.bounds)
+        if cluster_key in used_clusters:
+            continue
+        used_clusters.add(cluster_key)
+        cluster_id = f"{prefix}_flight_union"
+        overlap_ratio = cluster.area / max(full_cluster_area, 1e-9)
+        is_edge_interface = overlap_ratio < 0.20
+        candidates.append(_candidate(
+            cluster_id,
+            "STAIR_EDGE_INTERFACE" if is_edge_interface else "STAIR_OPENING",
+            label, "connected_blue_fill_union", cluster, page,
+            0.55 if is_edge_interface else 0.88,
+            "review" if is_edge_interface else "opening"))
+        if not is_edge_interface:
+            default_ids.append(cluster_id)
+        warnings.append(
+            f"label '{label}' (STAIR): generated landing and connected "
+            f"flight candidates; "
+            + (f"default={cluster_id}" if not is_edge_interface
+               else "edge-only overlap marked review"))
+    return candidates, default_ids, warnings
+
+
+def _stair_xcross_candidates(page, paths, content_rect, slab_union,
+                             scale) -> tuple[list[dict], list[str], list[str]]:
+    """Detect large stairwell penetrations from finite X-cross envelopes.
+
+    The generic X-cross detector intentionally caps shaft size at 4m. Stair
+    interfaces can be larger, so this branch requires independent STAIR text
+    evidence and corner-consistent crossing diagonal vectors.
+    """
+    anchors = _word_anchors(page, _STAIR_RE, content_rect)
+    if not anchors:
+        return [], [], []
+    to_mm = PT_TO_MM * (scale or 100)
+    diagonal_rows = []
+    for path in paths:
+        if path.outside_content:
+            continue
+        for start, end in path.segments:
+            dx, dy = end[0]-start[0], end[1]-start[1]
+            length = math.hypot(dx, dy)
+            if length < 5:
+                continue
+            angle = abs(math.degrees(math.atan2(dy, dx))) % 180
+            angle = min(angle, 180-angle)
+            if 12 <= angle <= 78:
+                diagonal_rows.append((LineString([start, end]), length))
+    candidates, default_ids, warnings = [], [], []
+    seen = []
+    for i, (first, first_length) in enumerate(diagonal_rows):
+        for second, second_length in diagonal_rows[i+1:]:
+            if min(first_length, second_length)/max(first_length, second_length) < 0.55:
+                continue
+            if not first.crosses(second):
+                continue
+            intersection = first.intersection(second)
+            if intersection.geom_type != "Point":
+                continue
+            if (intersection.distance(first.interpolate(0.5, normalized=True))
+                    > 0.28*first_length
+                    or intersection.distance(second.interpolate(0.5, normalized=True))
+                    > 0.28*second_length):
+                continue
+            points = list(first.coords) + list(second.coords)
+            minx = min(point[0] for point in points)
+            miny = min(point[1] for point in points)
+            maxx = max(point[0] for point in points)
+            maxy = max(point[1] for point in points)
+            # Stair interfaces are often trapezoidal: the two diagonal lines
+            # need not terminate at the corners of one axis-aligned box. The
+            # finite convex hull preserves their actual vector endpoints.
+            polygon = MultiPoint(points).convex_hull
+            short_mm = min(maxx-minx, maxy-miny)*to_mm
+            long_mm = max(maxx-minx, maxy-miny)*to_mm
+            if short_mm < 500 or long_mm > 12000 or long_mm/short_mm > 5.0:
+                continue
+            if polygon.geom_type != "Polygon" or len(polygon.exterior.coords) < 5:
+                continue
+            nearest = min(anchors, key=lambda row: polygon.distance(row[2]))
+            label, _bbox, anchor = nearest
+            # The label must genuinely anchor this X, not merely be the
+            # nearest stair elsewhere on a dense core plan.
+            if polygon.distance(anchor) > max(
+                    30.0, 0.25*max(first_length, second_length)):
+                continue
+            if slab_union is not None:
+                polygon = polygon.intersection(slab_union)
+                if polygon.is_empty:
+                    continue
+                if polygon.geom_type == "MultiPolygon":
+                    polygon = max(polygon.geoms, key=lambda geom: geom.area)
+            if any(polygon.intersection(existing).area /
+                   max(min(polygon.area, existing.area), 1e-9) > 0.8
+                   for existing in seen):
+                continue
+            seen.append(polygon)
+            token = re.sub(r"[^A-Z0-9]+", "_", label.upper()).strip("_")
+            candidate_id = (
+                f"stair_{token}_xcross_penetration_{len(candidates)+1:02d}")
+            candidates.append(_candidate(
+                candidate_id, "STAIR_PENETRATION", label,
+                "stair_label+x_cross_vector_envelope", polygon, page,
+                0.92, "opening"))
+            default_ids.append(candidate_id)
+            warnings.append(
+                f"{label}: large X-cross stair penetration candidate generated")
+    return candidates, default_ids, warnings
+
+
+def _interval_coverage(intervals: list[tuple[float, float]], start: float,
+                       end: float, tolerance: float) -> float:
+    clipped = []
+    for a, b in intervals:
+        lo, hi = max(start, min(a, b)), min(end, max(a, b))
+        if hi > lo:
+            clipped.append((lo, hi))
+    if not clipped or end <= start:
+        return 0.0
+    clipped.sort()
+    total, lo, hi = 0.0, clipped[0][0], clipped[0][1]
+    for nxt_lo, nxt_hi in clipped[1:]:
+        if nxt_lo <= hi + tolerance:
+            hi = max(hi, nxt_hi)
+        else:
+            total += hi - lo
+            lo, hi = nxt_lo, nxt_hi
+    return min(1.0, (total + hi - lo) / (end - start))
+
+
+def _stairwell_boundary_candidates(page, paths, classes, slab_union, scale,
+                                   xcross_candidates, stair_candidates, cfg):
+    """Build finite stairwell enclosures around X and flight seeds.
+
+    The X-cross is deliberately only an inside seed.  The returned geometry
+    is bounded by real horizontal/vertical PDF vectors; its convex hull is
+    never accepted as the final opening when an enclosure is available.
+    """
+    if not xcross_candidates:
+        return [], [], [], []
+    to_mm = PT_TO_MM * float(scale or 100)
+    axis_tol = max(0.5, float(getattr(
+        cfg, "penetration_axis_tolerance_mm", 150.0)) / to_mm)
+    out, defaults, penetrations, warnings = [], [], [], []
+
+    for xseed in xcross_candidates:
+        label = xseed["label"]
+        related = [c for c in stair_candidates
+                   if c["label"] == label and
+                   c["kind_hint"] in {"STAIR_OPENING", "STAIR_LANDING"}]
+        flight = next((c for c in related
+                       if c["kind_hint"] == "STAIR_OPENING"), None)
+        seed_polys = [xseed["polygon"]] + ([flight["polygon"]] if flight else [])
+        seed_union = unary_union(seed_polys).buffer(0)
+        minx, miny, maxx, maxy = seed_union.bounds
+        width, height = maxx-minx, maxy-miny
+        margin = max(30.0, min(100.0, 0.55*max(width, height)))
+        search = box(minx-margin, miny-margin, maxx+margin, maxy+margin)
+
+        horizontal, vertical = [], []
+        for path in paths:
+            if path.outside_content:
+                continue
+            if classes and 0 <= path.style_id < len(classes):
+                if classes[path.style_id].key.dashes:
+                    continue
+            for a, b in path.segments:
+                line = LineString([a, b])
+                if not line.intersects(search):
+                    continue
+                dx, dy = b[0]-a[0], b[1]-a[1]
+                length = math.hypot(dx, dy)
+                if length < max(8.0, 0.10*min(width, height)):
+                    continue
+                if abs(dy) <= max(0.35, 0.01*length):
+                    horizontal.append(((a[1]+b[1])/2,
+                                       min(a[0], b[0]), max(a[0], b[0])))
+                elif abs(dx) <= max(0.35, 0.01*length):
+                    vertical.append(((a[0]+b[0])/2,
+                                     min(a[1], b[1]), max(a[1], b[1])))
+
+        lefts = sorted({round(x, 3) for x, _, _ in vertical
+                        if minx-margin <= x <= minx+axis_tol},
+                       key=lambda x: minx-x)[:6]
+        rights = sorted({round(x, 3) for x, _, _ in vertical
+                         if maxx-axis_tol <= x <= maxx+margin},
+                        key=lambda x: x-maxx)[:6]
+        tops = sorted({round(y, 3) for y, _, _ in horizontal
+                       if miny-margin <= y <= miny+axis_tol},
+                      key=lambda y: miny-y)[:6]
+        bottoms = sorted({round(y, 3) for y, _, _ in horizontal
+                          if maxy-axis_tol <= y <= maxy+margin},
+                         key=lambda y: y-maxy)[:6]
+
+        rows = []
+        for left in lefts:
+            for right in rights:
+                for top in tops:
+                    for bottom in bottoms:
+                        if right-left < width*0.92 or bottom-top < height*0.92:
+                            continue
+                        candidate = box(left, top, right, bottom)
+                        if any(candidate.intersection(seed).area /
+                               max(seed.area, 1e-9) < 0.94
+                               for seed in seed_polys):
+                            continue
+                        vleft = [(a, b) for x, a, b in vertical
+                                 if abs(x-left) <= axis_tol]
+                        vright = [(a, b) for x, a, b in vertical
+                                  if abs(x-right) <= axis_tol]
+                        htop = [(a, b) for y, a, b in horizontal
+                                if abs(y-top) <= axis_tol]
+                        hbottom = [(a, b) for y, a, b in horizontal
+                                   if abs(y-bottom) <= axis_tol]
+                        coverages = [
+                            _interval_coverage(vleft, top, bottom, axis_tol),
+                            _interval_coverage(vright, top, bottom, axis_tol),
+                            _interval_coverage(htop, left, right, axis_tol),
+                            _interval_coverage(hbottom, left, right, axis_tol),
+                        ]
+                        coverage = sum(coverages)/4.0
+                        supported_sides = sum(value >= 0.20 for value in coverages)
+                        if supported_sides < 3:
+                            continue
+                        area_ratio = candidate.area/max(seed_union.envelope.area, 1e-9)
+                        if area_ratio > 4.0:
+                            continue
+                        # Prefer the outer finite enclosure when its real-line
+                        # support is comparable; this prevents falling back to
+                        # the smaller X hull or a single stair landing.
+                        score = (0.68*coverage + 0.07*supported_sides
+                                 + 0.08*min(area_ratio, 2.0)/2.0)
+                        rows.append((score, coverage, coverages, candidate))
+        if not rows:
+            warnings.append(
+                f"{label}: no vector-confirmed closed stairwell enclosure; "
+                "X hull retained for review only")
+            continue
+        rows.sort(key=lambda row: (row[0], row[3].area), reverse=True)
+        score, coverage, side_coverage, polygon = rows[0]
+        # One stairwell can contain another labelled flight. Preserve the
+        # finite enclosure, then include only vector flights that touch it.
+        connected_flights = [
+            candidate for candidate in stair_candidates
+            if candidate.get("kind_hint") == "STAIR_OPENING"
+            and candidate["polygon"].intersects(polygon.buffer(2.0))]
+        if connected_flights:
+            polygon = unary_union(
+                [polygon] + [candidate["polygon"]
+                             for candidate in connected_flights]).buffer(0)
+            if polygon.geom_type == "MultiPolygon":
+                polygon = max(polygon.geoms, key=lambda geom: geom.area)
+        if slab_union is not None:
+            clipped = polygon.intersection(slab_union)
+            if clipped.is_empty:
+                continue
+            if clipped.geom_type == "MultiPolygon":
+                clipped = max(clipped.geoms, key=lambda geom: geom.area)
+            polygon = clipped
+        confidence = min(0.97, 0.62 + 0.42*coverage)
+        token = re.sub(r"[^A-Z0-9]+", "_", label.upper()).strip("_")
+        cid = f"stair_{token}_closed_stairwell"
+        candidate = _candidate(
+            cid, "STAIRWELL", label,
+            "x_seed+flight_seed+orthogonal_vector_enclosure", polygon,
+            page, confidence,
+            "opening" if confidence >= getattr(
+                cfg, "penetration_min_confidence", 0.85) else "review")
+        candidate["boundary_coverage"] = coverage
+        candidate["side_coverage"] = side_coverage
+        candidate["contained_seed_ids"] = [xseed["id"]] + [
+            connected["id"] for connected in connected_flights]
+        candidate["rejected_hull_id"] = xseed["id"]
+        out.append(candidate)
+        if candidate["default_action"] == "opening":
+            defaults.append(cid)
+        penetrations.append(ResolvedPenetration(
+            id=cid, kind="STAIRWELL", polygon=polygon,
+            source_candidate_ids=[cid],
+            contained_seed_ids=candidate["contained_seed_ids"],
+            boundary_coverage=coverage, confidence=confidence,
+            status="verified" if cid in defaults else "review",
+            warnings=[] if cid in defaults else ["boundary confidence low"]))
+        warnings.append(
+            f"{label}: closed stairwell enclosure coverage={coverage:.2f}, "
+            f"confidence={confidence:.2f}")
+    return out, defaults, penetrations, warnings
+
+
+def _raw_candidates(raw_elements, walls, page, content_rect):
+    warnings: list[str] = []
+    candidates: list[dict] = []
+    default_ids: list[str] = []
+    core_anchors = _word_anchors(page, _CORE_RE, content_rect)
+    equipment_anchors = _word_anchors(page, _EQUIPMENT_RE, content_rect)
+    wall_polys = [w.polygon for w in walls
+                  if str(w.label).upper().startswith("LW")]
+    wall_union = unary_union(wall_polys) if wall_polys else None
+
+    for i, element in enumerate(raw_elements, 1):
+        nearby = _nearby_text(page, element.polygon, radius=40.0)
+        steel_label_count = sum(bool(_STEEL_LABEL_RE.match(text))
+                                for text in nearby)
+        near_equipment = any(element.polygon.distance(pt) < 45
+                             for _text, _bbox, pt in equipment_anchors)
+        near_core = any(element.polygon.distance(pt) < 140
+                        for _text, _bbox, pt in core_anchors)
+        near_lw = wall_union is not None and element.polygon.distance(wall_union) < 35
+        if near_equipment:
+            kind, label, action, confidence = (
+                "EQUIPMENT_REBATE", "FB/FLOOR BOX", "exclude", 0.95)
+            warnings.append("raw X-cross near FB/FLOOR BOX excluded by default")
+        elif steel_label_count >= 2:
+            kind, label, action, confidence = (
+                "STEELWORK_SYMBOL", "STEELWORK X-CROSS", "exclude", 0.95)
+            warnings.append(
+                "raw X-cross surrounded by steel labels excluded by default")
+        elif element.type in {"LIFT", "SHAFT"} or near_core or near_lw:
+            kind, label, action, confidence = (
+                "SHAFT", "CORE/SHAFT", "opening", 0.90)
+        else:
+            kind, label, action, confidence = (
+                element.type, element.label, "review", 0.55)
+        cid = f"raw_{i:02d}_{kind.lower()}"
+        candidates.append(_candidate(
+            cid, kind, label, "x_cross_vector", element.polygon,
+            page, confidence, action))
+        if action == "opening":
+            default_ids.append(cid)
+    return candidates, default_ids, warnings
+
+
+def _dedupe_elements(elements: list[ElementFootprint]) -> list[ElementFootprint]:
+    kept: list[ElementFootprint] = []
+    for element in sorted(elements, key=lambda x: -x.polygon.area):
+        normalized_label = re.sub(r"[^A-Z0-9]+", "", element.label.upper())
+        if (element.type == "STAIR" and normalized_label
+                and any(other.type == "STAIR" and
+                        re.sub(r"[^A-Z0-9]+", "", other.label.upper())
+                        == normalized_label for other in kept)):
+            continue
+        if any(
+            element.polygon.intersection(other.polygon).area
+            / max(min(element.polygon.area, other.polygon.area), 1e-9) > 0.65
+            for other in kept
+        ):
+            continue
+        kept.append(element)
+    return kept
+
+
+def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
+                     raw_elements: list[ElementFootprint], walls: list,
+                     slabs: list, scale: float, content_rect: fitz.Rect,
+                     cfg=None, renderer=None, use_ai: bool = True) -> OpeningResolution:
+    slab_union = unary_union([s["polygon_pdf"] for s in slabs]) if slabs else None
+    stair_candidates, stair_defaults, stair_warnings = _stair_candidates(
+        page, paths, classes, content_rect, slab_union, scale)
+    xcross_candidates, xcross_defaults, xcross_warnings = (
+        _stair_xcross_candidates(
+            page, paths, content_rect, slab_union, scale))
+    boundary_candidates, boundary_defaults, resolved_penetrations, boundary_warnings = (
+        _stairwell_boundary_candidates(
+            page, paths, classes, slab_union, scale, xcross_candidates,
+            stair_candidates, cfg))
+    boundary_labels = {candidate["label"] for candidate in boundary_candidates}
+    xcross_labels = {candidate["label"] for candidate in xcross_candidates}
+    if xcross_labels:
+        stair_defaults = [candidate_id for candidate_id in stair_defaults
+                          if next((candidate["label"] for candidate
+                                   in stair_candidates
+                                   if candidate["id"] == candidate_id), None)
+                          not in xcross_labels]
+    if boundary_labels:
+        # Closed vector enclosure supersedes both the flight-only footprint
+        # and the convex hull of diagonal endpoints.
+        stair_defaults = [candidate_id for candidate_id in stair_defaults
+                          if next((candidate["label"] for candidate
+                                   in stair_candidates
+                                   if candidate["id"] == candidate_id), None)
+                          not in boundary_labels]
+        xcross_defaults = [candidate_id for candidate_id in xcross_defaults
+                           if next((candidate["label"] for candidate
+                                    in xcross_candidates
+                                    if candidate["id"] == candidate_id), None)
+                           not in boundary_labels]
+        for candidate in xcross_candidates:
+            if candidate["label"] in boundary_labels:
+                candidate["default_action"] = "review"
+                candidate["source"] += "+rejected_as_final_hull"
+    raw_candidates, raw_defaults, raw_warnings = _raw_candidates(
+        raw_elements, walls, page, content_rect)
+    candidates = (stair_candidates + xcross_candidates
+                  + boundary_candidates + raw_candidates)
+    default_ids = (stair_defaults + xcross_defaults
+                   + boundary_defaults + raw_defaults)
+
+    judgement = {
+        "status": "deterministic",
+        "opening_ids": default_ids,
+        "exclude_ids": [c["id"] for c in candidates
+                        if c["default_action"] == "exclude"],
+        "confidence": 0.75,
+        "reason": "deterministic candidate policy",
+    }
+    judge_warning = None
+    if use_ai and cfg is not None and getattr(cfg, "enable_opening_judge", True):
+        try:
+            from src.slab_v2.opening_judge import judge_candidates
+            judged = judge_candidates(
+                page, candidates, slabs, cfg, renderer,
+                content_area_pt2=max(content_rect.width * content_rect.height, 1.0))
+            if judged.get("status") == "accepted":
+                judgement = judged
+            else:
+                judge_warning = judged.get("reason") or "judge not accepted"
+        except Exception as exc:
+            judge_warning = f"opening judge failed: {exc}"
+
+    # Geometry guard: once a closed vector enclosure is verified, neither an
+    # LLM decision nor the legacy deterministic policy may replace it with
+    # the convex hull of X endpoints.
+    judged_ids = list(judgement.get("opening_ids", []))
+    for boundary in boundary_candidates:
+        if boundary.get("default_action") != "opening":
+            continue
+        blocked = set(boundary.get("contained_seed_ids", []))
+        blocked.add(boundary.get("rejected_hull_id"))
+        judged_ids = [candidate_id for candidate_id in judged_ids
+                      if candidate_id not in blocked]
+        if boundary["id"] not in judged_ids:
+            judged_ids.append(boundary["id"])
+    judgement["opening_ids"] = judged_ids
+
+    by_id = {c["id"]: c for c in candidates}
+    selected = []
+    for cid in judgement.get("opening_ids", []):
+        candidate = by_id.get(cid)
+        if not candidate or candidate["default_action"] == "exclude":
+            continue
+        polygon = candidate["polygon"]
+        if slab_union is not None and not polygon.intersects(slab_union):
+            continue
+        etype = "STAIR" if candidate["kind_hint"].startswith("STAIR") \
+            else "SHAFT" if candidate["kind_hint"] == "SHAFT" else "VOID"
+        selected.append(ElementFootprint(
+            type=etype, polygon=polygon, label=candidate["label"],
+            anchor_bbox=tuple(candidate["bbox"]), area_pt2=polygon.area))
+    resolved = _dedupe_elements(selected)
+
+    warnings = (stair_warnings + xcross_warnings + boundary_warnings
+                + raw_warnings)
+    if judge_warning:
+        warnings.append(judge_warning + "; deterministic opening policy used")
+    report = {
+        "raw_elements": len(raw_elements),
+        "candidate_count": len(candidates),
+        "resolved_openings": len(resolved),
+        "stairs": sum(e.type == "STAIR" for e in resolved),
+        "shafts": sum(e.type in {"SHAFT", "LIFT"} for e in resolved),
+        "voids": sum(e.type == "VOID" for e in resolved),
+        "judge_status": judgement.get("status"),
+        "judge_confidence": judgement.get("confidence", 0.0),
+        "resolved_penetrations": len(resolved_penetrations),
+    }
+    return OpeningResolution(
+        resolved_openings=resolved,
+        stair_footprints=[e for e in resolved if e.type == "STAIR"],
+        core_shaft_footprints=[e for e in resolved if e.type in {"SHAFT", "LIFT"}],
+        resolved_penetrations=resolved_penetrations,
+        candidates=candidates,
+        judgement=judgement,
+        warnings=warnings,
+        report=report,
+    )

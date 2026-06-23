@@ -192,12 +192,23 @@ def elect_classes(ctx: SelectionContext,
     slab_ids = [i for i in data.get("slab_edge_classes", []) if i in valid_ids]
     supp_ids = [i for i in data.get("supporting_classes", [])
                 if i in valid_ids and i not in slab_ids]
+
+    # extract roles BEFORE checking slab_ids — roles (WALL, COLUMN, etc.)
+    # are valuable even on pages where slab edges aren't found
+    by_id = {c.id: c for c in ctx.classes}
+    roles = {}
+    for r in data.get("roles", []):
+        cid = r.get("class_id")
+        if cid in by_id:
+            roles[cid] = r.get("role", "OTHER")
+            by_id[cid].role = r.get("role", "OTHER")
+            by_id[cid].role_confidence = float(r.get("confidence") or 0.0)
+
     if not slab_ids:
         raise AIError("Round 1: model returned no valid slab_edge_classes")
 
     # coverage check: low coverage is a WARNING, not a failure — the greedy
     # class augmentation in the pipeline can still close the real boundary
-    by_id = {c.id: c for c in ctx.classes}
     xs, ys = [], []
     for i in slab_ids:
         b = by_id[i].bbox
@@ -211,14 +222,6 @@ def elect_classes(ctx: SelectionContext,
             f"elected classes {slab_ids} cover only {cov:.0%} of the "
             f"drawing area — relying on class augmentation to close the "
             f"boundary (check step_06)")
-
-    roles = {}
-    for r in data.get("roles", []):
-        cid = r.get("class_id")
-        if cid in by_id:
-            roles[cid] = r.get("role", "OTHER")
-            by_id[cid].role = r.get("role", "OTHER")
-            by_id[cid].role_confidence = float(r.get("confidence") or 0.0)
 
     return ClassElection(
         slab_edge_classes=slab_ids,

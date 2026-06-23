@@ -2,17 +2,15 @@
 Element extraction — stairs, lifts, shafts, voids via the X-CROSS symbol.
 
 On structural drawings an opening (stair/lift shaft, penetration) is drawn
-as a small rectangle with corner-to-corner diagonals (an "X"). That symbol
-— not the text label — defines the opening footprint: labels like
-"STAIR 01" usually sit OUTSIDE the shaft with a leader line, so anchoring
-on text alone grabs whole rooms (the v2 bug on Structural.pdf p10/p11).
+as a rectangle with corner-to-corner diagonals (an "X"). Detection finds
+CROSSING DIAGONAL PAIRS — two diagonal segments that intersect near their
+midpoints with endpoints near a common bounding rectangle's corners.
 
-Detection: a face is an opening candidate when at least two DIAGONAL
-segments span it near corner-to-corner. Text within the face or within
-cfg.element_text_radius_pt only assigns the type/label; an unlabeled
-X-face is still cut as VOID. Adjacent X-faces merge into one element
-(double lifts, multi-cell cores). A label with no X-face nearby produces
-a warning and cuts nothing — never cut a large face.
+This segment-pair approach is independent of the face graph (which
+subdivides X-cross rectangles into triangles, breaking face-based
+detection). Text labels like "STAIR 01" assign the type; an unlabeled
+X-cross is cut as VOID. Adjacent X-crosses merge. A label with no X-cross
+nearby uses a nearest-face fallback (same pattern as column detection).
 """
 
 from __future__ import annotations
@@ -21,14 +19,13 @@ import math
 import re
 
 import fitz
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import FaceGraph, ElementFootprint
 
-# keyword -> element type (checked in order, word-boundary)
 _KEYWORD_TYPES = [
     (re.compile(r"\bSTAIRS?\b|\bST[- ]?\d{1,2}\b", re.I), "STAIR"),
     (re.compile(r"\bLIFTS?\b|\bELEV(ATOR)?\b|\bHOIST\b|\bLV ?\d{1,2}\b", re.I),
@@ -61,36 +58,116 @@ def _diagonal_segments(paths) -> list:
     return out
 
 
-def _is_xcross_face(face, diag_tree: STRtree, diag_geoms: list,
-                    diag_lens: list) -> bool:
-    """Face has >=2 diagonal segments spanning it near corner-to-corner."""
-    minx, miny, maxx, maxy = face.polygon.bounds
-    face_diag = math.hypot(maxx - minx, maxy - miny)
-    if face_diag < 4.0:
-        return False
-    corners = [Point(minx, miny), Point(maxx, miny),
-               Point(maxx, maxy), Point(minx, maxy)]
-    span_count = 0
-    poly = face.polygon.buffer(_CORNER_TOL_PT)
-    for i in diag_tree.query(face.polygon):
-        seg = diag_geoms[i]
-        if diag_lens[i] < 0.5 * face_diag:
+def _detect_xcross_rects(
+    diags: list,
+    scale: int | None,
+    content_area_pt2: float,
+) -> list:
+    """Find X-cross rectangles from crossing diagonal segment pairs.
+
+    Returns list of shapely Polygons (axis-aligned bounding rectangles).
+    """
+    if len(diags) < 2:
+        return []
+
+    _PT_TO_MM = 25.4 / 72.0
+    _to_mm = _PT_TO_MM * (scale or 100)
+
+    _MIN_DIAG_MM = 250 * math.sqrt(2)
+    _MAX_DIAG_MM = 4000 * math.sqrt(2)
+    _min_diag_pt = _MIN_DIAG_MM / _to_mm
+    _max_diag_pt = _MAX_DIAG_MM / _to_mm
+
+    geoms = []
+    lens = []
+    for a, b, L in diags:
+        if L < _min_diag_pt or L > _max_diag_pt:
             continue
-        if not seg.intersects(poly):
+        geoms.append(LineString([a, b]))
+        lens.append(L)
+
+    if len(geoms) < 2:
+        return []
+
+    tree = STRtree(geoms)
+    used: set[int] = set()
+    rects: list = []
+
+    for i in range(len(geoms)):
+        if i in used:
             continue
-        mid = seg.interpolate(0.5, normalized=True)
-        if not face.polygon.contains(mid):
-            continue
-        (ax, ay), (bx, by) = seg.coords[0], seg.coords[-1]
-        a_near = any(c.distance(Point(ax, ay)) <= _CORNER_TOL_PT * 2
-                     for c in corners)
-        b_near = any(c.distance(Point(bx, by)) <= _CORNER_TOL_PT * 2
-                     for c in corners)
-        if a_near and b_near:
-            span_count += 1
-            if span_count >= 2:
-                return True
-    return False
+        seg_a = geoms[i]
+        len_a = lens[i]
+        mid_a = seg_a.interpolate(0.5, normalized=True)
+        ca = list(seg_a.coords)
+
+        best_j = None
+        best_score = float("inf")
+
+        for j in tree.query(seg_a):
+            j = int(j)
+            if j <= i or j in used:
+                continue
+            len_b = lens[j]
+            if min(len_a, len_b) / max(len_a, len_b) < 0.55:
+                continue
+            seg_b = geoms[j]
+            if not seg_a.crosses(seg_b):
+                continue
+
+            inter = seg_a.intersection(seg_b)
+            if inter.is_empty or inter.geom_type != "Point":
+                continue
+            mid_b = seg_b.interpolate(0.5, normalized=True)
+            tol = 0.25 * max(len_a, len_b)
+            if inter.distance(mid_a) > tol or inter.distance(mid_b) > tol:
+                continue
+
+            cb = list(seg_b.coords)
+            all_pts = [ca[0], ca[-1], cb[0], cb[-1]]
+            xs = [p[0] for p in all_pts]
+            ys = [p[1] for p in all_pts]
+            minx, miny = min(xs), min(ys)
+            maxx, maxy = max(xs), max(ys)
+            w_pt, h_pt = maxx - minx, maxy - miny
+            if w_pt < 2 or h_pt < 2:
+                continue
+
+            corners = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
+            corner_tol = _CORNER_TOL_PT * 3
+            ok = True
+            for pt in all_pts:
+                if not any(math.hypot(pt[0] - cx, pt[1] - cy) <= corner_tol
+                           for cx, cy in corners):
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            w_mm = w_pt * _to_mm
+            h_mm = h_pt * _to_mm
+            short, long = min(w_mm, h_mm), max(w_mm, h_mm)
+            if short < 200 or long > 4000:
+                continue
+            if short > 0 and long / short > 5.0:
+                continue
+
+            score = inter.distance(mid_a) + inter.distance(mid_b)
+            if score < best_score:
+                best_score = score
+                best_j = j
+
+        if best_j is not None:
+            used.add(i)
+            used.add(best_j)
+            ca2 = list(geoms[i].coords)
+            cb2 = list(geoms[best_j].coords)
+            all_pts = [ca2[0], ca2[-1], cb2[0], cb2[-1]]
+            xs = [p[0] for p in all_pts]
+            ys = [p[1] for p in all_pts]
+            rects.append(box(min(xs), min(ys), max(xs), max(ys)))
+
+    return rects
 
 
 def extract_elements(
@@ -100,6 +177,7 @@ def extract_elements(
     content_rect: fitz.Rect,
     content_area_pt2: float,
     paths: list | None = None,
+    scale: int | None = None,
 ) -> tuple[list[ElementFootprint], list[str]]:
     """X-cross opening detection. Returns (elements, warnings)."""
     warnings: list[str] = []
@@ -107,29 +185,33 @@ def extract_elements(
         return [], ["element extraction skipped: no paths provided"]
 
     diags = _diagonal_segments(paths)
-    if not diags:
-        return [], []
-    diag_geoms = [LineString([a, b]) for a, b, _l in diags]
-    diag_lens = [l for _a, _b, l in diags]
-    diag_tree = STRtree(diag_geoms)
+
+    _PT_TO_MM_e = 25.4 / 72.0
+    _to_mm_e = _PT_TO_MM_e * (scale or 100)
+    _MIN_SIDE_MM = 300.0
+    _min_side_pt = _MIN_SIDE_MM / _to_mm_e
 
     max_area = cfg.xcross_max_area_frac * content_area_pt2
-    xfaces = [f for f in fg_all.faces
-              if f.area_pt2 <= max_area
-              and _is_xcross_face(f, diag_tree, diag_geoms, diag_lens)]
-    if not xfaces:
-        return [], warnings
+    xcross_rects = _detect_xcross_rects(diags, scale, content_area_pt2)
 
-    # merge adjacent X-faces into single footprints
-    merged = unary_union([f.polygon.buffer(2.0) for f in xfaces])
     footprints = []
-    for g in getattr(merged, "geoms", [merged]):
-        shrunk = g.buffer(-2.0)
-        for part in getattr(shrunk, "geoms", [shrunk]):
-            if not part.is_empty and part.area > 0:
-                footprints.append(part)
+    if xcross_rects:
+        deduped: list = []
+        for r in xcross_rects:
+            is_dup = False
+            for existing in deduped:
+                inter = r.intersection(existing)
+                if inter.area / max(r.area, 1e-9) > 0.7:
+                    is_dup = True
+                    break
+            if not is_dup:
+                bx = r.bounds
+                w_pt = bx[2] - bx[0]
+                h_pt = bx[3] - bx[1]
+                if min(w_pt, h_pt) >= _min_side_pt and r.area <= max_area:
+                    deduped.append(r)
+        footprints = deduped
 
-    # collect text anchors for typing/labeling
     anchors = []
     for w in page.get_text("words"):
         x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
@@ -158,11 +240,69 @@ def extract_elements(
             type=etype, polygon=fp, label=label or etype,
             anchor_bbox=bbox, area_pt2=fp.area))
 
+    # ── fallback: text anchor + nearest stair-sized face (same pattern as columns) ──
+    _PT_TO_MM = 25.4 / 72.0
+    _to_mm = _PT_TO_MM * (scale or 100)
+    _STAIR_MIN_SIDE_MM = 1200
+    _STAIR_MAX_SIDE_MM = 5000
+    _STAIR_MAX_AREA_MM2 = 20_000_000
+    _MAX_ASPECT = 4.0
+    _SEARCH_RADIUS = cfg.element_text_radius_pt
+    for i, (atype, atext, abbox, apt) in enumerate(anchors):
+        if i in used_anchors:
+            continue
+        if atype not in ("STAIR", "LIFT", "SHAFT"):
+            continue
+        best_face = None
+        best_dist = _SEARCH_RADIUS + 1
+        for f in fg_all.faces:
+            dist = f.polygon.distance(apt)
+            if dist > _SEARCH_RADIUS:
+                continue
+            bx = f.polygon.bounds
+            w_mm = (bx[2] - bx[0]) * _to_mm
+            h_mm = (bx[3] - bx[1]) * _to_mm
+            area_mm2 = f.area_pt2 * (_to_mm ** 2)
+            short, long = min(w_mm, h_mm), max(w_mm, h_mm)
+            if short < _STAIR_MIN_SIDE_MM or long > _STAIR_MAX_SIDE_MM:
+                continue
+            if area_mm2 > _STAIR_MAX_AREA_MM2:
+                continue
+            if short > 0 and long / short > _MAX_ASPECT:
+                continue
+            if dist < best_dist:
+                best_face = f
+                best_dist = dist
+        if best_face is None:
+            continue
+        already = any(
+            best_face.polygon.intersects(e.polygon)
+            and best_face.polygon.intersection(e.polygon).area
+            / max(best_face.polygon.area, 1e-9) > 0.5
+            for e in elements)
+        if already:
+            continue
+        elements.append(ElementFootprint(
+            type=atype, polygon=best_face.polygon,
+            label=atext or atype,
+            anchor_bbox=abbox, area_pt2=best_face.area_pt2))
+        used_anchors.add(i)
+        bx = best_face.polygon.bounds
+        w_mm = (bx[2] - bx[0]) * _to_mm
+        h_mm = (bx[3] - bx[1]) * _to_mm
+        warnings.append(
+            f"label '{atext}' ({atype}): no X-cross, fallback face "
+            f"{w_mm:.0f}x{h_mm:.0f}mm")
+
     for i, (atype, atext, _bbox, apt) in enumerate(anchors):
         if i not in used_anchors and atype in ("STAIR", "LIFT", "SHAFT"):
             warnings.append(
                 f"label '{atext}' ({atype}) at ({apt.x:.0f},{apt.y:.0f})pt "
-                f"has no X-cross opening within "
-                f"{cfg.element_text_radius_pt:.0f}pt — nothing cut")
+                f"has no X-cross opening or qualifying face — nothing cut")
+
+    if xcross_rects:
+        warnings.insert(0,
+            f"X-cross segment-pair detection: {len(xcross_rects)} raw, "
+            f"{len(footprints)} after merge, {len(elements)} with type")
 
     return elements, warnings

@@ -56,6 +56,7 @@ def call_gemini_json(
     model: str = "",
     log_path: str | None = None,
     tag: str = "",
+    raw_path: str | None = None,
 ) -> dict:
     """One structured-output Gemini call. images = PNG bytes, in order,
     placed before the prompt text. Returns the parsed JSON dict.
@@ -97,6 +98,11 @@ def call_gemini_json(
     if response is None:
         raise RuntimeError(f"Gemini API error ({tag}): {last_err}")
     raw = response.text or ""
+
+    if raw_path:
+        rp = Path(raw_path)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(raw, encoding="utf-8")
 
     if log_path:
         p = Path(log_path)

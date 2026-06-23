@@ -49,6 +49,11 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def _safe_text(text) -> str:
+    """Keep debug labels drawable when PIL falls back to latin-1 fonts."""
+    return str(text).encode("ascii", "replace").decode("ascii")
+
+
 class PageRenderer:
     """Shared transform + raster underlay for one page."""
 
@@ -140,11 +145,12 @@ class PageRenderer:
                 frgb = tuple(int(v * 255) for v in c.key.fill)
                 dr.rectangle([20, cy + 10, 80, cy + 22], fill=frgb,
                              outline=(120, 120, 120))
-            desc = (f"CLASS {c.id} — width {c.key.width}pt, "
+            desc = (f"CLASS {c.id} - width {c.key.width}pt, "
                     f"{'dashed ' + c.key.dashes if c.key.dashes else 'solid'}, "
                     f"stroke {c.key.stroke}, fill {c.key.fill}, "
                     f"{c.n_segments} segs, total {int(c.total_length_pt)}pt")
-            dr.text((20 + sw_w + 16, y + 8), desc, fill=(0, 0, 0), font=font)
+            dr.text((20 + sw_w + 16, y + 8), _safe_text(desc),
+                    fill=(0, 0, 0), font=font)
         return self._save(img, name)
 
     # ── step 03: planarized graph ─────────────────────────────────────────
@@ -248,7 +254,7 @@ class PageRenderer:
         dr = ImageDraw.Draw(img)
         font = _font(22)
         dr.text((10, 10),
-                f"AI selection — slab faces (green): {sorted(selected)}, "
+                f"AI selection - slab faces (green): {sorted(selected)}, "
                 f"voids (red): {sorted(voids)}",
                 fill=(0, 0, 0), font=font)
         return self._save(img, name)
@@ -268,9 +274,247 @@ class PageRenderer:
         img = Image.alpha_composite(img, ov).convert("RGB")
         dr = ImageDraw.Draw(img)
         dr.text((10, 10),
-                f"deterministic assembly — union of {len(kept_face_ids)} "
+                f"deterministic assembly - union of {len(kept_face_ids)} "
                 f"faces, {len(slabs)} slab(s)",
                 fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_slab_candidates(self, candidates: list,
+                               name: str = "step_08a_slab_face_candidates.png") -> str:
+        """Atomic slab faces with stable IDs for semantic judging."""
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for c in candidates:
+            col = ((60, 180, 75, 85) if c.deterministic_score >= 0
+                   else (230, 160, 30, 85))
+            for g in getattr(c.polygon, "geoms", [c.polygon]):
+                if not hasattr(g, "exterior"):
+                    continue
+                ext = [self.tx(p) for p in g.exterior.coords]
+                dr.polygon(ext, fill=col, outline=col[:3] + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        font = _font(13)
+        for c in candidates:
+            rp = c.polygon.representative_point()
+            x, y = self.tx((rp.x, rp.y))
+            bbox = dr.textbbox((x, y), c.id, font=font, anchor="mm")
+            dr.rectangle([bbox[0] - 2, bbox[1] - 1,
+                          bbox[2] + 2, bbox[3] + 1], fill=(255, 255, 255))
+            dr.text((x, y), c.id, fill=(0, 0, 0), font=font, anchor="mm")
+        dr.text((10, 10), f"slab face candidates: {len(candidates)}",
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_slab_decision(self, candidates: list, resolution,
+                             name: str = "step_08c_slab_decision.png") -> str:
+        """Green slab, lime appendage, red removal, orange review."""
+        selected = set(resolution.selected_slab_ids)
+        appendages = set(resolution.appendage_ids)
+        removed = set(resolution.non_slab_ids) | set(resolution.opening_ids)
+        review = set(resolution.review_ids)
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for c in candidates:
+            if c.id in removed:
+                col = (230, 25, 75, 150)
+            elif c.id in review:
+                col = (245, 130, 48, 130)
+            elif c.id in appendages:
+                col = (110, 230, 40, 120)
+            elif c.id in selected:
+                col = (60, 180, 75, 120)
+            else:
+                col = (150, 150, 150, 35)
+            for g in getattr(c.polygon, "geoms", [c.polygon]):
+                if hasattr(g, "exterior"):
+                    dr.polygon([self.tx(p) for p in g.exterior.coords],
+                               fill=col, outline=col[:3] + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10), _safe_text(
+            f"slab judge={resolution.status} confidence="
+            f"{resolution.confidence:.2f} review={len(review)}"),
+            fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_floor_system_candidates(
+            self, candidates: list,
+            name: str = "step_08a_floor_system_candidates.png") -> str:
+        """Candidate partitions offered to the floor-system judge."""
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for c in candidates:
+            if c.fill_role == "OPENING":
+                col = (235, 40, 55, 115)
+            elif c.id.startswith("floor_other"):
+                col = (30, 125, 210, 105)
+            else:
+                col = (60, 180, 75, 90)
+            for g in getattr(c.polygon, "geoms", [c.polygon]):
+                if hasattr(g, "exterior"):
+                    dr.polygon([self.tx(p) for p in g.exterior.coords],
+                               fill=col, outline=col[:3] + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        font = _font(13)
+        for c in candidates:
+            rp = c.polygon.representative_point()
+            x, y = self.tx((rp.x, rp.y))
+            bbox = dr.textbbox((x, y), c.id, font=font, anchor="mm")
+            dr.rectangle([bbox[0] - 2, bbox[1] - 1,
+                          bbox[2] + 2, bbox[3] + 1], fill=(255, 255, 255))
+            dr.text((x, y), c.id, fill=(0, 0, 0), font=font, anchor="mm")
+        dr.text((10, 10), f"floor-system candidates: {len(candidates)}",
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_separator_endpoints(
+            self, candidates: list,
+            name: str = "step_08a_separator_endpoints.png") -> str:
+        """Vector separators and stair-confirmed terminal caps."""
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for c in candidates:
+            sep = getattr(c, "separator_segment", None)
+            cap = getattr(c, "terminal_cap_segment", None)
+            if sep is not None and not sep.is_empty:
+                for line in getattr(sep, "geoms", [sep]):
+                    pts = [self.tx(p) for p in line.coords]
+                    dr.line(pts, fill=(0, 180, 210, 255), width=5)
+                    for p in (pts[0], pts[-1]):
+                        dr.ellipse([p[0] - 6, p[1] - 6,
+                                    p[0] + 6, p[1] + 6],
+                                   fill=(0, 180, 210, 255))
+            if cap is not None and not cap.is_empty:
+                for line in getattr(cap, "geoms", [cap]):
+                    if not hasattr(line, "coords"):
+                        continue
+                    dr.line([self.tx(p) for p in line.coords],
+                            fill=(245, 130, 48, 255), width=5)
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10), "cyan=separator, orange=stair terminal cap",
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_floor_system_decision(
+            self, candidates: list, resolution,
+            name: str = "step_08d_floor_system_decision.png") -> str:
+        """Green PT slab, blue other floor, red opening, orange unknown."""
+        pt = set(resolution.pt_slab_ids)
+        other = set(resolution.other_floor_ids)
+        openings = set(resolution.opening_ids)
+        non_floor = set(resolution.non_floor_ids)
+        unknown = set(resolution.unknown_ids)
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for c in candidates:
+            if c.id in openings:
+                col = (245, 245, 245, 220)
+                outline = (230, 25, 75, 255)
+            elif c.id in other:
+                col, outline = (25, 120, 210, 120), (10, 80, 180, 255)
+            elif c.id in non_floor:
+                col = outline = (220, 35, 45, 150)
+            elif c.id in unknown:
+                col, outline = (245, 130, 48, 130), (210, 90, 20, 255)
+            elif c.id in pt:
+                col, outline = (60, 180, 75, 120), (0, 110, 0, 255)
+            else:
+                col = outline = (140, 140, 140, 35)
+            for g in getattr(c.polygon, "geoms", [c.polygon]):
+                if hasattr(g, "exterior"):
+                    dr.polygon([self.tx(p) for p in g.exterior.coords],
+                               fill=col, outline=outline)
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10), _safe_text(
+            f"floor systems | {resolution.status} | PT={len(pt)} "
+            f"other={len(other)} unknown={len(unknown)}"),
+            fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step08_overcut_guard(
+            self, candidates: list, resolution,
+            name: str = "step_08e_overcut_guard.png") -> str:
+        """Show accepted cuts and the infinite extension rejected by guard."""
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        pt = resolution.pt_gross_geometry
+        for g in getattr(pt, "geoms", [pt]):
+            if hasattr(g, "exterior"):
+                dr.polygon([self.tx(p) for p in g.exterior.coords],
+                           fill=(60, 180, 75, 80),
+                           outline=(0, 110, 0, 255))
+        accepted = set(resolution.other_floor_ids)
+        for c in candidates:
+            rejected = getattr(c, "rejected_extension_geometry", None)
+            if rejected is not None and not rejected.is_empty:
+                for g in getattr(rejected, "geoms", [rejected]):
+                    if hasattr(g, "exterior"):
+                        dr.polygon([self.tx(p) for p in g.exterior.coords],
+                                   fill=(205, 40, 210, 125),
+                                   outline=(150, 20, 160, 255))
+            if c.id in accepted:
+                for g in getattr(c.polygon, "geoms", [c.polygon]):
+                    if hasattr(g, "exterior"):
+                        dr.polygon([self.tx(p) for p in g.exterior.coords],
+                                   fill=(25, 120, 210, 115),
+                                   outline=(10, 80, 180, 255))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        ImageDraw.Draw(img).text(
+            (10, 10), "blue=bounded cut, magenta=prevented overcut",
+            fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step10_floor_system_geometry(self, geometry, title: str,
+                                     name: str) -> str:
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for g in getattr(geometry, "geoms", [geometry]):
+            if not hasattr(g, "exterior"):
+                continue
+            dr.polygon([self.tx(p) for p in g.exterior.coords],
+                       fill=(60, 180, 75, 115), outline=(0, 110, 0, 255))
+            for ring in g.interiors:
+                dr.polygon([self.tx(p) for p in ring.coords],
+                           fill=(255, 255, 255, 220),
+                           outline=(230, 25, 75, 255))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        ImageDraw.Draw(img).text((10, 10), _safe_text(title),
+                                 fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step10_net_slab(self, resolution,
+                        name: str = "step_10_final_net_slab.png") -> str:
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for g in getattr(resolution.net_geometry, "geoms",
+                         [resolution.net_geometry]):
+            if not hasattr(g, "exterior"):
+                continue
+            ext = [self.tx(p) for p in g.exterior.coords]
+            dr.polygon(ext, fill=(60, 180, 75, 115),
+                       outline=(0, 110, 0, 255))
+            for ring in g.interiors:
+                dr.polygon([self.tx(p) for p in ring.coords],
+                           fill=(255, 255, 255, 220),
+                           outline=(230, 25, 75, 255))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10), _safe_text(
+            f"final net slab | {resolution.status} | "
+            f"confidence={resolution.confidence:.2f}"),
+            fill=(0, 0, 0), font=_font(22))
         return self._save(img, name)
 
     # ── step 09 (v2): element footprints ──────────────────────────────────
@@ -305,6 +549,64 @@ class PageRenderer:
                 fill=(0, 0, 0), font=_font(22))
         return self._save(img, name)
 
+    def step09_candidates(self, candidates: list,
+                          name: str = "step_09c_opening_candidates.png") -> str:
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for candidate in candidates:
+            kind = candidate.get("kind_hint", "")
+            if kind == "EQUIPMENT_REBATE":
+                col = (120, 120, 120)
+            elif kind.startswith("STAIR"):
+                col = (230, 25, 75)
+            elif kind == "SHAFT":
+                col = (145, 30, 180)
+            else:
+                col = (0, 130, 200)
+            poly = candidate["polygon"]
+            for geom in getattr(poly, "geoms", [poly]):
+                ext = [self.tx(p) for p in geom.exterior.coords]
+                dr.polygon(ext, fill=col + (90,), outline=col + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        font = _font(13)
+        for candidate in candidates:
+            rp = candidate["polygon"].representative_point()
+            x, y = self.tx((rp.x, rp.y))
+            txt = _safe_text(candidate["id"])
+            bbox = dr.textbbox((x, y), txt, font=font, anchor="mm")
+            dr.rectangle([bbox[0]-2, bbox[1]-1, bbox[2]+2, bbox[3]+1],
+                         fill=(255, 255, 255))
+            dr.text((x, y), txt, fill=(0, 0, 0), font=font, anchor="mm")
+        dr.text((10, 10), f"opening candidates: {len(candidates)}",
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step09_judgement(self, candidates: list, judgement: dict,
+                         name: str = "step_09d_llm_judge.png") -> str:
+        accepted = set(judgement.get("opening_ids", []))
+        excluded = set(judgement.get("exclude_ids", []))
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for candidate in candidates:
+            cid = candidate["id"]
+            col = ((20, 170, 70) if cid in accepted else
+                   (210, 40, 40) if cid in excluded else (230, 160, 30))
+            poly = candidate["polygon"]
+            for geom in getattr(poly, "geoms", [poly]):
+                ext = [self.tx(p) for p in geom.exterior.coords]
+                dr.polygon(ext, fill=col + (100,), outline=col + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10),
+                _safe_text(f"judge={judgement.get('status')} "
+                           f"confidence={judgement.get('confidence', 0):.2f} "
+                           f"accepted={len(accepted)} excluded={len(excluded)}"),
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
     # ── step 10 (v2): final = gross slab + element openings preview ───────
     def step10_final(self, slabs: list, elements: list,
                      name: str = "step_10_final.png") -> str:
@@ -332,6 +634,40 @@ class PageRenderer:
             y += 28
         dr.text((10, y), f"openings (white) = {len(elements)} elements, "
                          f"cut at export", fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    # ── step 10c: detected walls ──────────────────────────────────────────
+    WALL_COLOR = (142, 36, 170)  # #8E24AA purple
+
+    def step10c_walls(self, walls: list,
+                      name: str = "step_10c_walls.png") -> str:
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        wc = self.WALL_COLOR
+        for w in walls:
+            geoms = list(w.polygon.geoms) \
+                if w.polygon.geom_type == "MultiPolygon" else [w.polygon]
+            for g in geoms:
+                ext = [self.tx(p) for p in g.exterior.coords]
+                dr.polygon(ext, fill=wc + (130,), outline=wc + (255,))
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        font = _font(14)
+        for w in walls:
+            rp = w.polygon.representative_point()
+            x, y = self.tx((rp.x, rp.y))
+            txt = f"{w.label} ({w.w_mm:.0f}x{w.l_mm:.0f})"
+            bbox = dr.textbbox((x, y), txt, font=font, anchor="mm")
+            dr.rectangle([bbox[0] - 2, bbox[1] - 1, bbox[2] + 2, bbox[3] + 1],
+                         fill=(255, 255, 255))
+            dr.text((x, y), txt, fill=(100, 0, 120), font=font, anchor="mm")
+        types_count = {}
+        for w in walls:
+            types_count[w.wall_type] = types_count.get(w.wall_type, 0) + 1
+        summary = "  ".join(f"{t}:{n}" for t, n in sorted(types_count.items()))
+        dr.text((10, 10), f"walls: {len(walls)}   {summary}",
+                fill=(0, 0, 0), font=_font(22))
         return self._save(img, name)
 
     # ── step 11: detected columns ──────────────────────────────────────────
@@ -443,7 +779,7 @@ class PageRenderer:
         for s in slabs:
             area = s.get("area_m2")
             dr.text((10, y),
-                    f"{s['label']}: area={area:.1f} m²" if area else s["label"],
+                    f"{s['label']}: area={area:.1f} m2" if area else s["label"],
                     fill=(0, 0, 0), font=_font(22))
             y += 28
         dr.text((10, y), f"attempts={attempts}", fill=(0, 0, 0), font=_font(22))

@@ -64,6 +64,42 @@ class SlabV2Config:
     max_total_calls: int = 8
     """Hard budget of Gemini calls per page."""
 
+    enable_opening_judge: bool = True
+    """Call Gemini after code generates opening candidates. No result cache is
+    used while this development flag is enabled."""
+
+    opening_judge_min_confidence: float = 0.70
+    """Minimum semantic-judge confidence before selected IDs replace the
+    deterministic opening policy."""
+
+    enable_slab_face_judge: bool = True
+    """Judge code-generated atomic slab faces. The gross deterministic slab
+    remains the fallback whenever the response or geometry validation fails."""
+
+    slab_judge_min_confidence: float = 0.80
+    slab_subtract_min_confidence: float = 0.85
+    """A semantic decision may classify at 0.80, but destructive non-slab
+    subtraction requires 0.85 plus deterministic negative evidence."""
+
+    slab_max_net_area_loss_frac: float = 0.35
+    """Reject a judge decision that removes more than this fraction of gross
+    slab unless every removed face has explicit negative text evidence."""
+
+    enable_floor_system_judge: bool = True
+    floor_system_judge_min_confidence: float = 0.80
+    floor_system_other_min_confidence: float = 0.85
+    floor_system_separator_min_coverage: float = 0.45
+    floor_system_stair_proximity_pt: float = 12.0
+    floor_system_terminal_tolerance_mm: float = 150.0
+    floor_system_terminal_tolerance_max_pt: float = 6.0
+    """Floor-system separation is conservative: an OTHER region needs a
+    substantial vector separator, verified stair adjacency, and independent
+    semantic/system evidence. Gemini may select IDs but cannot create lines."""
+
+    height_conflict_tolerance_mm: float = 100.0
+    height_reject_residual_mm: float = 150.0
+    """Datum graph thresholds for strong-source conflicts and outliers."""
+
     prompt_dpi: int = 150
     """DPI for images sent to Gemini and for debug renders."""
 
@@ -87,6 +123,11 @@ class SlabV2Config:
     must be at most this fraction of the content area — shafts are small;
     anything bigger is a drawing region, never an opening."""
 
+    xcross_min_area_frac: float = 0.0002
+    """Merged X-cross footprints smaller than this fraction of the content
+    area are dropped — they are annotation circles (e.g. slab thickness
+    '400'), grid intersection marks, or other false positives."""
+
     element_text_radius_pt: float = 80.0
     """Max distance from a STAIR/LIFT/... label to the X-cross face it
     names (labels usually sit outside the shaft with a leader line)."""
@@ -105,6 +146,29 @@ class SlabV2Config:
     shaft_wall_thickness_mm: float = 150.0
     """Wall thickness of the LIFT/SHAFT/DUCT ring volume. Footprints too
     narrow for the inward buffer fall back to a solid volume."""
+
+    render_shaft_solids: bool = False
+    """Keep verified shaft/core footprints as slab cuts, but do not create
+    duplicate 3D shaft rings when the detected LW walls already model core."""
+
+    keep_verified_shaft_openings: bool = True
+    render_stair_solids: bool = False
+    """Customer output is opening-only: stairs cut slabs but are not modelled."""
+
+    keep_verified_stair_openings: bool = True
+    penetration_min_boundary_coverage: float = 0.55
+    penetration_min_confidence: float = 0.85
+    penetration_axis_tolerance_mm: float = 150.0
+
+    lw1_min_vector_coverage: float = 0.35
+    """Both LW1 rails must have this target-page vector coverage before recovery."""
+    extraction_max_workers: int = 6
+    """Preserve verified LIFT/SHAFT/CORE footprints for slab subtraction."""
+
+    wall_junction_snap_max_mm: float = 25.0
+    wall_junction_verified_gap_mm: float = 1.0
+    """Only close small wall endpoint quantization gaps; larger discontinuities
+    remain review items rather than being bridged destructively."""
 
     stair_max_riser_mm: float = 175.0
     """Riser count = ceil(storey_height / this); actual riser = height/n."""
@@ -175,10 +239,23 @@ class SlabV2Config:
     rectangular shapes. Smaller = more precise, larger = tolerates offset
     labels with leader lines."""
 
+    steel_exclusion_radius_pt: float = 40.0
+    """Buffer radius around steel text labels (CH, SH, UB, etc.) to block
+    RC column detection. Independent of column_text_search_radius_pt so
+    steel zones remain effective even when text search radius is reduced."""
+
     # ── Manual overrides ────────────────────────────────────────────────────
     manual_scale: int | None = None
     """User-supplied scale denominator (e.g. 100 for 1:100). When set,
     bypasses both text-based and dimension-based scale detection."""
+
+    # ── Performance ────────────────────────────────────────────────────────────
+    max_parallel_pages: int = 10
+    """Number of pages to extract in parallel (ThreadPoolExecutor workers)."""
+
+    debug_images: bool = True
+    """When False, skip non-essential debug images (step_00, step_03-11).
+    Prompt images (step_01, step_02) are always generated for Gemini."""
 
     # ── Output ────────────────────────────────────────────────────────────────
     debug_dir: str = "debug_slab_v2"

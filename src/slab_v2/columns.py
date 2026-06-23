@@ -17,10 +17,11 @@ Candidates inside detected openings (stair/lift X-crosses) are dropped.
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 
 import fitz
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Point, Polygon, box
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
@@ -28,6 +29,62 @@ from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import ColumnFootprint, ColumnType
 
 PT_TO_MM = 25.4 / 72.0
+
+def _normalize_label(text: str) -> str:
+    """Normalize a PDF word/column symbol for robust label matching.
+
+    Strips everything except A-Z and 0-9 so that 'CH*35c' and 'CH*'
+    become 'CH35C' and 'CH' — asterisks, dashes, spaces all removed.
+    """
+    return re.sub(r"[^A-Z0-9]+", "", str(text or "").upper())
+
+
+def _steel_label_matches(word: str, steel_symbols: set[str]) -> bool:
+    """True when *word* (page text) looks like a variant of a census steel symbol.
+
+    Only uses symbols the Gemini census classified as STEEL — no hardcoded
+    prefix list, so SH/CH/etc. are only treated as steel when the census
+    says so for THIS PDF.
+    """
+    norm = _normalize_label(word)
+    if not norm:
+        return False
+    if norm in steel_symbols:
+        return True
+    for sym in steel_symbols:
+        if not sym or len(sym) < 2:
+            continue
+        if norm.startswith(sym):
+            return True
+    return False
+
+
+def _collect_steel_exclusion_zones(
+    page: fitz.Page,
+    steel_symbols: set[str],
+    radius_pt: float,
+    slab_union=None,
+) -> list:
+    """Return buffered text-label zones that should not become RC columns."""
+    if not steel_symbols:
+        return []
+    slab_buffer = slab_union.buffer(radius_pt * 3) if slab_union is not None else None
+    zones = []
+    for w in page.get_text("words"):
+        if len(w) < 5 or not _steel_label_matches(w[4], steel_symbols):
+            continue
+        x0, y0, x1, y1 = float(w[0]), float(w[1]), float(w[2]), float(w[3])
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if slab_buffer is not None and not slab_buffer.contains(Point(cx, cy)):
+            continue
+        zones.append(box(x0, y0, x1, y1).buffer(radius_pt))
+    return zones
+
+
+def _in_steel_exclusion(poly: Polygon, zones: list) -> bool:
+    """True when a candidate rectangle is too close to a steel text label."""
+    return any(poly.intersects(zone) or poly.centroid.within(zone)
+               for zone in zones)
 
 
 def _path_polygon(p) -> Polygon | None:
@@ -80,10 +137,34 @@ def extract_columns(
     warnings: list[str] = []
     if not scale:
         return [], ["column detection skipped: no scale"]
+    steel_symbols = {
+        _normalize_label(sym) for sym, ct in (column_types or {}).items()
+        if str(getattr(ct, "material", "") or "").upper() == "STEEL"
+    }
+    steel_symbols.discard("")
+    steel_skipped = sorted(
+        sym for sym, ct in (column_types or {}).items()
+        if str(getattr(ct, "material", "") or "").upper() == "STEEL"
+    )
+    if steel_skipped:
+        warnings.append(
+            "steel column types skipped in RC-only phase: "
+            + ", ".join(steel_skipped)
+        )
+    column_types = {
+        sym: ct for sym, ct in (column_types or {}).items()
+        if str(getattr(ct, "material", "") or "").upper() != "STEEL"
+    }
     to_mm = PT_TO_MM * scale
 
     openings = unary_union([e.polygon for e in elements]) \
         if elements else None
+    steel_exclusion_radius = max(cfg.steel_exclusion_radius_pt, 40.0)
+    steel_exclusion_zones = _collect_steel_exclusion_zones(
+        page, steel_symbols, steel_exclusion_radius, slab_union)
+    if steel_exclusion_zones:
+        warnings.append(
+            f"steel exclusion zones active: {len(steel_exclusion_zones)} label(s)")
 
     # ── candidates: small near-rectangles with measured mm sides ──────────
     cands = []           # (poly, w_mm, d_mm)
@@ -100,6 +181,8 @@ def extract_columns(
         if not (100.0 <= d_mm and w_mm <= cfg.column_max_side_mm):
             continue
         if openings is not None and poly.intersects(openings):
+            continue
+        if _in_steel_exclusion(poly, steel_exclusion_zones):
             continue
         if slab_union is not None:
             dist_mm = poly.distance(slab_union) * to_mm
@@ -159,14 +242,48 @@ def extract_columns(
             kept_idx.append(i)
 
     # ── text marks assign symbols ──────────────────────────────────────────
-    symbols_upper = {s.upper(): s for s in column_types}
+    symbols_norm = {_normalize_label(s): s for s in column_types}
     anchors = []
-    if symbols_upper:
-        for w in page.get_text("words"):
-            txt = w[4].strip().upper().rstrip(".,:")
-            if txt in symbols_upper:
+    if symbols_norm:
+        all_words = page.get_text("words")
+        for w in all_words:
+            txt = _normalize_label(w[4])
+            if txt in symbols_norm:
                 cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
-                anchors.append((symbols_upper[txt], (cx, cy)))
+                anchors.append((symbols_norm[txt], (cx, cy)))
+
+        # merge split labels: "C" + "9" → "C9"
+        _SPLIT_MERGE_DIST = 20.0
+        letter_words = []
+        digit_words = []
+        for w in all_words:
+            norm = _normalize_label(w[4])
+            if not norm:
+                continue
+            if norm.isalpha() and len(norm) <= 3:
+                letter_words.append((norm, (w[0]+w[2])/2, (w[1]+w[3])/2))
+            elif norm.isdigit() and len(norm) <= 2:
+                digit_words.append((norm, (w[0]+w[2])/2, (w[1]+w[3])/2))
+        for ltxt, lx, ly in letter_words:
+            for dtxt, dx, dy in digit_words:
+                if ((lx - dx)**2 + (ly - dy)**2)**0.5 > _SPLIT_MERGE_DIST:
+                    continue
+                combined = ltxt + dtxt
+                if combined in symbols_norm:
+                    mx, my = (lx + dx) / 2, (ly + dy) / 2
+                    anchors.append((symbols_norm[combined], (mx, my)))
+
+        # dedupe: same symbol within 30pt → keep first
+        _seen: dict[str, tuple[float, float]] = {}
+        _deduped: list[tuple[str, tuple[float, float]]] = []
+        for sym, pos in anchors:
+            if sym in _seen:
+                ox, oy = _seen[sym]
+                if ((pos[0] - ox)**2 + (pos[1] - oy)**2)**0.5 < 30:
+                    continue
+            _seen[sym] = pos
+            _deduped.append((sym, pos))
+        anchors = _deduped
 
     columns: list[ColumnFootprint] = []
     ambiguous = 0

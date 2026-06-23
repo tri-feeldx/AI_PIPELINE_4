@@ -284,6 +284,9 @@ def cmd_auto(args) -> int:
         print(f"\n=== building: {b.name} ===")
         storeys, prev_ffl = [], None
         for f in b.floors:
+            if "roof" in f.level_id.lower():
+                print(f"  SKIP: {f.level_id} (roof level — RC-only phase)")
+                continue
             ffl_m = f.ffl_m
             if ffl_m is None:
                 ffl_m = (prev_ffl or 0.0) + cfg.default_storey_height_mm \
