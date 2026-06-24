@@ -159,11 +159,17 @@ class SlabV2Config:
     penetration_min_boundary_coverage: float = 0.55
     penetration_min_confidence: float = 0.85
     penetration_axis_tolerance_mm: float = 150.0
+    penetration_edge_snap_max_mm: float = 600.0
+    penetration_edge_snap_min_overlap: float = 0.90
+    penetration_edge_snap_min_endpoint_coverage: float = 0.65
+    penetration_edge_snap_max_protected_ratio: float = 0.01
+    core_opening_min_boundary_coverage: float = 0.70
+    core_opening_max_wall_intersection_ratio: float = 0.01
 
     lw1_min_vector_coverage: float = 0.35
     """Both LW1 rails must have this target-page vector coverage before recovery."""
-    extraction_max_workers: int = 6
-    """Preserve verified LIFT/SHAFT/CORE footprints for slab subtraction."""
+    extraction_max_workers: int = 10
+    """Max parallel page-extraction threads."""
 
     wall_junction_snap_max_mm: float = 25.0
     wall_junction_verified_gap_mm: float = 1.0
@@ -252,6 +258,11 @@ class SlabV2Config:
     # ── Performance ────────────────────────────────────────────────────────────
     max_parallel_pages: int = 10
     """Number of pages to extract in parallel (ThreadPoolExecutor workers)."""
+
+    speed_mode: bool = False
+    """When True, disable optional Gemini judges and debug images for faster
+    batch processing.  Gross slab geometry (Round 1 + deterministic assembly)
+    is unaffected.  Re-run with speed_mode=False for pages needing review."""
 
     debug_images: bool = True
     """When False, skip non-essential debug images (step_00, step_03-11).

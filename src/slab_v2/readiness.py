@@ -18,13 +18,18 @@ def build_model_readiness(storeys: list[dict], level_datums: list,
     opening_review = False
     for s in storeys:
         result = s["result"]
-        if result.opening_candidates and result.opening_judgement.get(
-                "status") != "accepted":
+        opening_report = result.opening_report or {}
+        unresolved = (opening_report.get("unresolved_candidate_ids", [])
+                      or opening_report.get("high_impact_review_ids", []))
+        if (unresolved or
+                (result.opening_candidates and result.opening_judgement.get(
+                    "status") != "accepted")):
             opening_review = True
             break
     opening_status = "review" if opening_review else "verified"
     if opening_review:
-        reasons.append("Opening candidates were not all semantically verified.")
+        reasons.append(
+            "One or more high-impact opening candidates lack verified geometry.")
 
     wall_rows = [s["result"].wall_readiness for s in storeys
                  if s["result"].wall_readiness]

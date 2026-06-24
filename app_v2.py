@@ -10,6 +10,7 @@ import json
 import sys
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -571,15 +572,23 @@ def _phase_extract(cfg: SlabV2Config):
                 "v1_cols": v1_cols, "v1_cols_raw": v1_cols_raw_out,
                 "col_logs": col_logs}
 
-    max_w = max(1, min(len(tasks), int(cfg.extraction_max_workers)))
+    from src.slab_v2.gemini_client import get_client, set_gemini_concurrency
+    get_client()  # warm up credentials before workers start
+    max_w = max(10, int(cfg.extraction_max_workers))
+    set_gemini_concurrency(min(10, max_w))
     st.info(f"Extracting {len(tasks)} pages with {max_w} parallel workers...")
     page_results = {}
+    _t_extract_start = time.time()
     with ThreadPoolExecutor(max_workers=max_w) as executor:
         futures = {executor.submit(_extract_one_page, t): t for t in tasks}
         for future in as_completed(futures):
             r = future.result()
             page_results[r["pi"]] = r
             progress.progress(_done_count[0] / max(total_pages, 1))
+    _t_extract_elapsed = time.time() - _t_extract_start
+    st.info(f"Done: {len(tasks)} pages in {_t_extract_elapsed:.1f}s "
+            f"({max_w} workers, "
+            f"{_t_extract_elapsed / max(len(tasks), 1):.1f}s/page avg)")
 
     # ---- Render results on main thread (Streamlit UI) ----------------------------
     for b in ana.buildings:
@@ -628,6 +637,19 @@ def _phase_extract(cfg: SlabV2Config):
                             "Opening Judge: "
                             f"{result.opening_judgement.get('status', 'n/a')} "
                             f"({result.opening_judgement.get('confidence', 0):.2f})")
+                    if result.opening_report:
+                        opening_report = result.opening_report
+                        st.caption(
+                            "Opening Geometry Guards: "
+                            f"verified cuts={opening_report.get('verified_cuts', 0)} | "
+                            f"boundary snaps={opening_report.get('boundary_snaps', 0)} | "
+                            f"prevented={opening_report.get('prevented_overcuts', 0)} | "
+                            f"unresolved={len(opening_report.get('unresolved_candidate_ids', []))}")
+                        if opening_report.get("high_impact_review_ids"):
+                            st.warning(
+                                "Opening geometry needs review: "
+                                + ", ".join(
+                                    opening_report["high_impact_review_ids"]))
                     if result.floor_system_readiness:
                         fs = result.floor_system_readiness
                         st.caption(

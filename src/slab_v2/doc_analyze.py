@@ -23,6 +23,53 @@ from src.slab_v2.models import (BuildingInfo, ColumnType, DocAnalysis,
                                 FloorInfo, WallType)
 
 
+_WALL_SCOPE_SUFFIXES = {
+    "(U)": "under_only",
+    "U": "under_only",
+    "(O)": "over_only",
+    "O": "over_only",
+}
+
+
+def collect_page_wall_scope_evidence(
+    words: list,
+    content_rect: fitz.Rect,
+    symbols: set[str],
+) -> dict[str, dict[str, int]]:
+    """Count current/under/over wall labels inside the drawing area."""
+    normalized = {str(s).strip().upper(): str(s).strip() for s in symbols}
+    by_line: dict[tuple[int, int], list] = {}
+    for word in words:
+        if len(word) < 7:
+            continue
+        cx = (float(word[0]) + float(word[2])) / 2.0
+        cy = (float(word[1]) + float(word[3])) / 2.0
+        if not content_rect.contains(fitz.Point(cx, cy)):
+            continue
+        by_line.setdefault((int(word[5]), int(word[6])), []).append(word)
+
+    result: dict[str, dict[str, int]] = {}
+    for line_words in by_line.values():
+        line_words.sort(key=lambda w: (float(w[0]), float(w[1])))
+        for idx, word in enumerate(line_words):
+            token = str(word[4]).strip().upper()
+            if token not in normalized:
+                continue
+            scope = "current"
+            neighbours = (line_words[max(0, idx - 2):idx]
+                          + line_words[idx + 1:idx + 3])
+            for neighbour in neighbours:
+                suffix = str(neighbour[4]).strip().upper()
+                if suffix in _WALL_SCOPE_SUFFIXES:
+                    scope = _WALL_SCOPE_SUFFIXES[suffix]
+                    break
+            symbol = normalized[token]
+            counts = result.setdefault(symbol, {
+                "current": 0, "under_only": 0, "over_only": 0})
+            counts[scope] += 1
+    return result
+
+
 def _pages_0based(raw, n_pages: int, what: str,
                   warnings: list[str]) -> list[int]:
     out = []
@@ -46,6 +93,9 @@ def analyze_document(pdf_path: str,
     doc = fitz.open(pdf_path)
     n_pages = len(doc)
     page_text_upper = [page.get_text("text").upper() for page in doc]
+    page_words = [page.get_text("words") for page in doc]
+    from src.slab_v2.pipeline import _content_rect
+    page_content_rects = [_content_rect(page) for page in doc]
     doc.close()
 
     all_pages = list(range(n_pages))
@@ -329,34 +379,48 @@ def analyze_document(pdf_path: str,
         for f in b.floors:
             wd = _match_col_data(wall_buildings, b.name, f.level_name,
                                  f.level_id)
-            # Floor/page mapping comes from the floor analyzer.  Gemini wall
-            # census may aggregate adjacent sheets under one level, so local
-            # exact symbol anchors override its per-floor counts.
+            # Gemini wall census is ground truth for which walls belong
+            # to each floor.  Page text only validates presence within
+            # the census scope — it must not add walls the census omits.
+            census_walls = wd.get("walls", {}) if wd else {}
             local_walls: dict[str, int] = {}
-            floor_text = "\n".join(page_text_upper[p] for p in f.pages)
-            for symbol in res.wall_types:
-                pattern = rf"(?<![A-Z0-9]){re.escape(symbol.upper())}(?![A-Z0-9])"
-                count = len(re.findall(pattern, floor_text))
-                if count:
-                    # Core/perimeter wall labels describe one connected run;
-                    # repeated rendering/OCR copies must not multiply census.
-                    local_walls[symbol] = 1 if re.match(
-                        r"^(?:LW|W)\d+$", symbol.upper()) else count
-            if local_walls:
-                f.walls = local_walls
-                f.total_walls = sum(local_walls.values())
-                if wd and wd.get("walls") != local_walls:
-                    res.warnings.append(
-                        f"{b.name}/{f.level_id}: wall census counts replaced "
-                        "by page-local symbol evidence")
-            elif wd:
-                raw_walls = wd.get("walls", {})
-                clean_walls: dict[str, int] = {}
-                for wsym, wcount in raw_walls.items():
-                    clean_sym = re.sub(r'\s*\([A-Z]+\)\s*$', '', wsym).strip()
-                    clean_walls[clean_sym] = clean_walls.get(clean_sym, 0) + int(wcount)
-                f.walls = clean_walls
-                f.total_walls = wd.get("total_walls", 0)
+            search_symbols = set(res.wall_types) | set(census_walls)
+            scope_evidence: dict[str, dict[str, int]] = {}
+            for page_index in f.pages:
+                page_evidence = collect_page_wall_scope_evidence(
+                    page_words[page_index], page_content_rects[page_index],
+                    search_symbols)
+                for symbol, counts in page_evidence.items():
+                    merged = scope_evidence.setdefault(symbol, {
+                        "current": 0, "under_only": 0, "over_only": 0})
+                    for scope, count in counts.items():
+                        merged[scope] += count
+
+            for symbol, counts in scope_evidence.items():
+                current_count = int(counts.get("current", 0))
+                if not current_count or symbol not in res.wall_types:
+                    continue
+                local_walls[symbol] = 1 if re.match(
+                    r"^(?:LW|W)\d+$", symbol.upper()) else current_count
+
+            f.walls = local_walls
+            f.total_walls = sum(local_walls.values())
+            scoped_refs = {
+                symbol: counts for symbol, counts in scope_evidence.items()
+                if counts.get("under_only") or counts.get("over_only")
+            }
+            if scoped_refs:
+                details = ", ".join(
+                    f"{symbol}:U={counts.get('under_only', 0)},"
+                    f"O={counts.get('over_only', 0)}"
+                    for symbol, counts in sorted(scoped_refs.items()))
+                res.warnings.append(
+                    f"{b.name}/{f.level_id}: reference-only wall labels "
+                    f"excluded from current-floor export ({details})")
+            if wd and census_walls != local_walls:
+                res.warnings.append(
+                    f"{b.name}/{f.level_id}: wall census reconciled with "
+                    "drawing-zone vertical-scope evidence")
 
     # Save merged JSON
     with open(out_root / "doc_analysis.json", "w", encoding="utf-8") as fh:

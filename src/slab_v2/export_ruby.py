@@ -474,6 +474,27 @@ def generate_building_ruby(
             lv["walls_mm"] += _walls_mm(st["result"], st["page"], scale)
             lv["pages"].append(st["result"].page_index + 1)
 
+    from shapely.affinity import translate as _translate
+    def _centered(p: Polygon) -> Polygon:
+        cx, cy = p.centroid.coords[0]
+        return _translate(p, -cx, -cy)
+    _seen_walls: dict[str, Polygon] = {}
+    for lv in levels:
+        deduped = []
+        for item in lv["walls_mm"]:
+            label = item["label"]
+            if label.upper().startswith("LW"):
+                deduped.append(item)
+                continue
+            norm = _centered(item["polygon"])
+            if label in _seen_walls:
+                if _iou(norm, _seen_walls[label]) > 0.90:
+                    continue
+            else:
+                _seen_walls[label] = norm
+            deduped.append(item)
+        lv["walls_mm"] = deduped
+
     model_status = getattr(readiness_report, "model_status", "debug")
     readiness_reasons = getattr(readiness_report, "reasons", [])
 

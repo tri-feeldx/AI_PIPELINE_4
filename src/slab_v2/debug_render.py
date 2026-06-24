@@ -63,13 +63,28 @@ class PageRenderer:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.scale = cfg.debug_dpi / 72.0
+        self._raster: Image.Image | None = None
+        self._faded: Image.Image | None = None
+
+    def _ensure_raster(self):
+        if self._raster is not None:
+            return
         mat = fitz.Matrix(self.scale, self.scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        self.raster = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        # faded underlay: blend toward white
-        arr = np.asarray(self.raster, dtype=np.float32)
+        pix = self.page.get_pixmap(matrix=mat, alpha=False)
+        self._raster = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        arr = np.asarray(self._raster, dtype=np.float32)
         faded = (arr * 0.35 + 255 * 0.65).astype(np.uint8)
-        self.faded = Image.fromarray(faded)
+        self._faded = Image.fromarray(faded)
+
+    @property
+    def raster(self) -> Image.Image:
+        self._ensure_raster()
+        return self._raster
+
+    @property
+    def faded(self) -> Image.Image:
+        self._ensure_raster()
+        return self._faded
 
     # ── coordinate transform ──────────────────────────────────────────────
     def tx(self, p) -> tuple:
@@ -580,6 +595,46 @@ class PageRenderer:
                          fill=(255, 255, 255))
             dr.text((x, y), txt, fill=(0, 0, 0), font=font, anchor="mm")
         dr.text((10, 10), f"opening candidates: {len(candidates)}",
+                fill=(0, 0, 0), font=_font(22))
+        return self._save(img, name)
+
+    def step09_opening_guards(
+        self, candidates: list, walls: list, selected_ids: set[str],
+        name: str = "step_09e_opening_geometry_guards.png",
+    ) -> str:
+        """Show fail-closed opening decisions and protected LW geometry."""
+        img = self._base().convert("RGBA")
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        for wall in walls:
+            if not str(wall.label).upper().startswith("LW"):
+                continue
+            for geom in getattr(wall.polygon, "geoms", [wall.polygon]):
+                ext = [self.tx(point) for point in geom.exterior.coords]
+                dr.polygon(ext, fill=(130, 35, 170, 75),
+                           outline=(130, 35, 170, 255))
+        for candidate in candidates:
+            cid = candidate.get("id", "")
+            snap = candidate.get("geometry_audit", {}).get("boundary_snap", {})
+            if not candidate.get("destructive_allowed", False):
+                fill, outline = (220, 20, 180, 60), (220, 20, 180, 255)
+            elif cid in selected_ids and snap.get("status") == "verified_snap":
+                fill, outline = (255, 255, 255, 210), (0, 180, 210, 255)
+            elif cid in selected_ids:
+                fill, outline = (255, 255, 255, 210), (220, 30, 45, 255)
+            else:
+                fill, outline = (230, 150, 20, 70), (230, 150, 20, 255)
+            polygon = candidate.get("polygon")
+            if polygon is None:
+                continue
+            for geom in getattr(polygon, "geoms", [polygon]):
+                ext = [self.tx(point) for point in geom.exterior.coords]
+                dr.polygon(ext, fill=fill, outline=outline)
+        img = Image.alpha_composite(img, ov).convert("RGB")
+        dr = ImageDraw.Draw(img)
+        dr.text((10, 10),
+                f"opening guards: verified={len(selected_ids)} "
+                f"prevented={sum(not c.get('destructive_allowed', False) for c in candidates)}",
                 fill=(0, 0, 0), font=_font(22))
         return self._save(img, name)
 

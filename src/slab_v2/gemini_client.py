@@ -9,9 +9,18 @@ so responses are parsed by the SDK, never by regex.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 _client = None
+_client_lock = threading.Lock()
+_gemini_semaphore: threading.Semaphore | None = None
+
+
+def set_gemini_concurrency(max_concurrent: int = 10):
+    """Limit concurrent Gemini API calls across all worker threads."""
+    global _gemini_semaphore
+    _gemini_semaphore = threading.Semaphore(max_concurrent)
 
 
 def get_client():
@@ -19,25 +28,31 @@ def get_client():
     if _client is not None:
         return _client
 
-    from dotenv import load_dotenv
-    load_dotenv()
+    with _client_lock:
+        if _client is not None:
+            return _client
 
-    from google import genai
-    from google.oauth2 import service_account
+        from dotenv import load_dotenv
+        load_dotenv()
 
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    location = os.environ.get("VERTEX_LOCATION", "us-central1")
+        from google import genai
+        from google.oauth2 import service_account
 
-    if not creds_path or not project:
-        raise EnvironmentError(
-            "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_PROJECT "
-            "must be set in .env")
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        location = os.environ.get("VERTEX_LOCATION", "us-central1")
 
-    creds = service_account.Credentials.from_service_account_file(
-        creds_path, scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    _client = genai.Client(
-        vertexai=True, project=project, location=location, credentials=creds)
+        if not creds_path or not project:
+            raise EnvironmentError(
+                "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_PROJECT "
+                "must be set in .env")
+
+        creds = service_account.Credentials.from_service_account_file(
+            creds_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        _client = genai.Client(
+            vertexai=True, project=project, location=location,
+            credentials=creds)
     return _client
 
 
@@ -74,29 +89,36 @@ def call_gemini_json(
                 for b in images]
     contents.append(prompt)
 
-    response = None
-    last_err = None
-    for attempt in range(4):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0,
-                    seed=0,
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                ),
-            )
-            break
-        except genai_errors.APIError as e:
-            last_err = e
-            if e.code in (429, 500, 503) and attempt < 3:
-                time.sleep(15 * (attempt + 1))    # 15s, 30s, 45s backoff
-                continue
-            raise RuntimeError(f"Gemini API error ({tag}): {e}") from e
-    if response is None:
-        raise RuntimeError(f"Gemini API error ({tag}): {last_err}")
+    sem = _gemini_semaphore
+    if sem:
+        sem.acquire()
+    try:
+        response = None
+        last_err = None
+        for attempt in range(4):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        seed=0,
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                    ),
+                )
+                break
+            except genai_errors.APIError as e:
+                last_err = e
+                if e.code in (429, 500, 503) and attempt < 3:
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Gemini API error ({tag}): {e}") from e
+        if response is None:
+            raise RuntimeError(f"Gemini API error ({tag}): {last_err}")
+    finally:
+        if sem:
+            sem.release()
     raw = response.text or ""
 
     if raw_path:

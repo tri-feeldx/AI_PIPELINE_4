@@ -229,6 +229,7 @@ class ResolvedPenetration:
     confidence: float = 0.0
     status: str = "review"
     warnings: list = field(default_factory=list)
+    geometry_audit: dict = field(default_factory=dict)
 
 
 @dataclass

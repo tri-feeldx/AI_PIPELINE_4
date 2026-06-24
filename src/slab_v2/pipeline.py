@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -39,22 +40,26 @@ from src.slab_v2.debug_render import PageRenderer
 # debug_slab_v2/<stem>/upload<N>/page_<P>/... — runs never overwrite each
 # other, N is resolved once per process per document
 _RUN_DIRS: dict[str, Path] = {}
+_RUN_DIRS_LOCK = threading.Lock()
 
 
 def run_dir(cfg: SlabV2Config, pdf_path: str) -> Path:
     stem = Path(pdf_path).stem.replace(" ", "_")
     key = f"{cfg.debug_dir}|{stem}"
-    if key not in _RUN_DIRS:
-        root = Path(cfg.debug_dir) / stem
-        nums = []
-        if root.exists():
-            for d in root.iterdir():
-                m = re.fullmatch(r"upload(\d+)", d.name)
-                if m and d.is_dir():
-                    nums.append(int(m.group(1)))
-        path = root / f"upload{max(nums, default=0) + 1}"
-        path.mkdir(parents=True, exist_ok=True)
-        _RUN_DIRS[key] = path
+    if key in _RUN_DIRS:
+        return _RUN_DIRS[key]
+    with _RUN_DIRS_LOCK:
+        if key not in _RUN_DIRS:
+            root = Path(cfg.debug_dir) / stem
+            nums = []
+            if root.exists():
+                for d in root.iterdir():
+                    m = re.fullmatch(r"upload(\d+)", d.name)
+                    if m and d.is_dir():
+                        nums.append(int(m.group(1)))
+            path = root / f"upload{max(nums, default=0) + 1}"
+            path.mkdir(parents=True, exist_ok=True)
+            _RUN_DIRS[key] = path
     return _RUN_DIRS[key]
 
 
@@ -83,6 +88,11 @@ def extract_slabs_v2(
     wall_source_registry: dict | None = None,
 ) -> SlabV2Result:
     cfg = cfg or SlabV2Config()
+    if cfg.speed_mode:
+        cfg.enable_opening_judge = False
+        cfg.enable_slab_face_judge = False
+        cfg.enable_floor_system_judge = False
+        cfg.debug_images = False
     doc = fitz.open(pdf_path)
     page = doc[page_index]
 
@@ -434,7 +444,8 @@ def extract_slabs_v2(
     from src.slab_v2 import opening_resolver
     opening_resolution = opening_resolver.resolve_openings(
         page, paths, classes, result.elements, result.walls, slabs,
-        final_scale, content, cfg=cfg, renderer=rend, use_ai=use_ai)
+        final_scale, content, cfg=cfg, renderer=rend, use_ai=use_ai,
+        columns=result.columns)
     result.resolved_openings = opening_resolution.resolved_openings
     result.resolved_penetrations = opening_resolution.resolved_penetrations
     result.render_elements = [
@@ -498,6 +509,10 @@ def extract_slabs_v2(
             "step_09a_stair_core_candidates.png")
         rend.step09_elements(result.resolved_openings,
                              "step_09b_resolved_openings.png")
+        rend.step09_opening_guards(
+            opening_resolution.candidates, result.walls,
+            set(opening_resolution.judgement.get("opening_ids", [])),
+            "opening_geometry_guards_p%02d.png" % (page.number + 1))
         penetration_candidates = [
             candidate for candidate in opening_resolution.candidates
             if candidate.get("kind_hint") in {
@@ -531,6 +546,7 @@ def extract_slabs_v2(
             "boundary_coverage": item.boundary_coverage,
             "confidence": item.confidence, "status": item.status,
             "warnings": item.warnings,
+            "geometry_audit": item.geometry_audit,
             "bbox": list(item.polygon.bounds),
         } for item in opening_resolution.resolved_penetrations]
         penetration_candidates = [{
@@ -549,6 +565,17 @@ def extract_slabs_v2(
         (Path(out_dir) / f"resolved_penetrations_p{page.number+1:02d}.json").write_text(
             json.dumps(public_penetrations, indent=2, ensure_ascii=False),
             encoding="utf-8")
+        guard_candidates = [{
+            key: value for key, value in candidate.items()
+            if key != "polygon"
+        } for candidate in opening_resolution.candidates]
+        (Path(out_dir) / f"opening_geometry_guards_p{page.number+1:02d}.json").write_text(
+            json.dumps({
+                "selected_ids": opening_resolution.judgement.get(
+                    "opening_ids", []),
+                "report": opening_resolution.report,
+                "candidates": guard_candidates,
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as exc:
         result.warnings.append(f"penetration audit output failed: {exc}")
 
@@ -720,6 +747,7 @@ def _write_result_json(result: SlabV2Result, out_dir: Path) -> None:
              "boundary_coverage": p.boundary_coverage,
              "confidence": p.confidence, "status": p.status,
              "warnings": p.warnings,
+             "geometry_audit": p.geometry_audit,
              "polygon_pdf_pts": poly_coords(p.polygon)}
             for p in result.resolved_penetrations],
         "render_elements": [
