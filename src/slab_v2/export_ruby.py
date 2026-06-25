@@ -31,7 +31,7 @@ from shapely.ops import unary_union
 
 from src.coordinate_mapper import transform_polygon, pdf_point_to_real
 from src.slab_v2.config import SlabV2Config
-from src.slab_v2.models import SlabV2Result
+from src.slab_v2.models import OpeningIntent, SlabV2Result
 from src.slab_v2.element_geometry import (element_ruby, face_with_holes,
                                           _solid_up)
 
@@ -45,7 +45,18 @@ def _elements_mm(result: SlabV2Result, page: fitz.Page, scale: int):
 
 def _resolved_openings_mm(result: SlabV2Result, page: fitz.Page, scale: int):
     ox, oy = page.rect.x0, page.rect.y1
-    openings = result.resolved_openings or result.elements
+    allowed = {
+        OpeningIntent.SLAB_PENETRATION.value,
+        OpeningIntent.VOID.value,
+        OpeningIntent.LIFT_SHAFT.value,
+    }
+    openings = [
+        element for element in result.verified_cut_openings
+        if (element.opening_intent in allowed
+            and bool(element.evidence_ids)
+            and not ("STAIR" in element.object_roles
+                     and not element.evidence_ids))
+    ]
     return [(e.type, e.label,
              transform_polygon(e.polygon, page, scale, ox, oy))
             for e in openings]
@@ -54,14 +65,7 @@ def _resolved_openings_mm(result: SlabV2Result, page: fitz.Page, scale: int):
 def _render_elements_mm(result: SlabV2Result, page: fitz.Page, scale: int,
                         cfg: SlabV2Config):
     ox, oy = page.rect.x0, page.rect.y1
-    elements = result.render_elements
-    if not elements:
-        elements = [element for element in
-                    (result.resolved_openings or result.elements)
-                    if ((element.type not in {"SHAFT", "LIFT", "CORE"}
-                         or cfg.render_shaft_solids)
-                        and (element.type != "STAIR"
-                             or cfg.render_stair_solids))]
+    elements = list(result.render_elements)
     elements = [element for element in elements
                 if ((element.type not in {"SHAFT", "LIFT", "CORE"}
                      or cfg.render_shaft_solids)
@@ -275,7 +279,9 @@ def generate_ruby(
     openings = unary_union([p for _, _, p in resolved_mm]) \
         if resolved_mm else None
 
+    policy = getattr(cfg, "opening_policy_version", "penetration_only_v2")
     lines = [
+        f"# Opening policy: {policy}",
         "# slab_v2 export — page %d, scale 1:%s" % (
             pnum,
             f"{scale:.2f}" if isinstance(scale, float) else scale),
@@ -371,7 +377,7 @@ def generate_ruby(
         "model.commit_operation",
         f"puts 'slab_v2: imported {len(result.slabs)} slab(s), "
         f"{len(result.elements)} raw element(s), "
-        f"{len(result.resolved_openings)} resolved opening(s), "
+        f"{len(result.verified_cut_openings)} verified cut opening(s), "
         f"{len(result.walls)} wall(s), "
         f"{len(result.columns)} column(s), "
         f"{len(result.other_floor_systems)} other floor system(s) retained, "
@@ -497,6 +503,8 @@ def generate_building_ruby(
 
     model_status = getattr(readiness_report, "model_status", "debug")
     readiness_reasons = getattr(readiness_report, "reasons", [])
+    opening_policy = getattr(
+        cfg, "opening_policy_version", "penetration_only_v2")
 
     # vertical shaft pairing: same type, footprint IoU on consecutive levels
     pairs = 0
@@ -519,6 +527,7 @@ def generate_building_ruby(
 
     lines = [
         "# slab_v2 building export — %s, %d level(s)" % (bname, len(levels)),
+        "# Opening policy: %s" % opening_policy,
         ("# FINAL VERIFIED MODEL" if model_status == "final"
          else "# UNVERIFIED MODEL - DEBUG USE ONLY"),
         "# readiness: %s" % model_status,
@@ -724,11 +733,19 @@ def generate_building_ruby(
         for st in storeys)
     n_other_floors = sum(
         len(st["result"].other_floor_systems) for st in storeys)
+    n_stair_context = sum(
+        len(st["result"].opening_context_objects) for st in storeys)
+    n_prevented_stairs = sum(
+        len(st["result"].opening_report.get(
+            "prevented_stair_cut_ids", [])) for st in storeys)
+    n_mixed_review = sum(
+        len(st["result"].opening_report.get(
+            "unresolved_mixed_ids", [])) for st in storeys)
     lines += [
         "",
         "model.commit_operation",
         f"puts 'slab_v2: imported {len(levels)} level(s), "
-        f"{n_elems} raw element(s), {n_openings} resolved opening(s), "
+        f"{n_elems} raw element(s), {n_openings} verified cut opening(s), "
         f"{n_cols} column(s), "
         f"{n_walls} wall(s), "
         f"{n_shaft_solids} shaft solid(s), "
@@ -737,6 +754,9 @@ def generate_building_ruby(
         f"{pairs} vertical shaft pair(s), "
         f"judge accepted {judge_accepted}, excluded {judge_excluded}, "
         f"RC columns {detected_rc}/{expected_rc}'",
+        f"puts 'Opening policy: {opening_policy}; stair context: "
+        f"{n_stair_context}; prevented stair cuts: {n_prevented_stairs}; "
+        f"unresolved mixed candidates: {n_mixed_review}; stair solids: 0'",
         f"puts 'MODEL READINESS: {model_status.upper()}'",
     ]
 

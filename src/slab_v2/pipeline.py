@@ -446,13 +446,16 @@ def extract_slabs_v2(
         page, paths, classes, result.elements, result.walls, slabs,
         final_scale, content, cfg=cfg, renderer=rend, use_ai=use_ai,
         columns=result.columns)
-    result.resolved_openings = opening_resolution.resolved_openings
+    result.verified_cut_openings = opening_resolution.verified_cut_openings
+    result.resolved_openings = list(result.verified_cut_openings)
+    result.opening_context_objects = opening_resolution.context_objects
+    result.opening_review_candidates = opening_resolution.review_candidates
+    result.opening_policy_version = getattr(
+        cfg, "opening_policy_version", "penetration_only_v2")
     result.resolved_penetrations = opening_resolution.resolved_penetrations
-    result.render_elements = [
-        element for element in result.resolved_openings
-        if ((element.type not in {"SHAFT", "LIFT", "CORE"}
-             or cfg.render_shaft_solids)
-            and (element.type != "STAIR" or cfg.render_stair_solids))]
+    # Openings are subtraction metadata, never 3D solids. Dedicated element
+    # renderers may populate this later, but must not reuse cut geometry.
+    result.render_elements = []
     result.opening_candidates = opening_resolution.candidates
     result.opening_judgement = opening_resolution.judgement
     result.opening_report = opening_resolution.report
@@ -584,8 +587,9 @@ def extract_slabs_v2(
     from src.slab_v2 import floor_system_resolver
     floor_resolution, floor_candidates, floor_profile = (
         floor_system_resolver.resolve_floor_systems(
-            page, paths, classes, slabs, result.resolved_openings, cfg, rend,
-            use_ai=use_ai, scale=final_scale))
+            page, paths, classes, slabs, result.verified_cut_openings, cfg, rend,
+            use_ai=use_ai, scale=final_scale,
+            context_objects=result.opening_context_objects))
     result.floor_system_candidates = floor_candidates
     result.floor_system_profile = floor_profile
     result.floor_system_resolution = floor_resolution
@@ -679,7 +683,7 @@ def extract_slabs_v2(
     result.slabs = slabs
 
     if cfg.debug_images:
-        rend.step10_final(slabs, result.resolved_openings or result.elements)
+        rend.step10_final(slabs, result.verified_cut_openings)
     result.timings["total"] = time.time() - t0
     _write_result_json(result, out_dir)
     return result
@@ -737,9 +741,31 @@ def _write_result_json(result: SlabV2Result, out_dir: Path) -> None:
             for e in result.elements],
         "resolved_openings": [
             {"type": e.type, "label": e.label,
+             "opening_intent": e.opening_intent,
+             "object_roles": e.object_roles,
+             "evidence_ids": e.evidence_ids,
+             "candidate_id": e.candidate_id,
              "area_pt2": round(e.area_pt2, 1),
              "polygon_pdf_pts": poly_coords(e.polygon)}
             for e in result.resolved_openings],
+        "opening_policy_version": result.opening_policy_version,
+        "verified_cut_openings": [
+            {"type": e.type, "label": e.label,
+             "opening_intent": e.opening_intent,
+             "object_roles": e.object_roles,
+             "evidence_ids": e.evidence_ids,
+             "candidate_id": e.candidate_id,
+             "area_pt2": round(e.area_pt2, 1),
+             "polygon_pdf_pts": poly_coords(e.polygon)}
+            for e in result.verified_cut_openings],
+        "opening_context_objects": [
+            {"type": e.type, "label": e.label,
+             "opening_intent": e.opening_intent,
+             "object_roles": e.object_roles,
+             "candidate_id": e.candidate_id,
+             "area_pt2": round(e.area_pt2, 1),
+             "polygon_pdf_pts": poly_coords(e.polygon)}
+            for e in result.opening_context_objects],
         "resolved_penetrations": [
             {"id": p.id, "kind": p.kind,
              "source_candidate_ids": p.source_candidate_ids,

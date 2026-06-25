@@ -628,7 +628,7 @@ def _phase_extract(cfg: SlabV2Config):
                         for s in result.other_floor_systems)
                     st.write(f"Area: {area:.1f} m\u00b2 | "
                              f"Other floor: {other_area:.1f} m\u00b2 | "
-                             f"Openings: {len(result.resolved_openings)} | "
+                             f"Verified cuts: {len(result.verified_cut_openings)} | "
                              f"Walls: {len(result.walls)} | "
                              f"Columns: {len(result.columns)} | "
                              f"Scale: 1:{result.scale}")
@@ -640,10 +640,11 @@ def _phase_extract(cfg: SlabV2Config):
                     if result.opening_report:
                         opening_report = result.opening_report
                         st.caption(
-                            "Opening Geometry Guards: "
+                            f"Opening Policy {result.opening_policy_version}: "
                             f"verified cuts={opening_report.get('verified_cuts', 0)} | "
-                            f"boundary snaps={opening_report.get('boundary_snaps', 0)} | "
-                            f"prevented={opening_report.get('prevented_overcuts', 0)} | "
+                            f"stair context={opening_report.get('stair_context_count', 0)} | "
+                            f"prevented stair cuts={len(opening_report.get('prevented_stair_cut_ids', []))} | "
+                            f"mixed review={len(opening_report.get('unresolved_mixed_ids', []))} | "
                             f"unresolved={len(opening_report.get('unresolved_candidate_ids', []))}")
                         if opening_report.get("high_impact_review_ids"):
                             st.warning(
@@ -814,7 +815,8 @@ def _phase_extract(cfg: SlabV2Config):
             pass
         prefix = "final_model" if readiness.model_status == "final" \
             else "debug_model"
-        out_path = str(out_dir / f"{prefix}_{stem}_{bid}.rb")
+        policy = getattr(cfg, "opening_policy_version", "penetration_only_v2")
+        out_path = str(out_dir / f"{prefix}_{policy}_{stem}_{bid}.rb")
         # site placement offset for this building
         site_report = st.session_state.get("site_placement") or {}
         bld_transforms = site_report.get("site_transform", {}).get(
@@ -990,7 +992,8 @@ def _show_results(cfg: SlabV2Config):
                 "FFL (m)": f"{s['ffl_mm'] / 1000:.3f}",
                 "Area (m\u00b2)": f"{area:.1f}",
                 "Other floor (m\u00b2)": f"{other_area:.1f}",
-                "Openings": len(r.resolved_openings),
+                "Verified cuts": len(r.verified_cut_openings),
+                "Stair context": len(r.opening_context_objects),
                 "Walls": len(r.walls),
                 "Columns": col_str,
                 "Scale": f"1:{r.scale}" if r.scale else "N/A",
@@ -1108,7 +1111,9 @@ def _show_results(cfg: SlabV2Config):
             prefix = ("final_model" if readiness
                       and readiness.model_status == "final"
                       else "debug_model")
-            file_name = f"{prefix}_{stem}_{bid}.rb"
+            policy = getattr(
+                cfg, "opening_policy_version", "penetration_only_v2")
+            file_name = f"{prefix}_{policy}_{stem}_{bid}.rb"
             st.download_button(
                 f"Download {file_name}",
                 data=ruby_bytes[bname],

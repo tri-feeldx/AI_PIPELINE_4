@@ -52,8 +52,8 @@ class FloorSystemCandidateTests(unittest.TestCase):
 
     def test_nested_extent_plus_stairs_creates_two_other_floor_strips(self):
         candidates = build_floor_system_candidates(
-            self.page, self.paths, self.gross, self.openings,
-            self.profile, self.cfg)
+            self.page, self.paths, self.gross, [], self.profile, self.cfg,
+            context_objects=self.openings)
         other = [c for c in candidates if c.id.startswith("floor_other")]
         self.assertEqual(len(other), 2)
         self.assertTrue(all("external_stair_interface" in
@@ -81,8 +81,8 @@ class FloorSystemCandidateTests(unittest.TestCase):
             short_stairs.append(ElementFootprint(
                 "STAIR", poly, opening.label, poly.bounds, poly.area))
         candidates = build_floor_system_candidates(
-            self.page, self.paths, self.gross, short_stairs,
-            self.profile, self.cfg, scale=100)
+            self.page, self.paths, self.gross, [], self.profile, self.cfg,
+            scale=100, context_objects=short_stairs)
         self.assertFalse(any(c.id.startswith("floor_other") for c in candidates))
         self.assertTrue(any(c.id.startswith("floor_review") for c in candidates))
         main = next(c for c in candidates if c.id == "floor_pt_001")
@@ -105,8 +105,8 @@ class FloorSystemCandidateTests(unittest.TestCase):
             openings.append(ElementFootprint(
                 "STAIR", poly, opening.label, poly.bounds, poly.area))
         candidates = build_floor_system_candidates(
-            self.page, [path], gross, openings, self.profile, self.cfg,
-            scale=100)
+            self.page, [path], gross, [], self.profile, self.cfg,
+            scale=100, context_objects=openings)
         other = [c for c in candidates if c.id.startswith("floor_other")]
         self.assertEqual(len(other), 2)
         self.assertTrue(all(c.cut_status == "bounded_verified" for c in other))
@@ -135,8 +135,8 @@ class FloorSystemCandidateTests(unittest.TestCase):
                 return_value=decision):
             resolution, candidates, _profile = resolve_floor_systems(
                 self.page, self.paths, [],
-                [{"polygon_pdf": self.gross}], short_stairs,
-                self.cfg, renderer, use_ai=True, scale=100)
+                [{"polygon_pdf": self.gross}], [], self.cfg, renderer,
+                use_ai=True, scale=100, context_objects=short_stairs)
         self.assertTrue(any(c.id.startswith("floor_review")
                             for c in candidates))
         self.assertAlmostEqual(resolution.pt_gross_geometry.area,

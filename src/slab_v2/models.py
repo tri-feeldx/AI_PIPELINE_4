@@ -9,9 +9,20 @@ traces back to the PDF vector data (or a GEOS snap-round of it, ≤0.025 pt).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 from shapely.geometry import Polygon
+
+
+class OpeningIntent(str, Enum):
+    """Independent intent that authorizes a destructive slab cut."""
+
+    NONE = "NONE"
+    SLAB_PENETRATION = "SLAB_PENETRATION"
+    VOID = "VOID"
+    LIFT_SHAFT = "LIFT_SHAFT"
+    REBATE_SETDOWN = "REBATE_SETDOWN"
 
 
 @dataclass(frozen=True)
@@ -215,6 +226,10 @@ class ElementFootprint:
     label: str                              # the anchor text as drawn
     anchor_bbox: tuple                      # text bbox in PDF pts
     area_pt2: float = 0.0
+    opening_intent: str = OpeningIntent.NONE.value
+    object_roles: list = field(default_factory=list)
+    evidence_ids: list = field(default_factory=list)
+    candidate_id: str = ""
 
 
 @dataclass
@@ -481,6 +496,12 @@ class SlabV2Result:
     verification: Optional[VerificationReport] = None
     elements: list = field(default_factory=list)        # list[ElementFootprint]
     resolved_openings: list = field(default_factory=list)  # list[ElementFootprint]
+    # Only this collection is permitted to subtract slab geometry.  The
+    # compatibility resolved_openings field mirrors it for one release.
+    verified_cut_openings: list = field(default_factory=list)
+    opening_context_objects: list = field(default_factory=list)
+    opening_review_candidates: list = field(default_factory=list)
+    opening_policy_version: str = "penetration_only_v2"
     resolved_penetrations: list = field(default_factory=list)
     render_elements: list = field(default_factory=list)  # 3D elements, separate from cuts
     opening_report: dict = field(default_factory=dict)

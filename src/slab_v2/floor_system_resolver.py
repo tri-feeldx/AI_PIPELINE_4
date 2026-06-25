@@ -339,7 +339,7 @@ def _candidate_public(c: FloorSystemCandidate) -> dict:
 
 
 def build_floor_system_candidates(page, paths, gross, openings, profile, cfg,
-                                  scale=None):
+                                  scale=None, context_objects=None):
     """Split floor extent only where vector topology and context corroborate."""
     words = page.get_text("words")
     gross_area = max(gross.area, 1.0)
@@ -358,7 +358,8 @@ def build_floor_system_candidates(page, paths, gross, openings, profile, cfg,
                 clipped.representative_point()):
             nested.append((path, clipped))
 
-    stairs = [o for o in openings if str(o.type).upper() == "STAIR"]
+    stairs = [o for o in (context_objects or [])
+              if str(o.type).upper() == "STAIR"]
     for path, inner in nested:
         inner_point = inner.representative_point()
         for edge in _iter_edges(inner.minimum_rotated_rectangle):
@@ -504,9 +505,12 @@ def _judge(page, candidates, profile, cfg, renderer):
 Code generated stable candidate IDs and all coordinates. Return IDs only.
 Never invent geometry. Generic FLOOR STRUCTURE means floor extent, not proof
 of concrete. Classify PT/concrete slab separately from steel/composite/other
-floor systems. OTHER FLOOR is not an opening. Verified stair/core candidates
-remain openings. One signal alone (steel symbol, fill, stair adjacency) is not
-enough to remove concrete; require the supplied multi-signal evidence.
+floor systems. OTHER FLOOR is not an opening. A stair object is context only:
+stair adjacency, blue fill, tread lines, or a STAIR label do not prove an
+opening and do not prove a different floor system. Only independently verified
+penetration/void/lift-shaft candidates appear as OPENING. One signal alone
+(steel symbol, fill, stair adjacency) is not enough to remove concrete; require
+an explicit material/system transition plus the supplied geometry evidence.
 
 SEMANTIC PROFILE:
 {json.dumps(asdict(profile), ensure_ascii=False)}
@@ -529,11 +533,13 @@ PAGE TEXT:
 
 
 def resolve_floor_systems(page, paths, classes, gross_slabs, openings, cfg,
-                          renderer, use_ai=True, scale=None):
+                          renderer, use_ai=True, scale=None,
+                          context_objects=None):
     gross = unary_union([s["polygon_pdf"] for s in gross_slabs])
     profile = _profile_with_gemini(page, paths, classes, cfg, renderer, use_ai)
     candidates = build_floor_system_candidates(
-        page, paths, gross, openings, profile, cfg, scale=scale)
+        page, paths, gross, openings, profile, cfg, scale=scale,
+        context_objects=context_objects)
     by_id = {c.id: c for c in candidates}
     warnings = list(profile.warnings)
     decision = None
@@ -567,12 +573,16 @@ def resolve_floor_systems(page, paths, classes, gross_slabs, openings, cfg,
             continue
 
         independent = set(c.negative_pt_evidence)
+        independent_system = bool(independent & {
+            "steel_symbol_family_inside_region",
+            "steel_floor_context",
+        })
         strong_other = (
             len(c.separator_evidence) >= 2
             and c.cut_status == "bounded_verified"
             and "stair_confirmed_terminal_cap" in c.separator_evidence
             and "external_stair_interface" in independent
-            and len(independent - {"external_stair_interface"}) >= 1)
+            and independent_system)
         # Vertex response schemas may preserve the selected ID arrays while
         # omitting arbitrary-key confidence maps. Membership is semantic
         # evidence, but it is accepted only behind the same deterministic

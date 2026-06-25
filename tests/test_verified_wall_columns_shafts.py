@@ -12,6 +12,7 @@ from src.slab_v2.models import (
     ColumnFootprint,
     ElementFootprint,
     ModelReadinessReport,
+    OpeningIntent,
     SlabV2Result,
     WallFootprint,
 )
@@ -63,10 +64,14 @@ class VerifiedWallColumnShaftTests(unittest.TestCase):
         result.slabs = [{"label": "SLAB", "polygon_pdf": box(50, 50, 500, 500),
                          "polygon_mm": None, "area_m2": 250.0}]
         shaft = ElementFootprint("SHAFT", box(200, 200, 250, 250),
-                                 "CORE/SHAFT", (0, 0, 0, 0), 2500)
+                                 "CORE/SHAFT", (0, 0, 0, 0), 2500,
+                                 opening_intent=OpeningIntent.LIFT_SHAFT.value,
+                                 evidence_ids=["closed_wall_bounded_face"])
         stair = ElementFootprint("STAIR", box(300, 200, 350, 300),
                                  "STAIR 01", (0, 0, 0, 0), 5000)
-        result.resolved_openings = [shaft, stair]
+        result.verified_cut_openings = [shaft]
+        result.resolved_openings = [shaft]
+        result.opening_context_objects = [stair]
         result.render_elements = [stair]
         result.column_detection_report = {
             "status": "not_required", "expected": {}, "detected": {},
@@ -86,6 +91,8 @@ class VerifiedWallColumnShaftTests(unittest.TestCase):
         self.assertIn("0 shaft solid(s)", ruby)
         self.assertNotIn("STAIR_PLACEHOLDER", ruby)
         self.assertIn("0 stair solid(s)", ruby)
+        self.assertIn("Opening policy: penetration_only_v2", ruby)
+        self.assertIn("1 verified cut opening(s)", ruby)
 
     def test_verified_columns_have_unique_symbols_and_no_ambiguity(self):
         columns = [ColumnFootprint(

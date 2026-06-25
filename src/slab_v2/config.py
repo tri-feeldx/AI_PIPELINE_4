@@ -153,9 +153,13 @@ class SlabV2Config:
 
     keep_verified_shaft_openings: bool = True
     render_stair_solids: bool = False
-    """Customer output is opening-only: stairs cut slabs but are not modelled."""
+    """Stairs are context objects and are not modelled."""
 
-    keep_verified_stair_openings: bool = True
+    cut_stair_openings: bool = False
+    keep_verified_stair_openings: bool = False
+    cut_verified_lift_voids: bool = True
+    cut_verified_slab_penetrations: bool = True
+    opening_policy_version: str = "penetration_only_v2"
     penetration_min_boundary_coverage: float = 0.55
     penetration_min_confidence: float = 0.85
     penetration_axis_tolerance_mm: float = 150.0
@@ -165,6 +169,14 @@ class SlabV2Config:
     penetration_edge_snap_max_protected_ratio: float = 0.01
     core_opening_min_boundary_coverage: float = 0.70
     core_opening_max_wall_intersection_ratio: float = 0.01
+    slab_penetration_min_area_m2: float = 0.05
+    slab_penetration_max_area_m2: float = 10.0
+    slab_penetration_max_structural_intersection_ratio: float = 0.01
+    stair_opening_min_slab_overlap: float = 0.85
+    stair_opening_max_structural_intersection_ratio: float = 0.01
+    stair_opening_min_area_m2: float = 0.25
+    stair_opening_max_area_m2: float = 40.0
+    stair_opening_max_label_distance_mm: float = 2500.0
 
     lw1_min_vector_coverage: float = 0.35
     """Both LW1 rails must have this target-page vector coverage before recovery."""

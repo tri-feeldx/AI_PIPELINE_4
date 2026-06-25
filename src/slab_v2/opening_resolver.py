@@ -16,7 +16,8 @@ from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
-from src.slab_v2.models import ElementFootprint, ResolvedPenetration
+from src.slab_v2.models import (ElementFootprint, OpeningIntent,
+                                ResolvedPenetration)
 
 PT_TO_MM = 25.4 / 72.0
 
@@ -29,6 +30,9 @@ _STEEL_LABEL_RE = re.compile(r"^(?:SH|CH|UC|UB|SHS|CHS|RHS)\w*$", re.I)
 @dataclass
 class OpeningResolution:
     resolved_openings: list[ElementFootprint] = field(default_factory=list)
+    verified_cut_openings: list[ElementFootprint] = field(default_factory=list)
+    context_objects: list[ElementFootprint] = field(default_factory=list)
+    review_candidates: list[dict] = field(default_factory=list)
     stair_footprints: list[ElementFootprint] = field(default_factory=list)
     core_shaft_footprints: list[ElementFootprint] = field(default_factory=list)
     resolved_penetrations: list[ResolvedPenetration] = field(default_factory=list)
@@ -92,6 +96,7 @@ def _fill_polygons(paths: list, classes: list | None, predicate):
 def _candidate(candidate_id: str, kind: str, label: str, source: str,
                polygon, page: fitz.Page, confidence: float,
                default_action: str) -> dict:
+    is_stair = kind.startswith("STAIR") or bool(_STAIR_RE.search(label or ""))
     return {
         "id": candidate_id,
         "kind_hint": kind,
@@ -107,6 +112,12 @@ def _candidate(candidate_id: str, kind: str, label: str, source: str,
         "verification_status": (
             "verified" if default_action == "opening" and confidence >= 0.85
             else "review"),
+        "object_roles": ["STAIR"] if is_stair else [],
+        "object_evidence_ids": (["stair_label_or_geometry"] if is_stair else []),
+        "opening_intent": OpeningIntent.NONE.value,
+        "opening_evidence_ids": [],
+        "cut_eligible": False,
+        "reject_reason": "",
     }
 
 
@@ -130,7 +141,8 @@ def _connected_fill_cluster(fills: list, seed_idx: int,
 
 
 def _stair_candidates(page, paths, classes, content_rect, slab_union,
-                      scale) -> tuple[list[dict], list[str], list[str]]:
+                      scale, protected_solids=None, cfg=None
+                      ) -> tuple[list[dict], list[str], list[str]]:
     warnings: list[str] = []
     default_ids: list[str] = []
     anchors = _word_anchors(page, _STAIR_RE, content_rect)
@@ -190,20 +202,212 @@ def _stair_candidates(page, paths, classes, content_rect, slab_union,
         cluster_id = f"{prefix}_flight_union"
         overlap_ratio = cluster.area / max(full_cluster_area, 1e-9)
         is_edge_interface = overlap_ratio < 0.20
-        candidates.append(_candidate(
+        label_distance_mm = cluster.distance(anchor) * to_mm
+        area_m2 = cluster.area * to_mm * to_mm / 1_000_000.0
+        structural_ratio = (
+            cluster.intersection(protected_solids).area
+            / max(cluster.area, 1e-9)
+            if protected_solids is not None and not protected_solids.is_empty
+            else 0.0)
+        min_overlap = float(getattr(
+            cfg, "stair_opening_min_slab_overlap", 0.85))
+        max_structural = float(getattr(
+            cfg, "stair_opening_max_structural_intersection_ratio", 0.01))
+        min_area = float(getattr(cfg, "stair_opening_min_area_m2", 0.25))
+        max_area = float(getattr(cfg, "stair_opening_max_area_m2", 40.0))
+        max_label_distance = float(getattr(
+            cfg, "stair_opening_max_label_distance_mm", 2500.0))
+        verified = (
+            not is_edge_interface
+            and overlap_ratio >= min_overlap
+            and structural_ratio <= max_structural
+            and min_area <= area_m2 <= max_area
+            and label_distance_mm <= max_label_distance
+            and len(cluster_ids) >= 1
+            and cluster.geom_type == "Polygon"
+            and cluster.is_valid)
+        candidate = _candidate(
             cluster_id,
             "STAIR_EDGE_INTERFACE" if is_edge_interface else "STAIR_OPENING",
             label, "connected_blue_fill_union", cluster, page,
-            0.55 if is_edge_interface else 0.88,
-            "review" if is_edge_interface else "opening"))
-        if not is_edge_interface:
+            0.55 if is_edge_interface else (0.94 if verified else 0.72),
+            "opening" if verified else "review")
+        candidate.update({
+            "destructive_allowed": verified,
+            "verification_status": "verified" if verified else "review",
+            "slab_overlap_ratio": overlap_ratio,
+            "fill_component_count": len(cluster_ids),
+            "label_anchor_distance_mm": label_distance_mm,
+            "area_m2": area_m2,
+            "structural_intersection_ratio": structural_ratio,
+            "boundary_evidence": ["connected_blue_fill_union",
+                                  "stair_text_anchor"],
+            "geometry_audit": {
+                "slab_overlap_ratio": overlap_ratio,
+                "fill_component_count": len(cluster_ids),
+                "label_anchor_distance_mm": label_distance_mm,
+                "area_m2": area_m2,
+                "structural_intersection_ratio": structural_ratio,
+            },
+        })
+        candidates.append(candidate)
+        if verified:
             default_ids.append(cluster_id)
         warnings.append(
             f"label '{label}' (STAIR): generated landing and connected "
             f"flight candidates; "
-            + (f"default={cluster_id}" if not is_edge_interface
-               else "edge-only overlap marked review"))
+            + (f"verified={cluster_id}" if verified
+               else "edge/geometry evidence marked review"))
     return candidates, default_ids, warnings
+
+
+def _is_verified_stairwell_penetration(candidate: dict) -> bool:
+    """Return True when a stairwell candidate has independent cut evidence.
+
+    A stair label/flight is only object context. The P10-style case is
+    different: a closed vector enclosure contains an X penetration seed and
+    has a verified boundary snap to the slab edge. That is penetration
+    geometry that happens to contain stair graphics.
+    """
+    if str(candidate.get("kind_hint", "")).upper() != "STAIRWELL":
+        return False
+    if candidate.get("verification_status") != "verified":
+        return False
+    if candidate.get("default_action") != "opening":
+        return False
+    if not bool(candidate.get("destructive_allowed", False)):
+        return False
+    try:
+        coverage = float(candidate.get("boundary_coverage", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        coverage = 0.0
+    if coverage < 0.70:
+        return False
+
+    audit = candidate.get("geometry_audit", {}) or {}
+    snap = audit.get("boundary_snap", {}) if isinstance(audit, dict) else {}
+    if snap.get("status") != "verified_snap":
+        return False
+
+    source = str(candidate.get("source", "")).lower()
+    seed_text = " ".join(
+        str(seed).lower() for seed in candidate.get("contained_seed_ids", []))
+    has_x_seed = (
+        "x_seed" in source
+        or "xcross" in seed_text
+        or "x_cross" in seed_text
+    )
+    return has_x_seed
+
+
+def _apply_multi_intent_policy(candidates: list[dict]) -> dict:
+    """Separate object identity from independently proven opening intent.
+
+    Stair graphics can describe an object but never authorize subtraction.
+    A mixed stair/penetration candidate is cut only when its penetration,
+    void, or shaft evidence remains valid without using stair evidence.
+    """
+    prevented_stairs = []
+    restored_boundaries = []
+    rejected_x_hulls = []
+    mixed = []
+    verified = []
+    review = []
+    for candidate in candidates:
+        kind = str(candidate.get("kind_hint", "")).upper()
+        nearby = " ".join(candidate.get("nearby_text", []))
+        roles = set(candidate.get("object_roles", []))
+        if kind.startswith("STAIR") or _STAIR_RE.search(
+                str(candidate.get("label", "")) + " " + nearby):
+            roles.add("STAIR")
+
+        intent = OpeningIntent.NONE.value
+        opening_evidence = list(candidate.get("opening_evidence_ids", []))
+        if kind == "SLAB_PENETRATION":
+            intent = OpeningIntent.SLAB_PENETRATION.value
+            opening_evidence.extend([
+                "closed_x_cross_vector_signature",
+                "legend_slab_penetration_family",
+                "slab_containment_guard",
+            ])
+        elif kind in {"SHAFT", "LIFT", "CORE"}:
+            intent = OpeningIntent.LIFT_SHAFT.value
+            opening_evidence.extend([
+                "wall_bounded_shaft_or_core_context",
+                "closed_vector_geometry",
+            ])
+        elif kind == "VOID":
+            intent = OpeningIntent.VOID.value
+            opening_evidence.append("explicit_void_candidate")
+
+        if _is_verified_stairwell_penetration(candidate):
+            intent = OpeningIntent.SLAB_PENETRATION.value
+            opening_evidence.extend([
+                "closed_stairwell_penetration_boundary",
+                "contained_x_cross_seed",
+                "verified_boundary_snap",
+                "slab_containment_guard",
+            ])
+            candidate["mixed_intent_reason"] = (
+                "stair graphics are context only; closed boundary plus X seed "
+                "and verified slab-edge snap prove slab penetration intent")
+            restored_boundaries.append(candidate["id"])
+
+        # Explicit local text can independently prove intent even where a
+        # stair object is present. Stair labels/fill/treads are never counted.
+        if re.search(r"\bSLAB\s+PENETRATION\b|\bSLAB\s+OPENING\b", nearby, re.I):
+            intent = OpeningIntent.SLAB_PENETRATION.value
+            opening_evidence.append("local_explicit_penetration_text")
+        elif re.search(r"\bVOID\b|\bNO\s+SLAB\b", nearby, re.I):
+            intent = OpeningIntent.VOID.value
+            opening_evidence.append("local_explicit_void_text")
+        elif re.search(r"\bLIFT\b|\bSHAFT\b", nearby, re.I):
+            intent = OpeningIntent.LIFT_SHAFT.value
+            opening_evidence.append("local_explicit_lift_shaft_text")
+
+        verified_geometry = (
+            candidate.get("verification_status") == "verified"
+            and candidate.get("default_action") == "opening"
+            and bool(candidate.get("destructive_allowed", False)))
+        cut_eligible = (intent in {
+            OpeningIntent.SLAB_PENETRATION.value,
+            OpeningIntent.VOID.value,
+            OpeningIntent.LIFT_SHAFT.value,
+        } and verified_geometry and bool(opening_evidence))
+
+        if "STAIR" in roles and intent == OpeningIntent.NONE.value:
+            prevented_stairs.append(candidate["id"])
+            source = str(candidate.get("source", "")).lower()
+            if ("convex_hull" in source or "x_cross" in source
+                    or "xcross" in source or kind == "STAIR_PENETRATION"):
+                rejected_x_hulls.append(candidate["id"])
+            candidate["reject_reason"] = (
+                "stair object has no independent penetration/void/shaft intent")
+            candidate["verification_status"] = "context_only"
+            candidate["default_action"] = "review"
+            candidate["destructive_allowed"] = False
+        elif "STAIR" in roles and intent != OpeningIntent.NONE.value:
+            mixed.append(candidate["id"])
+        if cut_eligible:
+            verified.append(candidate["id"])
+        elif intent != OpeningIntent.NONE.value:
+            review.append(candidate["id"])
+
+        candidate["object_roles"] = sorted(roles)
+        candidate["opening_intent"] = intent
+        candidate["opening_evidence_ids"] = sorted(set(opening_evidence))
+        candidate["cut_eligible"] = cut_eligible
+        candidate["destructive_allowed"] = cut_eligible
+    return {
+        "verified_cut_ids": verified,
+        "prevented_stair_cut_ids": prevented_stairs,
+        "stair_context_blocked_ids": prevented_stairs,
+        "penetration_boundary_restored_ids": restored_boundaries,
+        "x_hull_rejected_ids": rejected_x_hulls,
+        "mixed_stair_penetration_ids": mixed,
+        "unresolved_mixed_ids": [cid for cid in mixed if cid not in verified],
+        "review_ids": review,
+    }
 
 
 def _stair_xcross_candidates(page, paths, content_rect, slab_union,
@@ -637,6 +841,7 @@ def _stairwell_boundary_candidates(page, paths, classes, slab_union, scale,
 
 def _verified_core_wall_opening_candidates(
     walls, raw_elements, page, content_rect, slab_union, scale, cfg,
+    paths=None,
 ):
     """Return wall-bounded shaft faces; retain the LW hull as context only."""
     lw_walls = [w for w in walls if w.label.upper().startswith("LW")]
@@ -674,6 +879,7 @@ def _verified_core_wall_opening_candidates(
     candidates = [context]
     default_ids = []
     verified_count = 0
+    accepted_polygons = []
     for element in raw_elements:
         if element.type not in {"VOID", "SHAFT", "LIFT"}:
             continue
@@ -718,13 +924,97 @@ def _verified_core_wall_opening_candidates(
         if verified:
             default_ids.append(cid)
             verified_count += 1
+            accepted_polygons.append(polygon)
+
+    # Some drawings use a single corner-to-corner diagonal inside a closed
+    # shaft face instead of a complete X.  The generic element detector
+    # intentionally requires two diagonals, so recover only faces whose
+    # geometry is already fully enclosed by the LW topology and whose one
+    # diagonal spans the face boundary.  The diagonal is evidence; the wall-
+    # bounded free face remains the geometry authority.
+    free_space = core_footprint.difference(wall_union).buffer(0)
+    diagonal_lines = []
+    for path in paths or []:
+        if path.outside_content:
+            continue
+        for start, end in path.segments:
+            dx, dy = end[0]-start[0], end[1]-start[1]
+            length = math.hypot(dx, dy)
+            if length <= 2.0:
+                continue
+            angle = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+            angle = min(angle, 180.0-angle)
+            if 15.0 <= angle <= 75.0:
+                diagonal_lines.append(LineString([start, end]))
+
+    for face in getattr(free_space, "geoms", [free_space]):
+        if face.is_empty or face.geom_type != "Polygon":
+            continue
+        face_area_m2 = face.area*to_mm*to_mm/1_000_000.0
+        if not 0.25 <= face_area_m2 <= 100.0:
+            continue
+        if any(face.intersection(existing).area / max(face.area, 1e-9) >= 0.90
+               for existing in accepted_polygons):
+            continue
+        boundary_coverage = (
+            face.boundary.intersection(
+                wall_union.buffer(boundary_tol)).length
+            / max(face.boundary.length, 1e-9))
+        if boundary_coverage < min_coverage:
+            continue
+        minx, miny, maxx, maxy = face.bounds
+        face_diagonal = math.hypot(maxx-minx, maxy-miny)
+        spanning = []
+        for line in diagonal_lines:
+            clipped = line.intersection(face)
+            if clipped.is_empty:
+                continue
+            span_ratio = clipped.length / max(face_diagonal, 1e-9)
+            coords = list(line.coords)
+            endpoint_error = max(
+                Point(coords[0]).distance(face.boundary),
+                Point(coords[-1]).distance(face.boundary))
+            if span_ratio >= 0.75 and endpoint_error <= boundary_tol:
+                spanning.append({
+                    "line_bounds": [float(value) for value in line.bounds],
+                    "span_ratio": float(span_ratio),
+                    "endpoint_error_pt": float(endpoint_error),
+                })
+        if not spanning:
+            continue
+        cid = f"core_interior_{len(candidates):02d}"
+        confidence = min(0.98, 0.82+0.12*boundary_coverage)
+        candidate = _candidate(
+            cid, "SHAFT", "CORE/SHAFT",
+            "closed_lw_interior_face+spanning_diagonal_seed", face, page,
+            confidence, "opening")
+        candidate.update({
+            "destructive_allowed": True,
+            "verification_status": "verified",
+            "wall_intersection_ratio": 0.0,
+            "core_containment_ratio": 1.0,
+            "boundary_coverage": boundary_coverage,
+            "source_element_type": "SINGLE_DIAGONAL_SHAFT_SEED",
+            "geometry_audit": {
+                "wall_intersection_ratio": 0.0,
+                "core_containment_ratio": 1.0,
+                "boundary_coverage": boundary_coverage,
+                "area_m2": face_area_m2,
+                "spanning_diagonals": spanning,
+            },
+        })
+        candidates.append(candidate)
+        default_ids.append(cid)
+        verified_count += 1
+        accepted_polygons.append(face)
 
     return candidates, default_ids, [
         f"CORE: envelope retained as context only; {verified_count} "
         "wall-bounded interior shaft face(s) verified"]
 
 
-def _raw_candidates(raw_elements, walls, page, content_rect):
+def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
+                    scale: float = 100.0, columns=None, cfg=None):
     warnings: list[str] = []
     candidates: list[dict] = []
     default_ids: list[str] = []
@@ -733,6 +1023,20 @@ def _raw_candidates(raw_elements, walls, page, content_rect):
     wall_polys = [w.polygon for w in walls
                   if str(w.label).upper().startswith("LW")]
     wall_union = unary_union(wall_polys) if wall_polys else None
+    structural_polys = [wall.polygon for wall in walls]
+    structural_polys.extend(column.polygon for column in (columns or []))
+    structural_union = (unary_union(structural_polys).buffer(0)
+                        if structural_polys else None)
+    page_text = page.get_text("text").upper()
+    legend_has_slab_penetration = bool(re.search(
+        r"\bSLAB\s+PENETRATION\b", page_text))
+    to_mm = PT_TO_MM * float(scale or 100)
+    min_penetration_area = float(getattr(
+        cfg, "slab_penetration_min_area_m2", 0.05))
+    max_penetration_area = float(getattr(
+        cfg, "slab_penetration_max_area_m2", 10.0))
+    max_structural_ratio = float(getattr(
+        cfg, "slab_penetration_max_structural_intersection_ratio", 0.01))
 
     for i, element in enumerate(raw_elements, 1):
         nearby = _nearby_text(page, element.polygon, radius=40.0)
@@ -743,6 +1047,22 @@ def _raw_candidates(raw_elements, walls, page, content_rect):
         near_core = any(element.polygon.distance(pt) < 140
                         for _text, _bbox, pt in core_anchors)
         near_lw = wall_union is not None and element.polygon.distance(wall_union) < 35
+        near_stair = any(re.search(r"\bSTAIR\b", text, re.I)
+                         for text in nearby)
+        local_opening_text = bool(re.search(
+            r"\bSLAB\s+PENETRATION\b|\bSLAB\s+OPENING\b|\bVOID\b|"
+            r"\bNO\s+SLAB\b|\bLIFT\b|\bSHAFT\b",
+            " ".join(nearby), re.I))
+        slab_containment = (element.polygon.intersection(slab_union).area
+                            / max(element.polygon.area, 1e-9)
+                            if slab_union is not None
+                            and not slab_union.is_empty else 0.0)
+        structural_ratio = (
+            element.polygon.intersection(structural_union).area
+            / max(element.polygon.area, 1e-9)
+            if structural_union is not None and not structural_union.is_empty
+            else 0.0)
+        area_m2 = element.polygon.area*to_mm*to_mm/1_000_000.0
         if near_equipment:
             kind, label, action, confidence = (
                 "EQUIPMENT_REBATE", "FB/FLOOR BOX", "exclude", 0.95)
@@ -755,13 +1075,37 @@ def _raw_candidates(raw_elements, walls, page, content_rect):
         elif element.type in {"LIFT", "SHAFT"} or near_core or near_lw:
             kind, label, action, confidence = (
                 "SHAFT", "CORE/SHAFT", "opening", 0.90)
+        elif (legend_has_slab_penetration
+              and (not near_stair or local_opening_text)
+              and slab_containment >= 0.98
+              and structural_ratio <= max_structural_ratio
+              and min_penetration_area <= area_m2 <= max_penetration_area):
+            kind, label, action, confidence = (
+                "SLAB_PENETRATION", "SLAB PENETRATION", "opening", 0.96)
         else:
             kind, label, action, confidence = (
                 element.type, element.label, "review", 0.55)
         cid = f"raw_{i:02d}_{kind.lower()}"
-        candidates.append(_candidate(
+        candidate = _candidate(
             cid, kind, label, "x_cross_vector", element.polygon,
-            page, confidence, action))
+            page, confidence, action)
+        candidate["geometry_audit"] = {
+            "legend_has_slab_penetration": legend_has_slab_penetration,
+            "slab_containment_ratio": slab_containment,
+            "structural_intersection_ratio": structural_ratio,
+            "area_m2": area_m2,
+            "near_stair": near_stair,
+            "local_opening_text": local_opening_text,
+            "steel_label_count": steel_label_count,
+            "near_equipment": near_equipment,
+        }
+        if near_stair:
+            candidate["object_roles"] = sorted(set(
+                candidate.get("object_roles", [])) | {"STAIR"})
+            candidate["object_evidence_ids"] = sorted(set(
+                candidate.get("object_evidence_ids", [])) |
+                {"nearby_stair_context"})
+        candidates.append(candidate)
         if action == "opening":
             default_ids.append(cid)
     return candidates, default_ids, warnings
@@ -797,7 +1141,8 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
     protected_solids = (unary_union(protected_polys).buffer(0)
                         if protected_polys else None)
     stair_candidates, stair_defaults, stair_warnings = _stair_candidates(
-        page, paths, classes, content_rect, slab_union, scale)
+        page, paths, classes, content_rect, slab_union, scale,
+        protected_solids=protected_solids, cfg=cfg)
     xcross_candidates, xcross_defaults, xcross_warnings = (
         _stair_xcross_candidates(
             page, paths, content_rect, slab_union, scale))
@@ -831,14 +1176,18 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
                 candidate["default_action"] = "review"
                 candidate["source"] += "+rejected_as_final_hull"
     raw_candidates, raw_defaults, raw_warnings = _raw_candidates(
-        raw_elements, walls, page, content_rect)
+        raw_elements, walls, page, content_rect, slab_union, scale,
+        columns=columns, cfg=cfg)
     core_candidates, core_defaults, core_warnings = (
         _verified_core_wall_opening_candidates(
-            walls, raw_elements, page, content_rect, slab_union, scale, cfg))
+            walls, raw_elements, page, content_rect, slab_union, scale, cfg,
+            paths=paths))
     candidates = (stair_candidates + xcross_candidates
                   + boundary_candidates + raw_candidates + core_candidates)
-    default_ids = (stair_defaults + xcross_defaults
-                   + boundary_defaults + raw_defaults + core_defaults)
+    policy = _apply_multi_intent_policy(candidates)
+    # The old per-detector defaults are audit evidence only. The policy is
+    # the single authority for destructive defaults.
+    default_ids = list(policy["verified_cut_ids"])
 
     judgement = {
         "status": "deterministic",
@@ -868,9 +1217,9 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
     by_id = {c["id"]: c for c in candidates}
     judged_ids = [
         candidate_id for candidate_id in judgement.get("opening_ids", [])
-        if by_id.get(candidate_id, {}).get("destructive_allowed", False)]
+        if by_id.get(candidate_id, {}).get("cut_eligible", False)]
     for boundary in boundary_candidates:
-        if boundary.get("default_action") != "opening":
+        if not boundary.get("cut_eligible", False):
             continue
         blocked = set(boundary.get("contained_seed_ids", []))
         blocked.add(boundary.get("rejected_hull_id"))
@@ -879,10 +1228,13 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
         if boundary["id"] not in judged_ids:
             judged_ids.append(boundary["id"])
     for core in core_candidates:
-        if (core.get("default_action") == "opening"
-                and core.get("destructive_allowed", False)
+        if (core.get("cut_eligible", False)
                 and core["id"] not in judged_ids):
             judged_ids.append(core["id"])
+    for raw in raw_candidates:
+        if (raw.get("cut_eligible", False)
+                and raw["id"] not in judged_ids):
+            judged_ids.append(raw["id"])
     judgement["opening_ids"] = judged_ids
 
     selected = []
@@ -891,20 +1243,44 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
     unresolved_ids = []
     for cid in judgement.get("opening_ids", []):
         candidate = by_id.get(cid)
-        if (not candidate or candidate.get("default_action") != "opening"
-                or not candidate.get("destructive_allowed", False)
+        if (not candidate or not candidate.get("cut_eligible", False)
                 or float(candidate.get("confidence", 0.0)) < min_confidence):
             unresolved_ids.append(cid)
             continue
         polygon = candidate["polygon"]
         if slab_union is not None and not polygon.intersects(slab_union):
             continue
-        etype = "STAIR" if candidate["kind_hint"].startswith("STAIR") \
-            else "SHAFT" if candidate["kind_hint"] == "SHAFT" else "VOID"
+        intent = candidate.get("opening_intent", OpeningIntent.NONE.value)
+        if intent == OpeningIntent.LIFT_SHAFT.value:
+            etype = "SHAFT"
+        elif intent == OpeningIntent.SLAB_PENETRATION.value:
+            etype = "SLAB_PENETRATION"
+        else:
+            etype = "VOID"
         selected.append(ElementFootprint(
             type=etype, polygon=polygon, label=candidate["label"],
-            anchor_bbox=tuple(candidate["bbox"]), area_pt2=polygon.area))
+            anchor_bbox=tuple(candidate["bbox"]), area_pt2=polygon.area,
+            opening_intent=intent,
+            object_roles=list(candidate.get("object_roles", [])),
+            evidence_ids=list(candidate.get("opening_evidence_ids", [])),
+            candidate_id=cid))
     resolved = _dedupe_elements(selected)
+
+    context_objects = []
+    for candidate in candidates:
+        if "STAIR" not in candidate.get("object_roles", []):
+            continue
+        context_objects.append(ElementFootprint(
+            type="STAIR", polygon=candidate["polygon"],
+            label=candidate.get("label", "STAIR"),
+            anchor_bbox=tuple(candidate["bbox"]),
+            area_pt2=candidate["polygon"].area,
+            opening_intent=candidate.get(
+                "opening_intent", OpeningIntent.NONE.value),
+            object_roles=list(candidate.get("object_roles", [])),
+            evidence_ids=list(candidate.get("object_evidence_ids", [])),
+            candidate_id=candidate["id"]))
+    context_objects = _dedupe_elements(context_objects)
 
     # A precursor is not an unresolved destructive decision once a verified
     # replacement covers it. This keeps the audit honest without making the
@@ -916,6 +1292,8 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
     high_impact_review_ids = []
     for candidate in candidates:
         if candidate.get("destructive_allowed", False):
+            continue
+        if candidate.get("verification_status") == "context_only":
             continue
         if candidate.get("kind_hint") in {
                 "CORE_CONTEXT", "EQUIPMENT_REBATE", "STEELWORK_SYMBOL"}:
@@ -931,8 +1309,15 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
         if (candidate.get("default_action") == "review"
                 and candidate.get("kind_hint") in {
                     "STAIRWELL", "STAIR_PENETRATION", "SHAFT", "VOID",
-                    "LIFT", "CORE"}):
+                    "LIFT", "CORE", "STAIR_OPENING",
+                    "STAIR_EDGE_INTERFACE"}):
             high_impact_review_ids.append(candidate["id"])
+    stair_review_ids = [
+        candidate["id"] for candidate in stair_candidates
+        if candidate.get("kind_hint") in {
+            "STAIR_OPENING", "STAIR_EDGE_INTERFACE"}
+        and candidate.get("verification_status") != "verified"
+    ]
 
     warnings = (stair_warnings + xcross_warnings + boundary_warnings
                 + raw_warnings + core_warnings)
@@ -942,7 +1327,8 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
         "raw_elements": len(raw_elements),
         "candidate_count": len(candidates),
         "resolved_openings": len(resolved),
-        "stairs": sum(e.type == "STAIR" for e in resolved),
+        "stairs": 0,
+        "stair_context_count": len(context_objects),
         "shafts": sum(e.type in {"SHAFT", "LIFT"} for e in resolved),
         "voids": sum(e.type == "VOID" for e in resolved),
         "judge_status": judgement.get("status"),
@@ -951,6 +1337,19 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
         "verified_cuts": len(resolved),
         "unresolved_candidate_ids": unresolved_ids,
         "high_impact_review_ids": high_impact_review_ids,
+        "opening_policy_version": getattr(
+            cfg, "opening_policy_version", "penetration_only_v2"),
+        "verified_cut_ids": policy["verified_cut_ids"],
+        "prevented_stair_cut_ids": policy["prevented_stair_cut_ids"],
+        "stair_context_blocked_ids": policy["stair_context_blocked_ids"],
+        "penetration_boundary_restored_ids": policy[
+            "penetration_boundary_restored_ids"],
+        "x_hull_rejected_ids": policy["x_hull_rejected_ids"],
+        "mixed_stair_penetration_ids": policy[
+            "mixed_stair_penetration_ids"],
+        "unresolved_mixed_ids": policy["unresolved_mixed_ids"],
+        "judge_exclusions_overridden": [],
+        "stair_review_ids": stair_review_ids,
         "prevented_overcuts": sum(
             not candidate.get("destructive_allowed", False)
             for candidate in candidates),
@@ -961,7 +1360,12 @@ def resolve_openings(page: fitz.Page, paths: list, classes: list | None,
     }
     return OpeningResolution(
         resolved_openings=resolved,
-        stair_footprints=[e for e in resolved if e.type == "STAIR"],
+        verified_cut_openings=resolved,
+        context_objects=context_objects,
+        review_candidates=[c for c in candidates
+                           if not c.get("cut_eligible", False)
+                           and c.get("verification_status") != "context_only"],
+        stair_footprints=context_objects,
         core_shaft_footprints=[e for e in resolved if e.type in {"SHAFT", "LIFT"}],
         resolved_penetrations=resolved_penetrations,
         candidates=candidates,

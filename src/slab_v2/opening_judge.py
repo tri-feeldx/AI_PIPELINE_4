@@ -63,16 +63,16 @@ never invent geometry or coordinates.
 IMAGE 1 labels every opening candidate by ID.
 IMAGE 2 is the drawing legend.
 
-Decide which candidates are real slab openings. For stairs prefer the full
-stairwell/flight candidate over a small landing candidate when tread evidence
-continues beyond the landing. Prefer connected_blue_fill_union over raw
-text-face fallbacks for the same stair. STAIR_PENETRATION is a finite X-cross
-vector envelope anchored to a STAIR label; prefer it over the smaller blue
-flight when it represents the complete stairwell opening. STAIR_EDGE_INTERFACE means most of
-the flight lies outside the slab; select it only when the small overlap is
-clearly an intentional slab notch. LIFT/SHAFT/CORE voids may be openings. A floor
-box (FB) or shallow rebate is NOT a full slab opening unless the legend/title
-explicitly says penetration/opening. Do not select wall or column footprints.
+Decide which CUT-ELIGIBLE candidates are real slab openings. Object identity
+and opening intent are independent. STAIR graphics, blue fill, tread lines,
+STAIR labels and stair X graphics are context only and NEVER authorize a slab
+cut. A stair may coexist with a real penetration, but that candidate is
+eligible only when code supplies an independent opening_intent of
+SLAB_PENETRATION, VOID, or LIFT_SHAFT plus opening_evidence_ids. Never promote
+a candidate whose cut_eligible field is false. Candidates already verified as
+penetration/void/lift-shaft should remain openings unless the image shows a
+direct structural conflict. A floor box (FB), setdown, step or shallow rebate
+is not a full-depth opening. Do not select wall or column footprints.
 
 SLABS:
 {json.dumps(slab_rows, ensure_ascii=False)}
@@ -104,7 +104,8 @@ only when thickness_source_text quotes visible title/legend evidence.
     # Hard guards: equipment/rebate candidates cannot become openings merely
     # because the model selected them; explicit geometry remains review-only.
     blocked = {c["id"] for c in candidates
-               if c.get("default_action") == "exclude"}
+               if (c.get("default_action") == "exclude"
+                   or not c.get("cut_eligible", False))}
     opening_ids = [x for x in opening_ids if x not in blocked]
     exclude_ids = sorted(set(exclude_ids) | blocked)
     status = "accepted" if (
