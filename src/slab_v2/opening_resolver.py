@@ -325,13 +325,11 @@ def _apply_multi_intent_policy(candidates: list[dict]) -> dict:
         opening_evidence = list(candidate.get("opening_evidence_ids", []))
         if kind == "SLAB_PENETRATION":
             intent = OpeningIntent.SLAB_PENETRATION.value
-            opening_evidence.append("closed_x_cross_vector_signature")
-            opening_evidence.append("slab_containment_guard")
-            audit = candidate.get("geometry_audit", {}) or {}
-            if audit.get("standalone_penetration", False):
-                opening_evidence.append("standalone_xcross_geometry")
-            else:
-                opening_evidence.append("legend_slab_penetration_family")
+            opening_evidence.extend([
+                "closed_x_cross_vector_signature",
+                "legend_slab_penetration_family",
+                "slab_containment_guard",
+            ])
         elif kind in {"SHAFT", "LIFT", "CORE"}:
             intent = OpeningIntent.LIFT_SHAFT.value
             opening_evidence.extend([
@@ -1039,8 +1037,6 @@ def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
         cfg, "slab_penetration_max_area_m2", 10.0))
     max_structural_ratio = float(getattr(
         cfg, "slab_penetration_max_structural_intersection_ratio", 0.01))
-    enable_standalone = bool(getattr(
-        cfg, "enable_standalone_xcross_penetration", True))
 
     for i, element in enumerate(raw_elements, 1):
         nearby = _nearby_text(page, element.polygon, radius=40.0)
@@ -1086,21 +1082,6 @@ def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
               and min_penetration_area <= area_m2 <= max_penetration_area):
             kind, label, action, confidence = (
                 "SLAB_PENETRATION", "SLAB PENETRATION", "opening", 0.96)
-        elif (enable_standalone
-              and not legend_has_slab_penetration
-              and not near_stair
-              and slab_containment >= 0.98
-              and structural_ratio <= max_structural_ratio
-              and min_penetration_area <= area_m2 <= max_penetration_area):
-            base_conf = 0.92 if local_opening_text else 0.88
-            kind, label, action, confidence = (
-                "SLAB_PENETRATION", "SLAB PENETRATION (standalone)",
-                "opening", base_conf)
-            warnings.append(
-                f"raw X-cross classified as standalone slab penetration "
-                f"(no legend); area={area_m2:.2f}m2, "
-                f"slab_containment={slab_containment:.2f}, "
-                f"confidence={base_conf}")
         else:
             kind, label, action, confidence = (
                 element.type, element.label, "review", 0.55)
@@ -1110,8 +1091,6 @@ def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
             page, confidence, action)
         candidate["geometry_audit"] = {
             "legend_has_slab_penetration": legend_has_slab_penetration,
-            "standalone_penetration": (
-                kind == "SLAB_PENETRATION" and not legend_has_slab_penetration),
             "slab_containment_ratio": slab_containment,
             "structural_intersection_ratio": structural_ratio,
             "area_m2": area_m2,

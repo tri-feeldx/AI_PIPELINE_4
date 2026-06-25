@@ -176,78 +176,17 @@ def test_isolated_xcross_is_verified_from_slab_penetration_legend():
     doc.close()
 
 
-def test_isolated_xcross_without_legend_is_standalone_penetration():
+def test_isolated_xcross_without_legend_stays_review_and_does_not_cut():
     doc = fitz.open()
     page = doc.new_page(width=500, height=500)
-    element = _element((200, 200, 225, 215))
-    candidates, defaults, _warnings = _raw_candidates(
-        [element], [], page, page.rect, box(50, 50, 450, 450), 100,
-        columns=[], cfg=SlabV2Config(debug_images=False))
-    assert len(defaults) == 1
-    candidate = candidates[0]
-    assert candidate["kind_hint"] == "SLAB_PENETRATION"
-    assert candidate["default_action"] == "opening"
-    assert candidate["destructive_allowed"] is True
-    assert candidate["confidence"] >= 0.85
-    assert candidate["confidence"] < 0.96
-    assert candidate["geometry_audit"]["standalone_penetration"] is True
-    assert candidate["geometry_audit"]["legend_has_slab_penetration"] is False
-    doc.close()
-
-
-def test_standalone_xcross_disabled_by_config_stays_review():
-    doc = fitz.open()
-    page = doc.new_page(width=500, height=500)
-    element = _element((200, 200, 225, 215))
-    cfg = SlabV2Config(
-        debug_images=False,
-        enable_standalone_xcross_penetration=False)
-    candidates, defaults, _warnings = _raw_candidates(
-        [element], [], page, page.rect, box(50, 50, 450, 450), 100,
-        columns=[], cfg=cfg)
-    assert defaults == []
-    assert candidates[0]["default_action"] == "review"
-    assert candidates[0]["destructive_allowed"] is False
-    doc.close()
-
-
-def test_standalone_xcross_near_stair_stays_review():
-    doc = fitz.open()
-    page = doc.new_page(width=500, height=500)
-    page.insert_text((195, 195), "STAIR")
     element = _element((200, 200, 225, 215))
     candidates, defaults, _warnings = _raw_candidates(
         [element], [], page, page.rect, box(50, 50, 450, 450), 100,
         columns=[], cfg=SlabV2Config(debug_images=False))
     assert defaults == []
     assert candidates[0]["default_action"] == "review"
+    assert candidates[0]["destructive_allowed"] is False
     doc.close()
-
-
-def test_standalone_penetration_gets_correct_evidence_in_policy():
-    standalone = {
-        "id": "raw_01_slab_penetration",
-        "kind_hint": "SLAB_PENETRATION",
-        "label": "SLAB PENETRATION (standalone)",
-        "nearby_text": [],
-        "object_roles": [],
-        "object_evidence_ids": [],
-        "opening_evidence_ids": [],
-        "verification_status": "verified",
-        "default_action": "opening",
-        "destructive_allowed": True,
-        "confidence": 0.88,
-        "geometry_audit": {"standalone_penetration": True},
-        "opening_intent": "NONE",
-        "cut_eligible": False,
-        "reject_reason": "",
-    }
-    report = _apply_multi_intent_policy([standalone])
-    assert report["verified_cut_ids"] == [standalone["id"]]
-    assert standalone["opening_intent"] == "SLAB_PENETRATION"
-    assert standalone["cut_eligible"] is True
-    assert "standalone_xcross_geometry" in standalone["opening_evidence_ids"]
-    assert "legend_slab_penetration_family" not in standalone["opening_evidence_ids"]
 
 
 def test_verified_stair_geometry_is_context_without_independent_intent():

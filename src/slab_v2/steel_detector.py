@@ -22,7 +22,7 @@ from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import ColumnType, SteelMember
 
 PT_TO_MM = 25.4 / 72.0
-_STEEL_PREFIX_RE = re.compile(r"^(UC|UB|SH|SC|SHS|CHS|RHS|CH)\w*", re.I)
+_STEEL_PREFIX_RE = re.compile(r"^(SHS|CHS|RHS|UC|UB|SH|SC|CH)\w*", re.I)
 
 
 @dataclass
@@ -61,6 +61,99 @@ def _steel_types(column_types: dict[str, ColumnType] | None) -> dict[str, Column
     }
 
 
+def _listify(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _census_items(steel_census: dict | None) -> list[dict]:
+    if not steel_census:
+        return []
+    rows: list[dict] = []
+    for key in ("steel_column_symbols", "steel_beam_symbols",
+                "bracing_symbols", "expected_symbols"):
+        for item in _listify(steel_census.get(key)):
+            if isinstance(item, dict):
+                rows.append(item)
+            elif item:
+                rows.append({"symbol": str(item), "member_type": "COLUMN"})
+    seen = set()
+    out = []
+    for item in rows:
+        sym = _normalize(item.get("symbol") or item.get("mark") or item.get("id"))
+        if not sym or sym in seen or not _STEEL_PREFIX_RE.match(sym):
+            continue
+        seen.add(sym)
+        out.append({**item, "symbol": sym})
+    return out
+
+
+def _steel_types_from_census(steel_census: dict | None) -> dict[str, ColumnType]:
+    rows: dict[str, ColumnType] = {}
+    for item in _census_items(steel_census):
+        sym = item["symbol"]
+        rows[sym] = ColumnType(
+            symbol=sym,
+            width_mm=0.0,
+            depth_mm=0.0,
+            count_total=0,
+            material="STEEL",
+        )
+        if hasattr(rows[sym], "section"):
+            setattr(rows[sym], "section", item.get("section") or sym)
+    return rows
+
+
+def _alias_map_from_census(steel_census: dict | None) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for item in _census_items(steel_census):
+        sym = item["symbol"]
+        aliases = set(_aliases(sym))
+        for alias in _listify(item.get("aliases")):
+            norm = _normalize(alias)
+            if norm:
+                aliases.add(norm)
+        out.setdefault(sym, set()).update(aliases)
+    return out
+
+
+def _merge_steel_types(column_types: dict[str, ColumnType] | None,
+                       steel_census: dict | None) -> tuple[dict[str, ColumnType], dict[str, set[str]]]:
+    merged = _steel_types(column_types)
+    from_census = _steel_types_from_census(steel_census)
+    for sym, ct in from_census.items():
+        merged.setdefault(sym, ct)
+    alias_map = {sym: set(_aliases(sym)) for sym in merged}
+    for sym, aliases in _alias_map_from_census(steel_census).items():
+        alias_map.setdefault(sym, set(_aliases(sym))).update(aliases)
+    return merged, alias_map
+
+
+def _expected_source_pages(steel_census: dict | None) -> set[int]:
+    pages: set[int] = set()
+    if not steel_census:
+        return pages
+    for source in _listify(steel_census.get("source_pages")):
+        if isinstance(source, dict):
+            value = source.get("page")
+        else:
+            value = source
+        try:
+            pages.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    for item in _census_items(steel_census):
+        for value in _listify(item.get("expected_pages")):
+            try:
+                pages.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    return pages
+
+
 def _path_polygon(path) -> Polygon | None:
     if getattr(path, "fill_polygon", None) is not None:
         poly = path.fill_polygon
@@ -83,10 +176,13 @@ def _rect_like_score(poly: Polygon) -> float:
     return ratio
 
 
-def _collect_symbol_anchors(page: fitz.Page, steel_symbols: dict[str, ColumnType]) -> list[dict]:
+def _collect_symbol_anchors(page: fitz.Page, steel_symbols: dict[str, ColumnType],
+                            alias_map: dict[str, set[str]] | None = None) -> list[dict]:
     words = page.get_text("words")
     anchors: list[dict] = []
     wanted = {sym: {_normalize(sym), *_aliases(sym)} for sym in steel_symbols}
+    for sym, aliases in (alias_map or {}).items():
+        wanted.setdefault(sym, set()).update(_normalize(a) for a in aliases)
     norm_to_symbol = {}
     for sym, aliases in wanted.items():
         for alias in aliases:
@@ -123,6 +219,35 @@ def _collect_symbol_anchors(page: fitz.Page, steel_symbols: dict[str, ColumnType
             })
             break
     return anchors
+
+
+def _write_audit(result: SteelDetectionResult, audit_out_dir: Path,
+                 page: fitz.Page, anchors: list[dict], geoms: list[dict],
+                 cfg: SlabV2Config) -> None:
+    audit_out_dir.mkdir(parents=True, exist_ok=True)
+    page_tag = f"p{page.number + 1:02d}"
+    (audit_out_dir / f"steel_candidates_{page_tag}.json").write_text(
+        json.dumps(result.candidates, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    (audit_out_dir / f"steel_assignment_{page_tag}.json").write_text(
+        json.dumps(result.assignment, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    (audit_out_dir / "steel_readiness_report.json").write_text(
+        json.dumps(result.readiness, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    (audit_out_dir / "steel_reconciliation.json").write_text(
+        json.dumps({
+            "status": "page_local_only",
+            "reason": "V1 exports only page-verified steel geometry; cross-floor steel reconciliation is deferred.",
+            "page": page.number + 1,
+            "readiness": result.readiness,
+        }, indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    if getattr(cfg, "debug_images", False):
+        _render_overlay(page, audit_out_dir, anchors, geoms, result.members,
+                        f"steel_candidates_{page_tag}.png")
+        _render_overlay(page, audit_out_dir, anchors, geoms, result.members,
+                        f"steel_assignment_{page_tag}.png")
 
 
 def _candidate_polygons(paths: list, scale: float) -> list[dict]:
@@ -228,31 +353,99 @@ def detect_steel(
     cfg: SlabV2Config,
     audit_out_dir: Path,
     renderer=None,
+    steel_census: dict | None = None,
 ) -> SteelDetectionResult:
     result = SteelDetectionResult()
-    steel_types = _steel_types(column_types)
+    steel_types, alias_map = _merge_steel_types(column_types, steel_census)
+    source_pages = sorted(_expected_source_pages(steel_census))
+    page_number = page.number + 1
+    census_status = (steel_census or {}).get("status", "")
+    zero_reason = (steel_census or {}).get("zero_steel_reason", "")
+
     if not steel_types:
+        status = "steel_source_missing"
+        if source_pages:
+            status = "steel_detected_but_unverified"
+            zero_reason = zero_reason or (
+                "Steel source pages were found, but no drawable steel symbols "
+                "were extracted into the steel census.")
+        else:
+            zero_reason = zero_reason or (
+                "No steel symbols, schedules, or steel source pages were found.")
         result.readiness = {
-            "status": "not_required",
+            "status": status,
             "expected_symbols": [],
             "verified_count": 0,
             "review_count": 0,
+            "source_pages": source_pages,
+            "steel_census_status": census_status,
+            "zero_steel_reason": zero_reason,
+            "export_policy": "verified_only",
             "warnings": [],
         }
+        result.assignment = {
+            "page_number": page_number,
+            "expected_symbols": [],
+            "source_pages": source_pages,
+            "detected": {},
+            "review_count": 0,
+            "zero_steel_reason": zero_reason,
+        }
+        _write_audit(result, audit_out_dir, page, [], [], cfg)
         return result
+
     if not scale:
         result.warnings.append("steel detection skipped: no verified page scale")
         result.readiness = {
-            "status": "review",
+            "status": "steel_detected_but_unverified",
             "expected_symbols": sorted(steel_types),
             "verified_count": 0,
             "review_count": 0,
+            "source_pages": source_pages,
+            "steel_census_status": census_status,
+            "zero_steel_reason": "Steel expected, but page scale is not verified.",
+            "export_policy": "verified_only",
             "warnings": result.warnings,
         }
+        result.assignment = {
+            "page_number": page_number,
+            "expected_symbols": sorted(steel_types),
+            "source_pages": source_pages,
+            "detected": {},
+            "review_count": 0,
+        }
+        _write_audit(result, audit_out_dir, page, [], [], cfg)
         return result
 
-    anchors = _collect_symbol_anchors(page, steel_types)
+    anchors = _collect_symbol_anchors(page, steel_types, alias_map)
     geoms = _candidate_polygons(paths, scale)
+
+    if source_pages and page_number not in source_pages and not anchors:
+        result.readiness = {
+            "status": "no_steel_expected",
+            "expected_symbols": sorted(steel_types),
+            "verified_count": 0,
+            "review_count": 0,
+            "source_pages": source_pages,
+            "steel_census_status": census_status,
+            "zero_steel_reason": (
+                "Steel census does not list this page as a steel source, "
+                "and no steel anchors were found on the page."),
+            "export_policy": "verified_only",
+            "warnings": [],
+        }
+        result.assignment = {
+            "page_number": page_number,
+            "expected_symbols": sorted(steel_types),
+            "source_pages": source_pages,
+            "anchors": [],
+            "assignments": [],
+            "detected": {},
+            "review_count": 0,
+        }
+        _write_audit(result, audit_out_dir, page, anchors, geoms, cfg)
+        return result
+
     radius_pt = max(24.0, 650.0 / (PT_TO_MM * scale))
     used_geom_ids: set[str] = set()
     assignments = []
@@ -317,44 +510,40 @@ def detect_steel(
         detected_by_symbol[member.symbol] = detected_by_symbol.get(member.symbol, 0) + 1
     review_count = sum(1 for c in result.candidates if c.get("status") == "review")
     result.assignment = {
-        "page_number": page.number + 1,
+        "page_number": page_number,
         "expected_symbols": sorted(steel_types),
+        "source_pages": source_pages,
+        "steel_census_status": census_status,
         "anchors": anchors,
         "assignments": assignments,
         "detected": detected_by_symbol,
         "review_count": review_count,
     }
-    status = "verified" if result.members else ("review" if anchors else "not_found")
+    if result.members:
+        status = "verified_steel"
+    elif anchors or (source_pages and page_number in source_pages):
+        status = "steel_detected_but_unverified"
+        zero_reason = zero_reason or (
+            "Steel evidence exists on this page, but no candidate passed "
+            "symbol + geometry verification.")
+    elif source_pages:
+        status = "no_steel_expected"
+        zero_reason = zero_reason or (
+            "Steel is expected elsewhere in the document, not on this page.")
+    else:
+        status = "steel_source_missing"
+        zero_reason = zero_reason or "No steel source evidence found."
     result.readiness = {
         "status": status,
         "expected_symbols": sorted(steel_types),
         "verified_count": len(result.members),
         "review_count": review_count,
+        "source_pages": source_pages,
+        "steel_census_status": census_status,
+        "zero_steel_reason": zero_reason if not result.members else "",
         "export_policy": "verified_only",
         "warnings": result.warnings,
     }
 
-    audit_out_dir.mkdir(parents=True, exist_ok=True)
-    page_tag = f"p{page.number + 1:02d}"
-    (audit_out_dir / f"steel_candidates_{page_tag}.json").write_text(
-        json.dumps(result.candidates, indent=2, ensure_ascii=False),
-        encoding="utf-8")
-    (audit_out_dir / f"steel_assignment_{page_tag}.json").write_text(
-        json.dumps(result.assignment, indent=2, ensure_ascii=False),
-        encoding="utf-8")
-    (audit_out_dir / "steel_readiness_report.json").write_text(
-        json.dumps(result.readiness, indent=2, ensure_ascii=False),
-        encoding="utf-8")
-    (audit_out_dir / "steel_reconciliation.json").write_text(
-        json.dumps({
-            "status": "page_local_only",
-            "reason": "V1 exports only page-verified steel geometry; cross-floor steel reconciliation is deferred.",
-            "page": page.number + 1,
-        }, indent=2, ensure_ascii=False),
-        encoding="utf-8")
-    if getattr(cfg, "debug_images", False):
-        _render_overlay(page, audit_out_dir, anchors, geoms, result.members,
-                        f"steel_candidates_{page_tag}.png")
-        _render_overlay(page, audit_out_dir, anchors, geoms, result.members,
-                        f"steel_assignment_{page_tag}.png")
+    _write_audit(result, audit_out_dir, page, anchors, geoms, cfg)
     return result

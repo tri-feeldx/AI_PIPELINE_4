@@ -172,7 +172,6 @@ class SlabV2Config:
     slab_penetration_min_area_m2: float = 0.05
     slab_penetration_max_area_m2: float = 10.0
     slab_penetration_max_structural_intersection_ratio: float = 0.01
-    enable_standalone_xcross_penetration: bool = True
     stair_opening_min_slab_overlap: float = 0.85
     stair_opening_max_structural_intersection_ratio: float = 0.01
     stair_opening_min_area_m2: float = 0.25

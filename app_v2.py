@@ -26,6 +26,7 @@ from src.slab_v2.export_ruby import generate_building_ruby
 from src.slab_v2.models import ColumnFootprint
 from src.slab_v2.readiness import build_model_readiness
 from src.slab_v2.height_reconcile import reconcile_heights
+from src.slab_v2.steel_source_planner import build_steel_census
 from src.column_detector import detect_columns_on_page
 from src.building_site_placement import run_building_site_placement_audit
 
@@ -77,6 +78,8 @@ def _display_number(value, digits: int = 0):
 _DEFAULTS = {
     "pdf_path": None,
     "pdf_name": None,
+    "arch_pdf_path": None,
+    "arch_pdf_name": None,
     "doc_analysis": None,
     "storeys": None,        # {building_name: [{result, ffl_mm, page_idx}]}
     "ruby_bytes": None,     # {building_name: bytes}
@@ -85,6 +88,7 @@ _DEFAULTS = {
     "height_overrides": {},
     "model_readiness": {},
     "wall_source_registry": None,
+    "steel_census": None,
     "phase": "upload",
 }
 
@@ -124,8 +128,9 @@ def _sidebar_config() -> SlabV2Config:
 
 # ---- Phase 1: Upload ------------------------------------------------------------------------------------------------------------
 def _phase_upload():
-    st.header("1. Upload Structural PDF")
-    uploaded = st.file_uploader("Choose a PDF file", type=["pdf"])
+    st.header("1. Upload PDFs")
+    uploaded = st.file_uploader(
+        "Structural PDF (required)", type=["pdf"], key="structural_pdf_upload")
     if uploaded is None:
         return
 
@@ -138,6 +143,24 @@ def _phase_upload():
     st.success(f"**{uploaded.name}**  --  {doc.page_count} pages")
     doc.close()
 
+    arch_uploaded = st.file_uploader(
+        "Architectural PDF (optional, for level/elevation evidence)",
+        type=["pdf"], key="architectural_pdf_upload")
+    if arch_uploaded is not None:
+        arch_tmp = Path(tempfile.gettempdir()) / (
+            f"feeldx_v2_arch_{arch_uploaded.name}")
+        arch_tmp.write_bytes(arch_uploaded.read())
+        st.session_state["arch_pdf_path"] = str(arch_tmp)
+        st.session_state["arch_pdf_name"] = arch_uploaded.name
+        try:
+            arch_doc = fitz.open(str(arch_tmp))
+            st.info(
+                f"Architectural evidence PDF: **{arch_uploaded.name}**"
+                f"  --  {arch_doc.page_count} pages")
+            arch_doc.close()
+        except Exception as exc:
+            st.warning(f"Could not inspect architectural PDF: {exc}")
+
     if st.button("Analyze Document", type="primary"):
         st.session_state["phase"] = "analyzing"
         st.session_state["doc_analysis"] = None
@@ -148,6 +171,7 @@ def _phase_upload():
         st.session_state["height_overrides"] = {}
         st.session_state["model_readiness"] = {}
         st.session_state["wall_source_registry"] = None
+        st.session_state["steel_census"] = None
         st.rerun()
 
 
@@ -397,6 +421,22 @@ def _phase_extract(cfg: SlabV2Config):
     except Exception:
         pass
 
+    # ---- Steel source planning ---------------------------------------------------------------
+    if st.session_state.get("steel_census") is None:
+        with st.spinner("Planning steel sources..."):
+            st.session_state["steel_census"] = build_steel_census(
+                pdf_path, ana, cfg, _upload_dir)
+    steel_census = st.session_state.get("steel_census") or {}
+    with st.expander("Steel Source Planner", expanded=True):
+        steel_status = steel_census.get("status", "steel_source_missing")
+        st.write(f"Status: **{steel_status}**")
+        st.json({
+            "source_pages": steel_census.get("source_pages", []),
+            "expected_symbols": steel_census.get("expected_symbols", []),
+            "zero_steel_reason": steel_census.get("zero_steel_reason", ""),
+            "warnings": steel_census.get("warnings", []),
+        })
+
     # ---- Height reconciliation (multi-source) ------------------------------------------------------
     with st.spinner("Reconciling storey heights..."):
         height_result = reconcile_heights(
@@ -483,7 +523,8 @@ def _phase_extract(cfg: SlabV2Config):
                 columns_per_floor=task.get("floor_columns") or None,
                 wall_types=v2_wall_types if v2_wall_types else None,
                 walls_per_floor=task.get("floor_walls") or None,
-                wall_source_registry=wall_source_registry)
+                wall_source_registry=wall_source_registry,
+                steel_census=steel_census)
         except Exception as e:
             return {**task, "result": None, "error": str(e),
                     "v1_cols": [], "v1_cols_raw": [], "col_logs": []}

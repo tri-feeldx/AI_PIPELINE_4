@@ -86,6 +86,7 @@ def extract_slabs_v2(
     wall_types: dict | None = None,
     walls_per_floor: dict | None = None,
     wall_source_registry: dict | None = None,
+    steel_census: dict | None = None,
 ) -> SlabV2Result:
     cfg = cfg or SlabV2Config()
     if cfg.speed_mode:
@@ -385,12 +386,12 @@ def extract_slabs_v2(
     # Steel is a separate subsystem. RC detection intentionally excludes steel
     # symbols; this stage audits and exports only verified steel geometry.
     steel_t0 = time.time()
-    if column_types is not None:
+    if column_types is not None or steel_census:
         try:
             from src.slab_v2 import steel_detector
             steel_result = steel_detector.detect_steel(
                 page, paths, classes, slab_union, final_scale, column_types,
-                cfg, Path(out_dir), renderer=rend)
+                cfg, Path(out_dir), renderer=rend, steel_census=steel_census)
             result.steel_members = steel_result.members
             result.steel_candidates = steel_result.candidates
             result.steel_assignment_report = steel_result.assignment
@@ -405,9 +406,10 @@ def extract_slabs_v2(
             result.warnings.append(f"steel detection failed: {exc}")
     else:
         result.steel_readiness = {
-            "status": "not_required",
+            "status": "steel_source_missing",
             "warnings": [],
             "export_policy": "verified_only",
+            "zero_steel_reason": "Steel source planner was not run.",
         }
     result.timings["steel"] = time.time() - steel_t0
 
