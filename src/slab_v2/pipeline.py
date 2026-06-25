@@ -382,6 +382,35 @@ def extract_slabs_v2(
                    ensure_ascii=False), encoding="utf-8")
     result.timings["columns"] = time.time() - column_t0
 
+    # Steel is a separate subsystem. RC detection intentionally excludes steel
+    # symbols; this stage audits and exports only verified steel geometry.
+    steel_t0 = time.time()
+    if column_types is not None:
+        try:
+            from src.slab_v2 import steel_detector
+            steel_result = steel_detector.detect_steel(
+                page, paths, classes, slab_union, final_scale, column_types,
+                cfg, Path(out_dir), renderer=rend)
+            result.steel_members = steel_result.members
+            result.steel_candidates = steel_result.candidates
+            result.steel_assignment_report = steel_result.assignment
+            result.steel_readiness = steel_result.readiness
+            result.warnings.extend(steel_result.warnings)
+        except Exception as exc:
+            result.steel_readiness = {
+                "status": "error",
+                "warnings": [str(exc)],
+                "export_policy": "verified_only",
+            }
+            result.warnings.append(f"steel detection failed: {exc}")
+    else:
+        result.steel_readiness = {
+            "status": "not_required",
+            "warnings": [],
+            "export_policy": "verified_only",
+        }
+    result.timings["steel"] = time.time() - steel_t0
+
     # ── walls: census-aware v2 or WALL-class face fallback ────────────────
     wall_t0 = time.time()
     col_polys = [c.polygon for c in result.columns] if result.columns else None
@@ -846,6 +875,17 @@ def _write_result_json(result: SlabV2Result, out_dir: Path) -> None:
         "column_candidates": result.column_candidates,
         "column_readiness": result.column_readiness,
         "column_detection_report": result.column_detection_report,
+        "steel_members": [
+            {"id": m.id, "symbol": m.symbol,
+             "member_type": m.member_type, "section": m.section,
+             "source": m.source, "confidence": m.confidence,
+             "status": m.status, "nearby_text": m.nearby_text,
+             "evidence": m.evidence, "reject_reason": m.reject_reason,
+             "polygon_pdf_pts": poly_coords(m.polygon)}
+            for m in result.steel_members],
+        "steel_candidates": result.steel_candidates,
+        "steel_assignment_report": result.steel_assignment_report,
+        "steel_readiness": result.steel_readiness,
         "slabs": [
             {"label": s["label"],
              "area_m2": s.get("area_m2"),

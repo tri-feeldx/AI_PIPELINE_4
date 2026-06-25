@@ -336,6 +336,23 @@ class ColumnType:
 
 
 @dataclass
+class SteelMember:
+    """A verified or review steel item kept separate from RC columns."""
+    id: str
+    symbol: str
+    member_type: str = "COLUMN"            # COLUMN | BEAM | BRACING | FLOOR
+    polygon: Optional[Polygon] = None      # PDF-point footprint when available
+    line: list = field(default_factory=list)
+    section: str = ""
+    source: str = "steel_detector"
+    confidence: float = 0.0
+    status: str = "review"                # verified | inferred | review | rejected
+    nearby_text: list = field(default_factory=list)
+    evidence: list = field(default_factory=list)
+    reject_reason: str = ""
+
+
+@dataclass
 class WallType:
     """One row of the wall schedule (from the Gemini document census)."""
     symbol: str
@@ -449,6 +466,7 @@ class ModelReadinessReport:
     opening_status: str = "review"
     wall_status: str = "review"
     column_status: str = "review"
+    steel_status: str = "not_required"
     wall_junction_status: str = "review"
     shaft_render_status: str = "review"
     stair_render_status: str = "review"
@@ -513,6 +531,10 @@ class SlabV2Result:
     column_candidates: list = field(default_factory=list)
     column_detection_report: dict = field(default_factory=dict)
     column_readiness: dict = field(default_factory=dict)
+    steel_members: list = field(default_factory=list)   # list[SteelMember]
+    steel_candidates: list = field(default_factory=list)
+    steel_assignment_report: dict = field(default_factory=dict)
+    steel_readiness: dict = field(default_factory=dict)
     opening_candidates: list = field(default_factory=list)
     opening_judgement: dict = field(default_factory=dict)
     slab_candidates: list = field(default_factory=list)

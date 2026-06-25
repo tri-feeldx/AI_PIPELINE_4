@@ -57,6 +57,17 @@ def build_model_readiness(storeys: list[dict], level_datums: list,
     if column_status != "verified":
         reasons.append("Expected RC columns are missing, extra, or ambiguous.")
 
+    steel_reports = [s["result"].steel_readiness for s in storeys
+                     if getattr(s["result"], "steel_readiness", None)]
+    steel_bad = [report for report in steel_reports
+                 if report.get("status", "not_required")
+                 not in {"verified", "not_required"}]
+    steel_status = "verified" if steel_reports and not steel_bad else "not_required"
+    if steel_bad:
+        steel_status = "review"
+        reasons.append(
+            "Steel members require review or lack verified geometry.")
+
     rendered_shafts = [element for s in storeys
                        for element in s["result"].render_elements
                        if element.type in {"SHAFT", "LIFT", "CORE"}]
@@ -89,12 +100,14 @@ def build_model_readiness(storeys: list[dict], level_datums: list,
              and opening_status == "verified" and wall_status == "verified"
              and wall_junction_status == "verified"
              and column_status == "verified"
+             and steel_status in {"verified", "not_required"}
              and shaft_render_status == "verified"
              and stair_render_status == "verified")
     return ModelReadinessReport(
         slab_status=slab_status, height_status=height_status,
         opening_status=opening_status, wall_status=wall_status,
         column_status=column_status,
+        steel_status=steel_status,
         wall_junction_status=wall_junction_status,
         shaft_render_status=shaft_render_status,
         stair_render_status=stair_render_status,

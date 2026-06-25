@@ -631,7 +631,35 @@ def _phase_extract(cfg: SlabV2Config):
                              f"Verified cuts: {len(result.verified_cut_openings)} | "
                              f"Walls: {len(result.walls)} | "
                              f"Columns: {len(result.columns)} | "
+                             f"Steel: {len(getattr(result, 'steel_members', []))} | "
                              f"Scale: 1:{result.scale}")
+                    steel_readiness = getattr(result, "steel_readiness", {}) or {}
+                    if steel_readiness:
+                        st.caption(
+                            "Steel Detector: "
+                            f"{steel_readiness.get('status', 'not_required')} | "
+                            f"verified={steel_readiness.get('verified_count', 0)} | "
+                            f"review={steel_readiness.get('review_count', 0)} | "
+                            f"export={steel_readiness.get('export_policy', 'verified_only')}")
+                    steel_candidates = getattr(result, "steel_candidates", []) or []
+                    if steel_candidates:
+                        with st.expander("Steel Audit", expanded=False):
+                            st.json({
+                                "readiness": steel_readiness,
+                                "assignment": getattr(
+                                    result, "steel_assignment_report", {}) or {},
+                                "verified_members": [
+                                    {
+                                        "id": getattr(m, "id", ""),
+                                        "symbol": getattr(m, "symbol", ""),
+                                        "type": getattr(m, "member_type", ""),
+                                        "status": getattr(m, "status", ""),
+                                        "confidence": getattr(m, "confidence", 0),
+                                    }
+                                    for m in getattr(result, "steel_members", [])
+                                ],
+                                "candidate_count": len(steel_candidates),
+                            })
                     if result.opening_judgement:
                         st.caption(
                             "Opening Judge: "

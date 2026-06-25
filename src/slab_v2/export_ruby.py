@@ -91,6 +91,24 @@ def _columns_mm(result: SlabV2Result, page: fitz.Page, scale: int):
             for c in result.columns]
 
 
+def _steel_members_mm(result: SlabV2Result, page: fitz.Page, scale: int):
+    ox, oy = page.rect.x0, page.rect.y1
+    rows = []
+    for member in getattr(result, "steel_members", []):
+        if (getattr(member, "status", "") != "verified"
+                or getattr(member, "polygon", None) is None):
+            continue
+        rows.append({
+            "id": member.id,
+            "symbol": member.symbol,
+            "member_type": str(member.member_type or "COLUMN").upper(),
+            "section": member.section,
+            "status": member.status,
+            "polygon": transform_polygon(member.polygon, page, scale, ox, oy),
+        })
+    return rows
+
+
 def _walls_mm(result: SlabV2Result, page: fitz.Page, scale: int):
     ox, oy = page.rect.x0, page.rect.y1
     rows = []
@@ -464,6 +482,7 @@ def generate_building_ruby(
     for lv in levels:
         lv["elements_mm"], lv["openings_mm"], lv["render_mm"] = [], [], []
         lv["slabs_mm"], lv["columns_mm"] = [], []
+        lv["steel_members_mm"] = []
         lv["walls_mm"] = []
         lv["pages"] = []
         for st in lv["storeys"]:
@@ -477,6 +496,8 @@ def generate_building_ruby(
             lv["slabs_mm"] += _slab_polys_mm(st["result"], st["page"],
                                              scale)
             lv["columns_mm"] += _columns_mm(st["result"], st["page"], scale)
+            lv["steel_members_mm"] += _steel_members_mm(
+                st["result"], st["page"], scale)
             lv["walls_mm"] += _walls_mm(st["result"], st["page"], scale)
             lv["pages"].append(st["result"].page_index + 1)
 
@@ -535,6 +556,9 @@ def generate_building_ruby(
         "# other floor systems are retained in audit JSON but not rendered",
         "# other floor system count: %d" % sum(
             len(s["result"].other_floor_systems) for s in storeys),
+        "# steel export policy: verified_only",
+        "# steel member count: %d" % sum(
+            len(getattr(s["result"], "steel_members", [])) for s in storeys),
         "# pages: %s" % ", ".join(
             str(s["result"].page_index + 1) for s in storeys),
         "# slab faces sit at Z=FFL (top of slab) and extrude down;",
@@ -559,7 +583,10 @@ def generate_building_ruby(
         tag_floor = f"S {lv_short} FLOOR"
         tag_wall = f"S {lv_short} WALL"
         tag_col_conc = f"S {lv_short} COLUMN CONCRETE"
-        tag_col_frame = f"S {lv_short} COLUMN FRAME"
+        tag_steel_col = f"S {lv_short} STEEL COLUMN"
+        tag_steel_beam = f"S {lv_short} STEEL BEAM"
+        tag_steel_bracing = f"S {lv_short} STEEL BRACING"
+        tag_steel_floor = f"S {lv_short} STEEL FLOOR"
         # Stair detail sheets are not yet geometrically reconciled with the
         # plan footprint.  The opening is authoritative; generated steps are
         # explicitly tagged as placeholders until detail evidence is verified.
@@ -622,14 +649,12 @@ def generate_building_ruby(
                 lines += elines
                 warnings += [f"page(s) {pages_txt}: {w}" for w in warns]
 
-        # columns: split into concrete / steel, each in own category group
+        # RC columns stay separate from the steel subsystem.  Older exports
+        # guessed steel from UC prefixes here; verified steel now comes from
+        # result.steel_members only.
         if lv["columns_mm"]:
             conc_cols = [(s, m) for s, m in lv["columns_mm"]
-                         if not m.is_empty
-                         and not s.upper().startswith("UC")]
-            steel_cols = [(s, m) for s, m in lv["columns_mm"]
-                          if not m.is_empty
-                          and s.upper().startswith("UC")]
+                         if not m.is_empty]
             if conc_cols:
                 lines += [
                     "",
@@ -649,25 +674,38 @@ def generate_building_ruby(
                                            lv["ffl_mm"], height)
                 if tag_col_conc not in all_tags:
                     all_tags.append(tag_col_conc)
-            if steel_cols:
+
+        steel_columns = [
+            item for item in lv.get("steel_members_mm", [])
+            if item.get("member_type") == "COLUMN"
+            and not item.get("polygon").is_empty
+        ]
+        if steel_columns:
+            lines += [
+                "",
+                f"cat_grp = {level_var}.entities.add_group",
+                f"cat_grp.name = '{tag_steel_col}'",
+                f"cat_grp.layer = layers.add('{tag_steel_col}')",
+            ]
+            for item in steel_columns:
+                symbol = item.get("symbol") or "STEEL"
+                member_id = item.get("id") or "steel"
+                section = item.get("section") or "UNKNOWN_SECTION"
+                status = item.get("status") or "verified"
                 lines += [
                     "",
-                    f"cat_grp = {level_var}.entities.add_group",
-                    f"cat_grp.name = '{tag_col_frame}'",
-                    f"cat_grp.layer = layers.add('{tag_col_frame}')",
+                    "elem_grp = cat_grp.entities.add_group",
+                    f"elem_grp.layer = layers.add('{tag_steel_col}')",
+                    f"elem_grp.name = 'STEEL_COL_{_safe(symbol)}_{_safe(member_id)}'",
+                    "elem_grp.material = [55, 135, 210]",
+                    f"# steel section: {_safe(section)}; status: {_safe(status)}",
                 ]
-                for symbol, mm in steel_cols:
-                    lines += [
-                        "",
-                        "elem_grp = cat_grp.entities.add_group",
-                        f"elem_grp.layer = layers.add('{tag_col_frame}')",
-                        f"elem_grp.name = 'COL_{_safe(symbol)}'",
-                    ]
-                    for g in getattr(mm, "geoms", [mm]):
-                        lines += _solid_up(g, "elem_grp",
-                                           lv["ffl_mm"], height)
-                if tag_col_frame not in all_tags:
-                    all_tags.append(tag_col_frame)
+                for g in getattr(item["polygon"], "geoms", [item["polygon"]]):
+                    lines += _solid_up(g, "elem_grp",
+                                       lv["ffl_mm"], height)
+            if tag_steel_col not in all_tags:
+                all_tags.append(tag_steel_col)
+        _ = (tag_steel_beam, tag_steel_bracing, tag_steel_floor)
 
         # walls → S Lx WALL (category parent group)
         wall_items = [item for item in lv["walls_mm"]
@@ -712,6 +750,16 @@ def generate_building_ruby(
     n_elems = sum(len(lv["elements_mm"]) for lv in levels)
     n_openings = sum(len(lv["openings_mm"]) for lv in levels)
     n_cols = sum(len(lv["columns_mm"]) for lv in levels)
+    n_steel_members = sum(len(lv.get("steel_members_mm", [])) for lv in levels)
+    n_steel_cols = sum(
+        sum(1 for item in lv.get("steel_members_mm", [])
+            if item.get("member_type") == "COLUMN") for lv in levels)
+    steel_statuses = sorted({
+        str(st["result"].steel_readiness.get("status", "not_required"))
+        for st in storeys
+        if getattr(st["result"], "steel_readiness", None)
+    })
+    steel_status = ",".join(steel_statuses) or "not_required"
     n_walls = sum(len(lv["walls_mm"]) for lv in levels)
     n_shaft_solids = sum(
         sum(1 for etype, _label, _mm in lv["render_mm"]
@@ -746,7 +794,7 @@ def generate_building_ruby(
         "model.commit_operation",
         f"puts 'slab_v2: imported {len(levels)} level(s), "
         f"{n_elems} raw element(s), {n_openings} verified cut opening(s), "
-        f"{n_cols} column(s), "
+        f"{n_cols} RC column(s), {n_steel_cols} steel column(s), "
         f"{n_walls} wall(s), "
         f"{n_shaft_solids} shaft solid(s), "
         f"{n_stair_solids} stair solid(s), "
@@ -757,6 +805,8 @@ def generate_building_ruby(
         f"puts 'Opening policy: {opening_policy}; stair context: "
         f"{n_stair_context}; prevented stair cuts: {n_prevented_stairs}; "
         f"unresolved mixed candidates: {n_mixed_review}; stair solids: 0'",
+        f"puts 'Steel readiness: {steel_status}; steel export: "
+        f"verified_only; steel members: {n_steel_members}'",
         f"puts 'MODEL READINESS: {model_status.upper()}'",
     ]
 
