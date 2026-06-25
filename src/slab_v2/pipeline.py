@@ -105,6 +105,9 @@ def extract_slabs_v2(
     # ── Stage A ───────────────────────────────────────────────────────────
     content = _content_rect(page)
     content_area = content.width * content.height
+    if content_area <= 0:
+        content = page.rect
+        content_area = content.width * content.height
     paths, classes = vector_extract.extract_paths(page, cfg, content)
     result.style_classes = classes
     result.timings["stage_a"] = time.time() - t0
@@ -116,7 +119,7 @@ def extract_slabs_v2(
 
     # ── Stage B ───────────────────────────────────────────────────────────
     t1 = time.time()
-    all_ids = {c.id for c in classes if c.role != "FRAME"}
+    all_ids = {c.id for c in classes if c.role not in ("FRAME", "HATCH")}
     fg_all = planarize.build_face_graph(paths, all_ids, cfg, content_area)
     result.timings["stage_b"] = time.time() - t1
 

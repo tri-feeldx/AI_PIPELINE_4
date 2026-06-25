@@ -205,6 +205,7 @@ def extract_paths(
             seqno=d.get("seqno") or 0,
             fill_polygon=fill_poly,
             outside_content=outside,
+            has_stroke=key.stroke is not None,
         )
         paths.append(vp)
         by_key[key].append(vp.id)
@@ -243,6 +244,12 @@ def extract_paths(
         if bw * bh >= cfg.frame_area_frac * page_area and len(ids) <= 6:
             sc.role = "FRAME"
             sc.role_confidence = 0.9
+        # hatch fingerprint: fill-only, many micro-segments
+        elif (key.fill is not None and key.stroke is None
+              and n_segs > 500 and median < 1.0):
+            sc.role = "HATCH"
+            sc.role_confidence = 0.85
+            sc.prefiltered = True
         for pid in ids:
             paths[pid].style_id = cid
         classes.append(sc)

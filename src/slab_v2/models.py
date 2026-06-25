@@ -72,6 +72,7 @@ class VectorPath:
     fill_polygon: Optional[Polygon] = None  # for filled closed paths
     outside_content: bool = False           # outside the drawing content rect
     layer: str = ""
+    has_stroke: bool = True                 # False for fill-only paths (stroke=None)
 
 
 @dataclass

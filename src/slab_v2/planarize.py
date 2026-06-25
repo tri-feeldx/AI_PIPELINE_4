@@ -21,6 +21,16 @@ from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import VectorPath, Face, FaceGraph
 
 
+def _fill_boundary_segments(fill_poly, simplify_tol: float = 0.5) -> list:
+    """Extract simplified boundary segments from a fill polygon's exterior ring."""
+    if not fill_poly.is_valid or fill_poly.is_empty:
+        return []
+    simplified = fill_poly.exterior.simplify(simplify_tol, preserve_topology=True)
+    coords = list(simplified.coords)
+    return [(coords[i], coords[i + 1]) for i in range(len(coords) - 1)
+            if coords[i] != coords[i + 1]]
+
+
 def _collect_segments(paths: list[VectorPath], style_ids: set[int]) -> list:
     """Deduplicated segments of the requested classes (content area only),
     plus collinear bridges for dashed lines exported as separate dashes."""
@@ -29,7 +39,13 @@ def _collect_segments(paths: list[VectorPath], style_ids: set[int]) -> list:
     for p in paths:
         if p.style_id not in style_ids or p.outside_content:
             continue
-        for (a, b) in p.segments:
+        # Fill-only paths: use simplified fill boundary instead of micro-segments
+        if (not p.has_stroke and p.fill_polygon is not None
+                and p.fill_polygon.is_valid):
+            source_segs = _fill_boundary_segments(p.fill_polygon)
+        else:
+            source_segs = p.segments
+        for (a, b) in source_segs:
             # direction-normalized quantized key (0.001 pt) for exact dedup
             ka = (round(a[0], 3), round(a[1], 3))
             kb = (round(b[0], 3), round(b[1], 3))
@@ -100,7 +116,16 @@ def _bridge_collinear(segs: list, max_gap_pt: float = 30.0) -> list:
 def _polygonize(segments: list, snap_grid: float):
     mls = MultiLineString(segments)
     snapped = shapely.set_precision(mls, grid_size=snap_grid)
-    noded = shapely.node(snapped)
+    try:
+        noded = shapely.node(snapped)
+    except Exception:
+        # GEOS noding can fail on near-degenerate geometry from fill boundaries;
+        # retry with a coarser grid before giving up
+        snapped = shapely.set_precision(mls, grid_size=snap_grid * 10)
+        try:
+            noded = shapely.node(snapped)
+        except Exception:
+            return [], [], []
     faces, dangles, cuts, invalids = polygonize_full([noded])
     return list(faces.geoms), list(dangles.geoms), list(cuts.geoms)
 
