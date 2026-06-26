@@ -330,6 +330,12 @@ def _apply_multi_intent_policy(candidates: list[dict]) -> dict:
                 "legend_slab_penetration_family",
                 "slab_containment_guard",
             ])
+        elif kind == "SLAB_OPENING":
+            intent = OpeningIntent.SLAB_PENETRATION.value
+            opening_evidence.extend([
+                "closed_x_cross_vector_signature",
+                "slab_containment_guard",
+            ])
         elif kind in {"SHAFT", "LIFT", "CORE"}:
             intent = OpeningIntent.LIFT_SHAFT.value
             opening_evidence.extend([
@@ -1082,6 +1088,13 @@ def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
               and min_penetration_area <= area_m2 <= max_penetration_area):
             kind, label, action, confidence = (
                 "SLAB_PENETRATION", "SLAB PENETRATION", "opening", 0.96)
+        elif (not near_stair
+              and slab_containment >= 0.90
+              and structural_ratio <= 0.05
+              and min_penetration_area <= area_m2 <= max_penetration_area):
+            kind, label, action, confidence = (
+                "SLAB_OPENING", element.label or "SLAB OPENING",
+                "opening", 0.88)
         else:
             kind, label, action, confidence = (
                 element.type, element.label, "review", 0.55)
