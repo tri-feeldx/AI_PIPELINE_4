@@ -188,7 +188,7 @@ def extract_elements(
 
     _PT_TO_MM_e = 25.4 / 72.0
     _to_mm_e = _PT_TO_MM_e * (scale or 100)
-    _MIN_SIDE_MM = 300.0
+    _MIN_SIDE_MM = 200.0
     _min_side_pt = _MIN_SIDE_MM / _to_mm_e
 
     max_area = cfg.xcross_max_area_frac * content_area_pt2
@@ -251,20 +251,26 @@ def extract_elements(
     for i, (atype, atext, abbox, apt) in enumerate(anchors):
         if i in used_anchors:
             continue
-        if atype not in ("STAIR", "LIFT", "SHAFT"):
+        if atype not in ("STAIR", "LIFT", "SHAFT", "VOID"):
             continue
+        if atype == "VOID":
+            _min_side = getattr(cfg, "void_fallback_min_side_mm", 400.0)
+            _radius = getattr(cfg, "text_evidence_search_radius_pt", 120.0)
+        else:
+            _min_side = _STAIR_MIN_SIDE_MM
+            _radius = _SEARCH_RADIUS
         best_face = None
-        best_dist = _SEARCH_RADIUS + 1
+        best_dist = _radius + 1
         for f in fg_all.faces:
             dist = f.polygon.distance(apt)
-            if dist > _SEARCH_RADIUS:
+            if dist > _radius:
                 continue
             bx = f.polygon.bounds
             w_mm = (bx[2] - bx[0]) * _to_mm
             h_mm = (bx[3] - bx[1]) * _to_mm
             area_mm2 = f.area_pt2 * (_to_mm ** 2)
             short, long = min(w_mm, h_mm), max(w_mm, h_mm)
-            if short < _STAIR_MIN_SIDE_MM or long > _STAIR_MAX_SIDE_MM:
+            if short < _min_side or long > _STAIR_MAX_SIDE_MM:
                 continue
             if area_mm2 > _STAIR_MAX_AREA_MM2:
                 continue
@@ -295,7 +301,7 @@ def extract_elements(
             f"{w_mm:.0f}x{h_mm:.0f}mm")
 
     for i, (atype, atext, _bbox, apt) in enumerate(anchors):
-        if i not in used_anchors and atype in ("STAIR", "LIFT", "SHAFT"):
+        if i not in used_anchors and atype in ("STAIR", "LIFT", "SHAFT", "VOID"):
             warnings.append(
                 f"label '{atext}' ({atype}) at ({apt.x:.0f},{apt.y:.0f})pt "
                 f"has no X-cross opening or qualifying face — nothing cut")

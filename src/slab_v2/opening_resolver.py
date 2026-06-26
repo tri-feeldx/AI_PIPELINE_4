@@ -845,15 +845,39 @@ def _stairwell_boundary_candidates(page, paths, classes, slab_union, scale,
     return out, defaults, penetrations, warnings
 
 
-def _verified_core_wall_opening_candidates(
-    walls, raw_elements, page, content_rect, slab_union, scale, cfg,
-    paths=None,
+def _cluster_walls(walls, gap_pt):
+    """Cluster walls by spatial proximity (flood-fill on buffered polygons)."""
+    if not walls:
+        return []
+    n = len(walls)
+    visited = [False] * n
+    buffered = [w.polygon.buffer(gap_pt) for w in walls]
+    clusters = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        cluster = [i]
+        visited[i] = True
+        queue = [i]
+        while queue:
+            curr = queue.pop()
+            for j in range(n):
+                if visited[j]:
+                    continue
+                if buffered[curr].intersects(buffered[j]):
+                    visited[j] = True
+                    cluster.append(j)
+                    queue.append(j)
+        clusters.append([walls[idx] for idx in cluster])
+    return clusters
+
+
+def _core_wall_candidates_for_cluster(
+    cluster_walls, raw_elements, page, content_rect, slab_union, scale, cfg,
+    paths=None, id_offset=0,
 ):
-    """Return wall-bounded shaft faces; retain the LW hull as context only."""
-    lw_walls = [w for w in walls if w.label.upper().startswith("LW")]
-    if len(lw_walls) < 4:
-        return [], [], []
-    wall_union = unary_union([w.polygon for w in lw_walls]).buffer(0)
+    """Process one wall cluster through the core wall detection logic."""
+    wall_union = unary_union([w.polygon for w in cluster_walls]).buffer(0)
     core_footprint = wall_union.convex_hull
     if core_footprint.is_empty or core_footprint.geom_type != "Polygon":
         return [], [], []
@@ -864,8 +888,9 @@ def _verified_core_wall_opening_candidates(
     if slab_union is not None and not core_footprint.intersects(slab_union):
         return [], [], []
 
+    ctx_id = f"core_lw_wall_enclosed_{id_offset}"
     context = _candidate(
-        "core_lw_wall_enclosed", "CORE_CONTEXT", "CORE/LW",
+        ctx_id, "CORE_CONTEXT", "CORE/LW",
         "lw_wall_envelope_context_only", core_footprint, page, 0.99,
         "exclude")
     context.update({
@@ -906,7 +931,7 @@ def _verified_core_wall_opening_candidates(
         verified = (0.25 <= face_area_m2 <= 100.0
                     and wall_ratio <= max_wall_ratio
                     and boundary_coverage >= min_coverage)
-        cid = f"core_interior_{len(candidates):02d}"
+        cid = f"core_interior_{id_offset + len(candidates):02d}"
         candidate = _candidate(
             cid, "SHAFT", "CORE/SHAFT",
             "closed_raw_face+lw_wall_ring", polygon, page,
@@ -988,7 +1013,7 @@ def _verified_core_wall_opening_candidates(
                 })
         if not spanning:
             continue
-        cid = f"core_interior_{len(candidates):02d}"
+        cid = f"core_interior_{id_offset + len(candidates):02d}"
         confidence = min(0.98, 0.82+0.12*boundary_coverage)
         candidate = _candidate(
             cid, "SHAFT", "CORE/SHAFT",
@@ -1017,6 +1042,34 @@ def _verified_core_wall_opening_candidates(
     return candidates, default_ids, [
         f"CORE: envelope retained as context only; {verified_count} "
         "wall-bounded interior shaft face(s) verified"]
+
+
+def _verified_core_wall_opening_candidates(
+    walls, raw_elements, page, content_rect, slab_union, scale, cfg,
+    paths=None,
+):
+    """Cluster CW/LW walls by proximity, process each cluster independently."""
+    lw_walls = [w for w in walls
+                if w.label.upper().startswith(("LW", "CW"))]
+    if len(lw_walls) < 4:
+        return [], [], []
+    to_mm = PT_TO_MM * float(scale or 100)
+    gap_mm = float(getattr(cfg, "core_wall_cluster_gap_mm", 200.0))
+    gap_pt = gap_mm / to_mm
+    clusters = _cluster_walls(lw_walls, gap_pt)
+    all_candidates, all_defaults, all_warnings = [], [], []
+    id_offset = 0
+    for cluster in clusters:
+        if len(cluster) < 4:
+            continue
+        cands, defs, warns = _core_wall_candidates_for_cluster(
+            cluster, raw_elements, page, content_rect, slab_union, scale, cfg,
+            paths=paths, id_offset=id_offset)
+        all_candidates.extend(cands)
+        all_defaults.extend(defs)
+        all_warnings.extend(warns)
+        id_offset += len(cands)
+    return all_candidates, all_defaults, all_warnings
 
 
 def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,

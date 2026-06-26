@@ -279,8 +279,10 @@ def extract_slabs_v2(
 
     # ── elements: X-cross openings ────────────────────────────────────────
     from src.slab_v2 import elements as elements_mod
+    hatch_ids = {c.id for c in classes if c.role == "HATCH"}
+    elem_paths = [p for p in paths if p.style_id not in hatch_ids]
     elems, elem_warnings = elements_mod.extract_elements(
-        page, fg_all, cfg, content, content_area, paths=paths,
+        page, fg_all, cfg, content, content_area, paths=elem_paths,
         scale=text_scale)
     # keep only openings that intersect a slab
     from shapely.ops import unary_union
@@ -288,6 +290,29 @@ def extract_slabs_v2(
     result.elements = [e for e in elems
                        if e.polygon.intersects(slab_union)]
     result.warnings.extend(elem_warnings)
+    _to_mm_log = 25.4 / 72.0 * float(text_scale or 100)
+    xcross_audit = []
+    for e in elems:
+        bx = e.polygon.bounds
+        w_mm = (bx[2] - bx[0]) * _to_mm_log
+        h_mm = (bx[3] - bx[1]) * _to_mm_log
+        intersects = e.polygon.intersects(slab_union)
+        xcross_audit.append({
+            "type": e.type, "label": e.label,
+            "bounds_pt": [round(b, 1) for b in bx],
+            "size_mm": f"{w_mm:.0f}x{h_mm:.0f}",
+            "intersects_slab": intersects,
+            "kept": intersects,
+        })
+    (Path(out_dir) / f"xcross_audit_p{page.number+1:02d}.json").write_text(
+        json.dumps({"total_detected": len(elems),
+                    "kept": len(result.elements),
+                    "discarded": len(elems) - len(result.elements),
+                    "slab_area_m2": round(sum(
+                        s.get("area_m2", 0) if isinstance(s, dict)
+                        else 0 for s in slabs), 1),
+                    "elements": xcross_audit},
+                   indent=2, ensure_ascii=False), encoding="utf-8")
     if cfg.debug_images:
         rend.step09_elements(result.elements)
 

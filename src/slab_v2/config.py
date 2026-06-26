@@ -118,10 +118,10 @@ class SlabV2Config:
     """An element footprint (stair/lift/shaft) larger than this fraction of
     the content area is considered a mis-anchor and skipped with a warning."""
 
-    xcross_max_area_frac: float = 0.04
+    xcross_max_area_frac: float = 0.10
     """X-cross opening candidates (rect with corner-to-corner diagonals)
-    must be at most this fraction of the content area — shafts are small;
-    anything bigger is a drawing region, never an opening."""
+    must be at most this fraction of the content area — large shaft voids
+    can reach ~8% on dense pages."""
 
     xcross_min_area_frac: float = 0.0002
     """Merged X-cross footprints smaller than this fraction of the content
@@ -131,6 +131,18 @@ class SlabV2Config:
     element_text_radius_pt: float = 80.0
     """Max distance from a STAIR/LIFT/... label to the X-cross face it
     names (labels usually sit outside the shaft with a leader line)."""
+
+    core_wall_cluster_gap_mm: float = 200.0
+    """Max gap between CW/LW wall polygons for spatial clustering.
+    Walls within this distance are grouped into the same core zone."""
+
+    void_fallback_min_side_mm: float = 400.0
+    """Min side for face fallback when VOID/PENETRATION text found.
+    Smaller than STAIR (1200mm) because penetrations can be 400-600mm."""
+
+    text_evidence_search_radius_pt: float = 120.0
+    """Search radius for VOID text → face association. Wider than default
+    80pt because VOID labels can be further from the opening."""
 
     slab_thickness_mm: float = 200.0
     """Extrusion depth for exported slab faces (same default as v1)."""
