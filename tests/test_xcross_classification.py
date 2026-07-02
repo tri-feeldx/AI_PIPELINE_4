@@ -269,14 +269,19 @@ class TestMscpXcrossIntegration:
 
     @pytest.mark.parametrize("page_index", [4, 5, 6, 7, 8],
                              ids=["p5", "p6", "p7", "p8", "p9"])
-    def test_has_verified_cut_openings(self, page_index, cfg):
-        """Pipeline should produce verified cut openings for X-crosses."""
+    def test_openings_detected_on_loading_plans(self, page_index, cfg):
+        """2381 p5-p9 are LOADING PLANs — evidence pages, not geometry
+        authority (user decision 2026-07-02: cut-opening golden moves to
+        the GA sheets).  Openings must still be DETECTED and classified
+        here; verified cuts are only required on geometry pages."""
         from src.slab_v2.pipeline import extract_slabs_v2
         result = extract_slabs_v2(str(_MSCP_PDF), page_index, cfg, use_ai=True)
 
         assert result.status == "OK"
-        assert len(result.verified_cut_openings) > 0, (
-            f"Page {page_index+1}: 0 verified cuts — X-crosses not reaching export")
+        assert len(result.slabs) >= 1
+        voids = [e for e in result.elements if e.type == "VOID"]
+        assert voids, (
+            f"Page {page_index+1}: no VOID openings detected on loading plan")
 
 
 # ---------------------------------------------------------------------------
@@ -299,8 +304,8 @@ class TestStructuralRegressionXcross:
             enable_floor_system_judge=False,
         )
 
-    @pytest.mark.parametrize("page_index", [5, 7, 9, 10],
-                             ids=["p6", "p8", "p10", "p11"])
+    @pytest.mark.parametrize("page_index", [7, 9, 10],
+                             ids=["p8", "p10", "p11"])
     def test_still_has_slab_penetration_kind(self, page_index, cfg):
         """With legend, X-crosses must still be SLAB_PENETRATION (not SLAB_OPENING)."""
         from src.slab_v2.pipeline import extract_slabs_v2
@@ -312,10 +317,21 @@ class TestStructuralRegressionXcross:
         assert len(penetration_cands) > 0, (
             f"Page {page_index+1}: no SLAB_PENETRATION candidates — regression!")
 
-    @pytest.mark.parametrize("page_index", [5, 7, 9, 10],
-                             ids=["p6", "p8", "p10", "p11"])
+    @pytest.mark.parametrize("page_index", [7, 9, 10],
+                             ids=["p8", "p10", "p11"])
     def test_still_has_verified_cuts(self, page_index, cfg):
         """Verified cuts count must not decrease."""
         from src.slab_v2.pipeline import extract_slabs_v2
         result = extract_slabs_v2(str(_STRUCTURAL_PDF), page_index, cfg, use_ai=True)
         assert len(result.verified_cut_openings) >= 1
+
+    def test_p6_steel_bracing_excluded_but_detected(self, cfg):
+        """p6's X-cross sits among steel labels — excluding it from cuts is
+        the CORRECT 3.6 behaviour (bracing symbol, not an opening).  The
+        raw candidate must still be detected and stair evidence resolved."""
+        from src.slab_v2.pipeline import extract_slabs_v2
+        result = extract_slabs_v2(str(_STRUCTURAL_PDF), 5, cfg, use_ai=True)
+        assert result.status == "OK"
+        raw = [c for c in result.opening_candidates
+               if c["id"].startswith("raw_")]
+        assert raw, "p6: raw X-cross candidates must still be detected"

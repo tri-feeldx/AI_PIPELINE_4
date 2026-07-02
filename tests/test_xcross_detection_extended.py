@@ -268,13 +268,17 @@ class TestMscpRegression35:
 
     @pytest.mark.parametrize("page_index", [4, 5, 6, 7, 8],
                              ids=["p5", "p6", "p7", "p8", "p9"])
-    def test_still_has_cuts(self, page_index, cfg):
+    def test_still_detects_openings(self, page_index, cfg):
+        """p5-p9 are LOADING PLANs — evidence pages (user decision
+        2026-07-02: cut golden moves to GA sheets); openings must still be
+        detected and classified here."""
         from src.slab_v2.pipeline import extract_slabs_v2
         result = extract_slabs_v2(str(_MSCP_PDF), page_index, cfg,
                                   use_ai=True)
         assert result.status == "OK"
-        assert len(result.verified_cut_openings) > 0, (
-            f"2381 MSCP p{page_index+1}: regression — 0 cuts")
+        voids = [e for e in result.elements if e.type == "VOID"]
+        assert voids, (
+            f"2381 MSCP p{page_index+1}: no VOID openings detected")
 
 
 # ---------------------------------------------------------------------------
@@ -298,11 +302,21 @@ class TestStructuralRegression35:
             enable_floor_system_judge=False,
         )
 
-    @pytest.mark.parametrize("page_index", [5, 7, 9, 10],
-                             ids=["p6", "p8", "p10", "p11"])
+    @pytest.mark.parametrize("page_index", [7, 9, 10],
+                             ids=["p8", "p10", "p11"])
     def test_still_has_cuts(self, page_index, cfg):
         from src.slab_v2.pipeline import extract_slabs_v2
         result = extract_slabs_v2(str(_STRUCTURAL_PDF), page_index, cfg,
                                   use_ai=True)
         assert result.status == "OK"
         assert len(result.verified_cut_openings) >= 1
+
+    def test_p6_raw_xcross_still_detected(self, cfg):
+        """p6's X-cross is bracing among steel labels — correctly excluded
+        from cuts by the 3.6 steel guard, but detection must survive."""
+        from src.slab_v2.pipeline import extract_slabs_v2
+        result = extract_slabs_v2(str(_STRUCTURAL_PDF), 5, cfg, use_ai=True)
+        assert result.status == "OK"
+        raw = [c for c in result.opening_candidates
+               if c["id"].startswith("raw_")]
+        assert raw
