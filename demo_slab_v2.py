@@ -189,6 +189,18 @@ def cmd_build(args) -> int:
             p, _, v = part.partition("=")
             ffl_override[int(p) - 1] = float(v)
 
+    # ARCH cross-reference: real FFLs + storey heights per level
+    arch_by_page: dict[int, dict] = {}
+    if getattr(args, "arch", None):
+        from src.arch_ref.enrich import build_level_table, map_str_pages
+        table = build_level_table(args.arch)
+        for w in table.warnings:
+            print(f"ARCH WARN: {w}")
+        for m in map_str_pages(args.pdf, table):
+            arch_by_page[m["page_no"] - 1] = m
+        print(f"ARCH: {len(table.levels)} levels, "
+              f"{len(arch_by_page)} STR pages mapped")
+
     storeys, missing = [], []
     for pi in page_idx:
         print(f"\n=== page {pi + 1} ===")
@@ -198,11 +210,21 @@ def cmd_build(args) -> int:
         if result.status != "OK" or not result.slabs:
             print(f"  SKIP: status={result.status}", file=sys.stderr)
             continue
+        arch = arch_by_page.get(pi)
         ffl_m = ffl_override.get(pi)
+        if ffl_m is None and arch is not None \
+                and arch["confidence"] == "VERIFIED":
+            ffl_m = arch["ffl_mm"] / 1000.0
+            print(f"  ARCH: {arch['level_name']} FFL {ffl_m:+.3f}m "
+                  f"height {arch['height_mm'] or '?'}mm (verified)")
         if ffl_m is None:
             ffl_m = _dominant_ffl_m(doc[pi])
         st = {"result": result, "page": doc[pi],
               "ffl_mm": None if ffl_m is None else ffl_m * 1000.0}
+        if arch is not None and arch["confidence"] == "VERIFIED":
+            st["level_id"] = arch["level_name"]
+            if arch["height_mm"]:
+                st["height_mm"] = arch["height_mm"]
         (missing if ffl_m is None else storeys).append(st)
         for w in result.warnings:
             print(f"  WARN: {w}")
@@ -405,6 +427,9 @@ def main() -> int:
     p4.add_argument("--scale", type=int, default=None)
     p4.add_argument("--out", default=None, help="output .rb path")
     p4.add_argument("--no-ai", dest="legacy_no_ai", action="store_true")
+    p4.add_argument("--arch", default=None,
+                    help="matching ARCH pdf: real FFLs + storey heights "
+                         "per level (verified levels only)")
     p4.set_defaults(fn=cmd_build)
 
     p5 = sub.add_parser(

@@ -4,6 +4,7 @@
   python -X utf8 demo_arch_ref.py zones  "<arch_pdf>" <page_1based>
   python -X utf8 demo_arch_ref.py grid   "<pdf>"      <page_1based>
   python -X utf8 demo_arch_ref.py match  "<arch_pdf>" <arch_page> "<str_pdf>" <str_page> [out_dir]
+  python -X utf8 demo_arch_ref.py enrich "<str_pdf>" "<arch_pdf>"
 
 `match` prints both grids, the per-axis spacing in mm (using each sheet's
 scale) and writes arch_ref_match.json + an overlay debug image into out_dir
@@ -110,6 +111,21 @@ def cmd_match(arch_pdf: str, arch_page: int, str_pdf: str, str_page: int,
     print(f"report -> {out / 'arch_ref_match.json'}")
 
 
+def cmd_enrich(str_pdf: str, arch_pdf: str) -> None:
+    from src.arch_ref.enrich import build_level_table, map_str_pages
+    table = build_level_table(arch_pdf)
+    for w in table.warnings:
+        print(f"WARN: {w}")
+    mapping = map_str_pages(str_pdf, table)
+    print(f"{'STR p':>6} {'level':<14} {'FFL (m)':>9} {'height':>8} "
+          f"{'zones':>5} {'conf':<9} title")
+    for m in sorted(mapping, key=lambda m: m["ffl_mm"]):
+        h = f"{m['height_mm']:.0f}" if m["height_mm"] else "?"
+        print(f"{m['page_no']:>6} {m['level_name']:<14} "
+              f"{m['ffl_mm'] / 1000:>+9.3f} {h:>8} {len(m['zones']):>5} "
+              f"{m['confidence']:<9} {m['title'][:44]}")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "levels":
@@ -121,5 +137,7 @@ if __name__ == "__main__":
     elif cmd == "match":
         cmd_match(sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5]),
                   *(sys.argv[6:7] or []))
+    elif cmd == "enrich":
+        cmd_enrich(sys.argv[2], sys.argv[3])
     else:
         print(__doc__)
