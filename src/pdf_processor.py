@@ -13,7 +13,11 @@ FLOOR_PLAN_KEYWORDS = [
 ]
 
 _GEOMETRY_TITLE_RE = re.compile(
-    r"\b(GENERAL\s+ARRANGEMENT\s+PLAN|GA\s+PLAN|OUTLINE\s+PLAN|"
+    # "GENERAL ARRANGEMENT" titles are GA drawings even without the word
+    # "PLAN" (e.g. "GENERAL ARRANGEMENT LEVEL - 1", "... GROUND FLOOR");
+    # foundation/loading titles are matched earlier and take precedence.
+    r"\b(GENERAL\s+ARRANGEMENT\s+(?:PLAN|LEVEL|GROUND|FLOOR|ROOF)|"
+    r"GA\s+PLAN|OUTLINE\s+PLAN|"
     r"FLOOR\s+PLAN|SLAB\s+PLAN|FRAMING\s+PLAN|STEELWORK\s+PLAN|"
     r"STEEL\s+MARKING\s+PLAN|MARKING\s+PLAN|LEVEL\s+\d+\s+PLAN|"
     r"LEVEL\s+\d+\s+OUTLINE\s+PLAN)\b",
