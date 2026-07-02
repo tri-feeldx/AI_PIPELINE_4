@@ -159,7 +159,7 @@ class SlabV2Config:
     """An element footprint (stair/lift/shaft) larger than this fraction of
     the content area is considered a mis-anchor and skipped with a warning."""
 
-    xcross_max_area_frac: float = 0.04
+    xcross_max_area_frac: float = 0.10
     """X-cross opening candidates (rect with corner-to-corner diagonals)
     must be at most this fraction of the content area — shafts are small;
     anything bigger is a drawing region, never an opening.
