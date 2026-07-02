@@ -55,6 +55,17 @@ class TestSchedules2381P17:
             assert sched.walls[mark].thickness_mm == t, mark
 
 
+def test_rebar_mass_from_rate():
+    from src.slab_v2.schedule_parser import ColumnType
+    c = ColumnType(mark="C-A1", size_mm=(450, 1200),
+                   reinforcement_rate_kg_m3=350)
+    # 0.45 * 1.2 * 3.0 m3 * 350 kg/m3 = 567 kg
+    assert c.rebar_mass_kg(3000) == pytest.approx(567.0)
+    # split-deck short column: 1.5m storey
+    assert c.rebar_mass_kg(1500) == pytest.approx(283.5)
+    assert ColumnType(mark="X").rebar_mass_kg(3000) is None
+
+
 def test_page_without_schedules_returns_empty():
     doc = fitz.open()
     page = doc.new_page(width=1000, height=700)

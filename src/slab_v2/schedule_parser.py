@@ -30,6 +30,15 @@ class ColumnType:
     concrete_grade: int | None = None
     reinforcement_rate_kg_m3: int | None = None
 
+    def rebar_mass_kg(self, height_mm: float) -> float | None:
+        """Reinforcement mass of one column of this type at the given
+        storey height, from the schedule's rate (kg per m3 of concrete)."""
+        if self.size_mm is None or self.reinforcement_rate_kg_m3 is None:
+            return None
+        w, h = self.size_mm
+        vol_m3 = (w / 1000.0) * (h / 1000.0) * (height_mm / 1000.0)
+        return round(vol_m3 * self.reinforcement_rate_kg_m3, 1)
+
 
 @dataclass
 class WallType:
