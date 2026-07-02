@@ -191,18 +191,13 @@ def extract_slabs_v2(
     )
 
     if role_audit.get("role") in {"evidence_only", "foundation_plan"}:
-        result.status = (
-            "FOUNDATION_PLAN_PAGE"
-            if role_audit.get("role") == "foundation_plan"
-            else "EVIDENCE_ONLY_PAGE"
-        )
+        # informational only — golden pages (loading plans with X-cross
+        # openings, foundation sheets) must still extract geometry; export
+        # gating decides downstream from result.page_role_classification
         result.warnings.append(
-            "page role classified as non-slab evidence/geometry context; "
-            "slab geometry export skipped")
-        _trace("early_exit", result.status.lower(), page_role=role_audit)
-        _write_result_json(result, out_dir)
-        _write_page_trace({"exit": result.status})
-        return result
+            f"page role classified as {role_audit.get('role')}; geometry "
+            f"extracted anyway, downstream export gating applies")
+        _trace("page_role_flag", role_audit.get("role"), page_role=role_audit)
 
     viewport_rect, viewport_audit = plan_viewport.detect_plan_viewport(
         page, paths, content, role_audit)
