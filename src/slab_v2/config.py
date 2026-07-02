@@ -28,6 +28,17 @@ class SlabV2Config:
     """Dangle-endpoint snap distances tried in order when polygonize yields
     too few faces. Endpoints move ONTO existing nodes, never to midpoints."""
 
+    dash_bridge_tol_pt: float = 6.0
+    """Max gap bridged between mutually-nearest FREE endpoints within one
+    style class. Revit exports dashed boundaries as one path per dash
+    (measured gaps 2.2/4.5pt on 2381 GA pages); corner gaps are not
+    collinear, so collinear bridging alone cannot close them."""
+
+    nofill_blocking_min_width_pt: float = 1.0
+    """No-fill topology resolver: stroke classes at least this wide are
+    slab-edge candidates whose edges block region-growing from the sheet
+    border (2381 GA slab boundary class is 1.42pt; gridlines are <=0.5pt)."""
+
     min_face_area_frac: float = 0.005
     """A face counts as 'significant' if its area exceeds this fraction of
     the drawing content area (used to judge whether polygonize succeeded)."""

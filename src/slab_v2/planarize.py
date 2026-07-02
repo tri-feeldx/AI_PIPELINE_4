@@ -72,7 +72,8 @@ def _fill_boundary_segments(fill_poly, simplify_tol: float = 0.5) -> list:
             if coords[i] != coords[i + 1]]
 
 
-def _collect_segments(paths: list[VectorPath], style_ids: set[int]) -> list:
+def _collect_segments(paths: list[VectorPath], style_ids: set[int],
+                      dash_bridge_tol_pt: float = 0.0) -> list:
     """Deduplicated segments of the requested classes (content area only),
     plus collinear bridges for dashed lines exported as separate dashes."""
     seen = set()
@@ -100,9 +101,101 @@ def _collect_segments(paths: list[VectorPath], style_ids: set[int]) -> list:
 
     segments = []
     for sid, segs in by_class.items():
+        collinear = _bridge_collinear(segs)
         segments.extend(segs)
-        segments.extend(_bridge_collinear(segs))
+        segments.extend(collinear)
+        if dash_bridge_tol_pt > 0:
+            # corner/junction gaps are not collinear; close them by joining
+            # mutually-nearest free endpoints of the same class
+            segments.extend(
+                _bridge_endpoints(segs + collinear, dash_bridge_tol_pt))
     return segments
+
+
+def _bridge_endpoints(segs: list, tol_pt: float,
+                      max_dev_deg: float = 30.0) -> list:
+    """Connectors between mutually-nearest FREE endpoints within tol_pt.
+
+    A free endpoint occurs in exactly one segment (a dash end).  Pairing is
+    mutual-nearest and one-shot, and a bridge is only allowed when it
+    CONTINUES at least one of the two dashes (deviation <= max_dev_deg from
+    that dash's outward direction).  Slab edges are pairs of parallel dashed
+    lines ~1.4pt apart — without the direction rule the nearer endpoint is
+    on the neighbouring line and bridging rungs a ladder across the pair.
+    Both bridge vertices are existing PDF coordinates.
+    """
+    import math
+    from collections import Counter
+
+    def key(p):
+        return (round(p[0], 3), round(p[1], 3))
+
+    cnt = Counter()
+    existing = set()
+    outward: dict[tuple, tuple] = {}
+    for a, b in segs:
+        ka, kb = key(a), key(b)
+        cnt[ka] += 1
+        cnt[kb] += 1
+        existing.add((ka, kb) if ka <= kb else (kb, ka))
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(dx, dy)
+        if L > 1e-9:
+            outward[ka] = (-dx / L, -dy / L)   # pointing away from segment
+            outward[kb] = (dx / L, dy / L)
+    free = [p for p, c in cnt.items() if c == 1]
+    if len(free) < 2:
+        return []
+
+    min_cos = math.cos(math.radians(max_dev_deg))
+
+    def continues(p, q):
+        """Bridge p->q must roughly follow the outward direction of the
+        dash at p or at q (corner gaps align with one side only)."""
+        bx, by = q[0] - p[0], q[1] - p[1]
+        L = math.hypot(bx, by)
+        if L < 1e-9:
+            return False
+        for end, sign in ((p, 1.0), (q, -1.0)):
+            d = outward.get(end)
+            if d and (bx * d[0] + by * d[1]) * sign / L >= min_cos:
+                return True
+        return False
+
+    cell = max(tol_pt, 1e-6)
+    grid: dict[tuple, list] = {}
+    for p in free:
+        grid.setdefault((int(p[0] // cell), int(p[1] // cell)), []).append(p)
+
+    def nearest(p):
+        cx, cy = int(p[0] // cell), int(p[1] // cell)
+        best, best_d = None, tol_pt
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for q in grid.get((gx, gy), ()):
+                    if q == p:
+                        continue
+                    if ((p, q) if p <= q else (q, p)) in existing:
+                        continue      # already directly connected
+                    if not continues(p, q):
+                        continue      # would rung across a parallel pair
+                    d = math.hypot(p[0] - q[0], p[1] - q[1])
+                    if 1e-9 < d <= best_d:
+                        best, best_d = q, d
+        return best
+
+    bridges, used = [], set()
+    for p in free:
+        if p in used:
+            continue
+        q = nearest(p)
+        if q is None or q in used:
+            continue
+        if nearest(q) == p:
+            bridges.append((p, q))
+            used.add(p)
+            used.add(q)
+    return bridges
 
 
 def _bridge_collinear(segs: list, max_gap_pt: float = 30.0) -> list:
@@ -269,7 +362,9 @@ def build_face_graph(
     content_rect=None,
 ) -> FaceGraph:
     """Node + polygonize the segments of the given style classes."""
-    segments = _collect_segments(paths, style_ids)
+    segments = _collect_segments(
+        paths, style_ids,
+        dash_bridge_tol_pt=getattr(cfg, "dash_bridge_tol_pt", 0.0))
 
     if content_rect is not None:
         boundary_segs = _boundary_edges_to_inject(
