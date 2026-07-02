@@ -182,7 +182,9 @@ class TestSouthMelbourneBasic:
         result = extract_slabs_v2(
             str(_SOUTH_MELBOURNE), mid_page, cfg_golden, use_ai=False)
         assert result is not None
-        assert result.status in {"OK", "NO_FACES"}
+        # graceful fail-closed statuses count as 'did not crash' — SMPS p6
+        # is a notes/site sheet and correctly refuses a tiny slab export
+        assert result.status in {"OK", "NO_FACES", "NO_EXPORT_TINY_SLAB"}
 
     def test_structural_page_has_scale(self, cfg_golden):
         """At least one page in the first 15 should have a detectable scale."""
