@@ -76,6 +76,42 @@ def test_open_boundary_leaks_and_fails_closed():
     assert slab is None or slab.area < 0.2 * 100 * 100
 
 
+class TestAdaptiveBlockingWidth:
+    """Blocking classes are the ones clearly thicker than the page's own
+    linework — chosen from the width distribution, not a fixed constant."""
+
+    @staticmethod
+    def _cls(cid, width, length=1000.0, stroke=(0, 0, 0), role="UNKNOWN"):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.id = cid
+        c.role = role
+        c.total_length_pt = length
+        c.key = MagicMock()
+        c.key.width = width
+        c.key.stroke = stroke
+        return c
+
+    def test_thick_classes_picked_relative_to_median(self):
+        from src.slab_v2.nofill_topology import pick_blocking_ids
+        classes = ([self._cls(i, 0.24, 5000) for i in range(6)]
+                   + [self._cls(10, 1.42, 8000), self._cls(11, 2.83, 500)])
+        ids = pick_blocking_ids(classes)
+        assert ids == {10, 11}
+
+    def test_uniform_thin_page_picks_nothing(self):
+        from src.slab_v2.nofill_topology import pick_blocking_ids
+        classes = [self._cls(i, 0.5, 3000) for i in range(5)]
+        assert pick_blocking_ids(classes) == set()
+
+    def test_frame_and_fill_only_excluded(self):
+        from src.slab_v2.nofill_topology import pick_blocking_ids
+        classes = [self._cls(0, 0.3, 5000),
+                   self._cls(1, 2.0, 9000, role="FRAME"),
+                   self._cls(2, 2.0, 9000, stroke=None)]
+        assert pick_blocking_ids(classes) == set()
+
+
 def test_audit_reports_counts(fragmented_sheet):
     viewport, blocking, all_segs = fragmented_sheet
     faces = _make_faces(all_segs)

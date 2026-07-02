@@ -106,21 +106,49 @@ def slab_faces_by_topology(
     return slab, audit
 
 
+def pick_blocking_ids(classes, thick_ratio: float = 1.5,
+                      min_width_floor: float = 0.7) -> set:
+    """Slab-edge candidate classes from the page's OWN width distribution.
+
+    Median stroke width is weighted by total drawn length (the page's
+    'body' linework); blocking = stroke classes at least thick_ratio x
+    that median AND above an absolute floor. A page whose linework is all
+    one weight yields no blocking classes — fail-closed, never guessed.
+    """
+    weighted = []
+    for c in classes:
+        w = c.key.width or 0.0
+        if c.role != "FRAME" and c.key.stroke is not None and w > 0:
+            weighted.append((w, c.total_length_pt or 0.0))
+    if not weighted:
+        return set()
+    weighted.sort()
+    total = sum(l for _, l in weighted)
+    acc, median_w = 0.0, weighted[-1][0]
+    for w, l in weighted:
+        acc += l
+        if acc >= total / 2.0:
+            median_w = w
+            break
+    threshold = max(thick_ratio * median_w, min_width_floor)
+    return {
+        c.id for c in classes
+        if c.role != "FRAME" and c.key.stroke is not None
+        and (c.key.width or 0.0) >= threshold
+    }
+
+
 def resolve_no_fill_topology(paths, classes, cfg, viewport_rect, area_ref):
-    """Pipeline wrapper: pick blocking classes by stroke width, polygonize
-    the full non-frame network (dash-bridged) and run the topology resolver.
+    """Pipeline wrapper: pick blocking classes from the page's own width
+    distribution, polygonize the full non-frame network (dash-bridged)
+    and run the topology resolver.
 
     Returns (slab geometry | None, audit dict).
     """
     from src.slab_v2 import planarize
 
-    min_w = getattr(cfg, "nofill_blocking_min_width_pt", 1.0)
     nonframe = {c.id for c in classes if c.role != "FRAME"}
-    blocking_ids = {
-        c.id for c in classes
-        if c.id in nonframe and (c.key.width or 0.0) >= min_w
-        and c.key.stroke is not None
-    }
+    blocking_ids = pick_blocking_ids(classes)
     audit_extra = {
         "blocking_class_ids": sorted(blocking_ids),
         "blocking_min_width_pt": min_w,
