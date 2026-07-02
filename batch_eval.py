@@ -93,16 +93,29 @@ def main() -> int:
     ap.add_argument("--pages", default=None,
                     help="1-based range like '1-30' (default: all)")
     ap.add_argument("--out-dir", default="batch_eval_out")
+    ap.add_argument("--resume", action="store_true",
+                    help="append to pages.jsonl, skip pages already recorded")
     args = ap.parse_args()
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    done: set = set()
+    prior: list[dict] = []
+    jsonl_path = out / "pages.jsonl"
+    if args.resume and jsonl_path.exists():
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                prior.append(r)
+                done.add((r["pdf"], r["page"]))
+        print(f"resume: {len(done)} pages already recorded")
     cfg = SlabV2Config(debug_images=False, enable_opening_judge=False,
                        enable_slab_face_judge=False,
                        enable_floor_system_judge=False)
 
-    rows = []
-    jsonl = open(out / "pages.jsonl", "w", encoding="utf-8")
+    rows = list(prior)
+    jsonl = open(jsonl_path, "a" if args.resume else "w", encoding="utf-8")
     for pdf in args.pdfs:
         if not Path(pdf).exists():
             print(f"SKIP missing {pdf}")
@@ -115,6 +128,8 @@ def main() -> int:
             a, _, b = args.pages.partition("-")
             idxs = range(int(a) - 1, min(int(b or a), n))
         for pi in idxs:
+            if (Path(pdf).name, pi + 1) in done:
+                continue
             row = eval_page(pdf, pi, cfg)
             rows.append(row)
             jsonl.write(json.dumps(row, ensure_ascii=False) + "\n")
