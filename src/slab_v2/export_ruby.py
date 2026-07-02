@@ -22,7 +22,9 @@ extruded down).
 
 from __future__ import annotations
 
+import json
 import math
+from collections import Counter
 from pathlib import Path
 
 import fitz
@@ -85,17 +87,132 @@ def _slab_polys_mm(result: SlabV2Result, page: fitz.Page, scale: int):
     return out
 
 
-def _columns_mm(result: SlabV2Result, page: fitz.Page, scale: int):
+_STEEL_LIKE_PREFIXES = (
+    "BT", "CH", "CHS", "CT", "D", "EA", "LA", "PFC", "PF", "RB", "RHS",
+    "SC", "SH", "SHS", "TF", "UA", "UB", "UC",
+)
+_FOUNDATION_LIKE_PREFIXES = (
+    "F", "FDN", "FOOT", "PAD", "PC", "PILE", "PL", "P", "SF",
+)
+_LOCALLY_VERIFIED_COLUMN_SOURCES = {
+    "global_text_assignment",
+    "segmented_anchor_recovery",
+}
+
+
+def _norm_symbol(symbol: str) -> str:
+    return str(symbol or "").upper().replace("*", "").strip()
+
+
+def _poly_bounds(poly):
+    try:
+        if poly is None or poly.is_empty:
+            return None
+        return [round(float(value), 3) for value in poly.bounds]
+    except Exception:
+        return None
+
+
+def _is_rc_column_symbol(symbol: str) -> bool:
+    s = _norm_symbol(symbol)
+    if not s or s == "C?":
+        return False
+    if s.startswith(_STEEL_LIKE_PREFIXES):
+        return False
+    # Keep common concrete families such as C1, C-A3, COL1, RC1.
+    return s.startswith(("C", "COL", "RC"))
+
+
+def _is_foundation_like_symbol(symbol: str) -> bool:
+    s = _norm_symbol(symbol)
+    if not s or _is_rc_column_symbol(s):
+        return False
+    return s.startswith(_FOUNDATION_LIKE_PREFIXES)
+
+
+def _column_export_decision(column, cfg: SlabV2Config,
+                            column_system_verified: bool,
+                            debug_verified_only: bool) -> tuple[bool, str]:
+    symbol = getattr(column, "symbol", "")
+    source = str(getattr(column, "source", "") or "")
+    if getattr(column, "contract_export_decision", "") == "exported":
+        return True, "contract_selected"
+    if not debug_verified_only:
+        return True, "export_non_debug"
+    if _is_foundation_like_symbol(symbol):
+        return False, "foundation_like_symbol"
+    if not _is_rc_column_symbol(symbol):
+        return False, "non_rc_or_ambiguous_symbol"
+    w = float(getattr(column, "w_mm", 0) or 0)
+    d = float(getattr(column, "d_mm", 0) or 0)
+    max_side = float(getattr(cfg, "column_max_side_mm", 1500.0) or 1500.0)
+    if w <= 0 or d <= 0 or w > max_side or d > max_side:
+        return False, "size_not_verified"
+    if column_system_verified:
+        return True, "verified_column_system"
+    if source == "cross_floor_vector_recovery" and not getattr(
+            cfg, "debug_export_cross_floor_recovered_rc_columns", False):
+        return False, "cross_floor_recovery_hidden"
+    if source == "shape_fallback" and not getattr(
+            cfg, "debug_export_shape_fallback_rc_columns", False):
+        return False, "shape_fallback_hidden"
+    if getattr(column, "labeled", False):
+        return True, "labeled_local"
+    if source in _LOCALLY_VERIFIED_COLUMN_SOURCES:
+        return True, source
+    return False, source or "unverified_source"
+
+
+def _columns_mm(result: SlabV2Result, page: fitz.Page, scale: int,
+                cfg: SlabV2Config, debug_verified_only: bool):
     ox, oy = page.rect.x0, page.rect.y1
-    return [(c.symbol, transform_polygon(c.polygon, page, scale, ox, oy))
-            for c in result.columns]
+    rows = []
+    hidden = Counter()
+    trace = []
+    column_system_verified = (
+        (getattr(result, "column_detection_report", {}) or {}).get("status")
+        == "verified"
+        or (getattr(result, "column_readiness", {}) or {}).get("status")
+        == "verified"
+    )
+    for column in result.columns:
+        allowed, reason = _column_export_decision(
+            column, cfg, column_system_verified, debug_verified_only)
+        trace.append({
+            "symbol": str(getattr(column, "symbol", "") or ""),
+            "source": str(getattr(column, "source", "") or ""),
+            "candidate_id": str(getattr(column, "candidate_id", "") or ""),
+            "labeled": bool(getattr(column, "labeled", False)),
+            "w_mm": float(getattr(column, "w_mm", 0) or 0),
+            "d_mm": float(getattr(column, "d_mm", 0) or 0),
+            "confidence": float(getattr(column, "confidence", 0) or 0),
+            "bounds_pdf": _poly_bounds(getattr(column, "polygon", None)),
+            "decision": "exported" if allowed else "hidden",
+            "reason": reason,
+        })
+        if not allowed:
+            hidden[reason] += 1
+            continue
+        rows.append((column.symbol, transform_polygon(
+            column.polygon, page, scale, ox, oy)))
+    return rows, hidden, trace
+
+
+def _clean_rc_expected(report: dict) -> int:
+    expected = report.get("expected", {}) if isinstance(report, dict) else {}
+    return sum(int(count or 0) for symbol, count in expected.items()
+               if _is_rc_column_symbol(symbol))
 
 
 def _steel_members_mm(result: SlabV2Result, page: fitz.Page, scale: int):
     ox, oy = page.rect.x0, page.rect.y1
     rows = []
     for member in getattr(result, "steel_members", []):
-        if (getattr(member, "status", "") != "verified"
+        contract_selected = (
+            getattr(member, "contract_export_decision", "") == "exported"
+        )
+        if ((getattr(member, "status", "") != "verified"
+             and not contract_selected)
                 or getattr(member, "polygon", None) is None):
             continue
         rows.append({
@@ -103,7 +220,14 @@ def _steel_members_mm(result: SlabV2Result, page: fitz.Page, scale: int):
             "symbol": member.symbol,
             "member_type": str(member.member_type or "COLUMN").upper(),
             "section": member.section,
-            "status": member.status,
+            "status": member.status if not contract_selected else "contract_selected",
+            "position_level": getattr(member, "position_level", ""),
+            "profile_level_range": getattr(member, "profile_level_range", []),
+            "final_level": getattr(member, "final_level", ""),
+            "level_assignment_status": getattr(
+                member, "level_assignment_status", ""),
+            "level_assignment_reason": getattr(
+                member, "level_assignment_reason", ""),
             "polygon": transform_polygon(member.polygon, page, scale, ox, oy),
         })
     return rows
@@ -237,6 +361,7 @@ def _slab_lines(label: str, mm, openings, parent_var: str, tag_name: str,
         f"{var} = {parent_var}.entities.add_group",
         f"{var}.layer = layers.add('{tag_name}')",
         f"{var}.name = '{_safe(label)}'",
+        f"{var}.material = [150, 150, 150]",
     ]
     for g in getattr(mm, "geoms", [mm]):
         if not g.is_empty:
@@ -298,6 +423,24 @@ def generate_ruby(
         if resolved_mm else None
 
     policy = getattr(cfg, "opening_policy_version", "penetration_only_v2")
+    steel_readiness = getattr(result, "steel_readiness", {}) or {}
+    steel_expected_symbols = sorted({
+        str(sym)
+        for sym in steel_readiness.get("expected_symbols", []) or []
+    })
+    n_steel_members_header = len(getattr(result, "steel_members", []) or [])
+    n_steel_review_header = int(steel_readiness.get("review_count", 0) or 0)
+    n_steel_rejected_header = int(
+        steel_readiness.get("rejected_count", 0) or 0)
+    steel_zero_reason = str(
+        steel_readiness.get("zero_steel_reason", "")).strip()
+    steel_zero_reasons = [steel_zero_reason] if steel_zero_reason else []
+    steel_export_policy = str(
+        steel_readiness.get("export_policy")
+        or ("detected_debug_all_geometry"
+            if getattr(cfg, "export_all_detected_steel", False)
+            else "verified_only"))
+
     lines = [
         f"# Opening policy: {policy}",
         "# slab_v2 export — page %d, scale 1:%s" % (
@@ -308,6 +451,13 @@ def generate_ruby(
         f"{len(result.other_floor_systems)}",
         f"# floor-system status: "
         f"{result.floor_system_readiness.get('status', 'review')}",
+        f"# steel export policy: {steel_export_policy}",
+        "# UNVERIFIED STEEL DEBUG EXPORT" if steel_export_policy == "detected_debug_all_geometry" else "# steel verified-only export",
+        f"# steel expected symbols: {', '.join(steel_expected_symbols) or '-'}",
+        f"# steel verified member count: {n_steel_members_header}",
+        f"# steel review count: {n_steel_review_header}",
+        f"# steel rejected count: {n_steel_rejected_header}",
+        f"# steel zero reason: {'; '.join(steel_zero_reasons) or '-'}",
         "model = Sketchup.active_model",
         "model.start_operation('slab_v2 import', true)",
         "layers = model.layers",
@@ -436,6 +586,8 @@ def generate_building_ruby(
     cfg = cfg or SlabV2Config()
     warnings: list[str] = []
     bname = building_name or "Building"
+    out = Path(out_path)
+    trace_path = out.with_name(f"{out.stem}_export_trace.json")
 
     # group storeys: by level_id if available (prevents FFL collision),
     # else by FFL (zone/part pages of the same floor share one level)
@@ -478,13 +630,22 @@ def generate_building_ruby(
                 f"single storey — element height defaults to {h:.0f}mm")
         heights.append(h)
 
+    model_status = getattr(readiness_report, "model_status", "debug")
+    debug_verified_only = (
+        model_status != "final"
+        and bool(getattr(cfg, "debug_export_verified_only", True))
+    )
+
     # precompute mm geometry per page, merged per level
+    hidden_rc_columns = Counter()
     for lv in levels:
         lv["elements_mm"], lv["openings_mm"], lv["render_mm"] = [], [], []
         lv["slabs_mm"], lv["columns_mm"] = [], []
         lv["steel_members_mm"] = []
         lv["walls_mm"] = []
         lv["pages"] = []
+        lv["column_export_trace"] = []
+        lv["page_export_trace"] = []
         for st in lv["storeys"]:
             scale = st["result"].scale or 100
             lv["elements_mm"] += _elements_mm(st["result"], st["page"],
@@ -495,11 +656,60 @@ def generate_building_ruby(
                 st["result"], st["page"], scale, cfg)
             lv["slabs_mm"] += _slab_polys_mm(st["result"], st["page"],
                                              scale)
-            lv["columns_mm"] += _columns_mm(st["result"], st["page"], scale)
-            lv["steel_members_mm"] += _steel_members_mm(
-                st["result"], st["page"], scale)
+            column_rows, hidden_columns, column_trace = _columns_mm(
+                st["result"], st["page"], scale, cfg, debug_verified_only)
+            lv["columns_mm"] += column_rows
+            hidden_rc_columns.update(hidden_columns)
+            page_number = st["result"].page_index + 1
+            for trace_row in column_trace:
+                trace_row["page"] = page_number
+                trace_row["level_id"] = lv["level_id"]
+                trace_row["scale"] = scale
+            lv["column_export_trace"] += column_trace
+            steel_rows = _steel_members_mm(st["result"], st["page"], scale)
+            lv["steel_members_mm"] += steel_rows
             lv["walls_mm"] += _walls_mm(st["result"], st["page"], scale)
-            lv["pages"].append(st["result"].page_index + 1)
+            lv["pages"].append(page_number)
+            lv["page_export_trace"].append({
+                "page": page_number,
+                "level_id": lv["level_id"],
+                "scale": scale,
+                "slab_count": len(st["result"].slabs),
+                "verified_cut_opening_count": len(getattr(
+                    st["result"], "verified_cut_openings", []) or []),
+                "raw_element_count": len(getattr(
+                    st["result"], "elements", []) or []),
+                "render_element_count": len(getattr(
+                    st["result"], "render_elements", []) or []),
+                "rc_column_raw_count": len(getattr(
+                    st["result"], "columns", []) or []),
+                "rc_column_exported_count": len(column_rows),
+                "rc_column_hidden_reasons": dict(hidden_columns),
+                "steel_member_raw_count": len(getattr(
+                    st["result"], "steel_members", []) or []),
+                "steel_member_exported_count": len(steel_rows),
+                "wall_count": len(getattr(st["result"], "walls", []) or []),
+                "column_detection_status": (
+                    getattr(st["result"], "column_detection_report", {})
+                    or {}).get("status", ""),
+                "column_readiness_status": (
+                    getattr(st["result"], "column_readiness", {})
+                    or {}).get("status", ""),
+                "steel_readiness": getattr(
+                    st["result"], "steel_readiness", {}) or {},
+                "opening_report": getattr(
+                    st["result"], "opening_report", {}) or {},
+                "floor_system_readiness": getattr(
+                    st["result"], "floor_system_readiness", {}) or {},
+                "wall_readiness": getattr(
+                    st["result"], "wall_readiness", {}) or {},
+                "contract_status": (
+                    getattr(st["result"], "contract_reconciliation", {}) or {}
+                ).get("contract_status", ""),
+                "contract_critical_unfulfilled": int((
+                    getattr(st["result"], "contract_reconciliation", {}) or {}
+                ).get("critical_unfulfilled_count", 0) or 0),
+            })
 
     from shapely.affinity import translate as _translate
     def _centered(p: Polygon) -> Polygon:
@@ -522,10 +732,113 @@ def generate_building_ruby(
             deduped.append(item)
         lv["walls_mm"] = deduped
 
-    model_status = getattr(readiness_report, "model_status", "debug")
     readiness_reasons = getattr(readiness_report, "reasons", [])
     opening_policy = getattr(
         cfg, "opening_policy_version", "penetration_only_v2")
+    steel_readiness_rows = [
+        getattr(st["result"], "steel_readiness", {}) or {}
+        for st in storeys
+        if getattr(st["result"], "steel_readiness", None) is not None
+    ]
+    steel_expected_symbols = sorted({
+        str(sym)
+        for row in steel_readiness_rows
+        for sym in row.get("expected_symbols", []) or []
+    })
+    n_steel_members_header = sum(
+        len(lv.get("steel_members_mm", [])) for lv in levels)
+    n_steel_review_header = sum(
+        int(row.get("review_count", 0) or 0) for row in steel_readiness_rows)
+    n_steel_rejected_header = sum(
+        int(row.get("rejected_count", 0) or 0) for row in steel_readiness_rows)
+    steel_zero_reasons = sorted({
+        str(row.get("zero_steel_reason", "")).strip()
+        for row in steel_readiness_rows
+        if str(row.get("zero_steel_reason", "")).strip()
+    })
+    steel_zero_or_low_reasons = sorted({
+        str(row.get("zero_or_low_steel_reason", "")).strip()
+        for row in steel_readiness_rows
+        if str(row.get("zero_or_low_steel_reason", "")).strip()
+    })
+    if not steel_zero_or_low_reasons and steel_zero_reasons:
+        steel_zero_or_low_reasons = list(steel_zero_reasons)
+    steel_export_all_detected = any(
+        bool(row.get("export_all_detected_steel"))
+        or str(row.get("export_policy", "")).strip() == "detected_debug_all_geometry"
+        for row in steel_readiness_rows
+    )
+    steel_export_policy = (
+        "detected_debug_all_geometry"
+        if steel_export_all_detected else "verified_only")
+    steel_counts_by_level: dict[str, int] = {}
+    for row in steel_readiness_rows:
+        for level, count in (row.get("counts_by_level", {}) or {}).items():
+            steel_counts_by_level[str(level)] = (
+                steel_counts_by_level.get(str(level), 0) + int(count or 0))
+    hidden_rc_total = sum(hidden_rc_columns.values())
+    hidden_rc_summary = "; ".join(
+        f"{reason}={count}" for reason, count in hidden_rc_columns.most_common())
+    height_statuses = sorted({
+        str(lv.get("height_status") or "")
+        for lv in levels
+        if str(lv.get("height_status") or "").strip()
+    })
+    unverified_heights = any(
+        status in {"default_unsafe", "debug_ffl_gap", "debug_reused_below"}
+        for status in height_statuses)
+    contract_reports = []
+    seen_contract_reports = set()
+    for st in storeys:
+        report = getattr(st["result"], "contract_reconciliation", {}) or {}
+        if not report:
+            continue
+        marker = id(report)
+        if marker in seen_contract_reports:
+            continue
+        seen_contract_reports.add(marker)
+        contract_reports.append(report)
+    contract_statuses = sorted({
+        str(report.get("contract_status") or "unknown")
+        for report in contract_reports
+    })
+    contract_status = ",".join(contract_statuses) or "not_available"
+    contract_critical = sum(
+        int(report.get("critical_unfulfilled_count", 0) or 0)
+        for report in contract_reports)
+    contract_reasons: list[str] = []
+    contract_by_subsystem: dict[str, dict] = {}
+    for report in contract_reports:
+        contract_reasons.extend([
+            str(reason) for reason in (report.get("reasons", []) or [])
+            if str(reason).strip()
+        ])
+        for subsystem, row in (report.get("by_subsystem", {}) or {}).items():
+            dst = contract_by_subsystem.setdefault(str(subsystem), {
+                "expected": 0,
+                "detected": 0,
+                "exported": 0,
+                "missing": 0,
+                "extra": 0,
+                "blocked": 0,
+                "status": "unknown",
+            })
+            for key in ("expected", "detected", "exported", "missing",
+                        "extra", "blocked"):
+                dst[key] += int(row.get(key, 0) or 0)
+            row_status = str(row.get("status") or "unknown")
+            if row_status in {"missing", "partial", "blocked", "extra",
+                              "conflict"}:
+                dst["status"] = row_status
+            elif dst["status"] == "unknown":
+                dst["status"] = row_status
+    contract_summary = "; ".join(
+        f"{name}: exp {row['expected']}, det {row['detected']}, "
+        f"export {row['exported']}, miss {row['missing']}, "
+        f"block {row['blocked']}, extra {row['extra']}"
+        for name, row in sorted(contract_by_subsystem.items())
+    ) or "none"
+    contract_reason_text = "; ".join(contract_reasons[:12]) or "none"
 
     # vertical shaft pairing: same type, footprint IoU on consecutive levels
     pairs = 0
@@ -549,16 +862,42 @@ def generate_building_ruby(
     lines = [
         "# slab_v2 building export — %s, %d level(s)" % (bname, len(levels)),
         "# Opening policy: %s" % opening_policy,
+        "# export trace: %s" % trace_path,
         ("# FINAL VERIFIED MODEL" if model_status == "final"
          else "# UNVERIFIED MODEL - DEBUG USE ONLY"),
         "# readiness: %s" % model_status,
         "# readiness reasons: %s" % ("; ".join(readiness_reasons) or "none"),
+        "# drawing contract status: %s" % contract_status,
+        "# drawing contract critical unfulfilled: %d" % contract_critical,
+        "# drawing contract subsystem summary: %s" % contract_summary,
+        "# drawing contract reasons: %s" % contract_reason_text,
+        "# exported_verified_only: %s" % (
+            "true" if debug_verified_only else "false"),
+        "# hidden_review_rc_columns: %d" % hidden_rc_total,
+        "# hidden_review_rc_column_reasons: %s" % (
+            hidden_rc_summary or "none"),
+        "# height readiness: %s" % (
+            "UNVERIFIED HEIGHTS" if unverified_heights else "verified/inferred"),
+        "# height statuses: %s" % (
+            ", ".join(height_statuses) or "none"),
         "# other floor systems are retained in audit JSON but not rendered",
         "# other floor system count: %d" % sum(
             len(s["result"].other_floor_systems) for s in storeys),
-        "# steel export policy: verified_only",
-        "# steel member count: %d" % sum(
-            len(getattr(s["result"], "steel_members", [])) for s in storeys),
+        "# steel export policy: %s" % steel_export_policy,
+        ("# UNVERIFIED STEEL DEBUG EXPORT - all detected non-dashed steel geometry is rendered"
+         if steel_export_all_detected else "# steel verified-only export"),
+        "# steel expected symbols: %s" % (
+            ", ".join(steel_expected_symbols) or "none"),
+        "# steel verified member count: %d" % n_steel_members_header,
+        "# steel review count: %d" % n_steel_review_header,
+        "# steel rejected count: %d" % n_steel_rejected_header,
+        "# steel counts by final level: %s" % (
+            "; ".join(f"{k}={v}" for k, v in sorted(steel_counts_by_level.items()))
+            or "none"),
+        "# steel zero reason: %s" % (
+            "; ".join(steel_zero_reasons) or "none"),
+        "# steel zero/low diagnosis: %s" % (
+            "; ".join(steel_zero_or_low_reasons) or "none"),
         "# pages: %s" % ", ".join(
             str(s["result"].page_index + 1) for s in storeys),
         "# slab faces sit at Z=FFL (top of slab) and extrude down;",
@@ -675,19 +1014,45 @@ def generate_building_ruby(
                 if tag_col_conc not in all_tags:
                     all_tags.append(tag_col_conc)
 
-        steel_columns = [
-            item for item in lv.get("steel_members_mm", [])
-            if item.get("member_type") == "COLUMN"
-            and not item.get("polygon").is_empty
-        ]
-        if steel_columns:
+        steel_tag_map = {
+            "COLUMN": (tag_steel_col, "STEEL_COL", lv["ffl_mm"], height),
+            "BEAM": (
+                tag_steel_beam,
+                "STEEL_BEAM",
+                lv["ffl_mm"] + max(cfg.slab_thickness_mm, height - 450.0),
+                300.0,
+            ),
+            "BRACING": (
+                tag_steel_bracing,
+                "STEEL_BRACING",
+                lv["ffl_mm"] + max(cfg.slab_thickness_mm, height - 450.0),
+                250.0,
+            ),
+            "FLOOR": (
+                tag_steel_floor,
+                "STEEL_FLOOR",
+                lv["ffl_mm"],
+                min(150.0, max(75.0, cfg.slab_thickness_mm * 0.6)),
+            ),
+        }
+        steel_by_type: dict[str, list] = {}
+        for item in lv.get("steel_members_mm", []):
+            polygon = item.get("polygon")
+            if polygon is None or polygon.is_empty:
+                continue
+            member_type = str(item.get("member_type") or "COLUMN").upper()
+            if member_type not in steel_tag_map:
+                member_type = "COLUMN"
+            steel_by_type.setdefault(member_type, []).append(item)
+        for member_type, steel_items in steel_by_type.items():
+            tag_name, name_prefix, z_base, z_height = steel_tag_map[member_type]
             lines += [
                 "",
                 f"cat_grp = {level_var}.entities.add_group",
-                f"cat_grp.name = '{tag_steel_col}'",
-                f"cat_grp.layer = layers.add('{tag_steel_col}')",
+                f"cat_grp.name = '{tag_name}'",
+                f"cat_grp.layer = layers.add('{tag_name}')",
             ]
-            for item in steel_columns:
+            for item in steel_items:
                 symbol = item.get("symbol") or "STEEL"
                 member_id = item.get("id") or "steel"
                 section = item.get("section") or "UNKNOWN_SECTION"
@@ -695,17 +1060,21 @@ def generate_building_ruby(
                 lines += [
                     "",
                     "elem_grp = cat_grp.entities.add_group",
-                    f"elem_grp.layer = layers.add('{tag_steel_col}')",
-                    f"elem_grp.name = 'STEEL_COL_{_safe(symbol)}_{_safe(member_id)}'",
+                    f"elem_grp.layer = layers.add('{tag_name}')",
+                    f"elem_grp.name = '{name_prefix}_{_safe(symbol)}_{_safe(member_id)}'",
                     "elem_grp.material = [55, 135, 210]",
-                    f"# steel section: {_safe(section)}; status: {_safe(status)}",
+                    "# steel type: %s; section: %s; status: %s; final_level: %s"
+                    % (
+                        member_type,
+                        _safe(section),
+                        _safe(status),
+                        _safe(item.get("final_level") or ""),
+                    ),
                 ]
                 for g in getattr(item["polygon"], "geoms", [item["polygon"]]):
-                    lines += _solid_up(g, "elem_grp",
-                                       lv["ffl_mm"], height)
-            if tag_steel_col not in all_tags:
-                all_tags.append(tag_steel_col)
-        _ = (tag_steel_beam, tag_steel_bracing, tag_steel_floor)
+                    lines += _solid_up(g, "elem_grp", z_base, z_height)
+            if tag_name not in all_tags:
+                all_tags.append(tag_name)
 
         # walls → S Lx WALL (category parent group)
         wall_items = [item for item in lv["walls_mm"]
@@ -754,6 +1123,15 @@ def generate_building_ruby(
     n_steel_cols = sum(
         sum(1 for item in lv.get("steel_members_mm", [])
             if item.get("member_type") == "COLUMN") for lv in levels)
+    n_steel_beams = sum(
+        sum(1 for item in lv.get("steel_members_mm", [])
+            if item.get("member_type") == "BEAM") for lv in levels)
+    n_steel_bracing = sum(
+        sum(1 for item in lv.get("steel_members_mm", [])
+            if item.get("member_type") == "BRACING") for lv in levels)
+    n_steel_floors = sum(
+        sum(1 for item in lv.get("steel_members_mm", [])
+            if item.get("member_type") == "FLOOR") for lv in levels)
     steel_statuses = sorted({
         str(st["result"].steel_readiness.get("status", "not_required"))
         for st in storeys
@@ -774,7 +1152,7 @@ def generate_building_ruby(
         len(st["result"].opening_judgement.get("exclude_ids", []))
         for st in storeys)
     expected_rc = sum(
-        sum(st["result"].column_detection_report.get("expected", {}).values())
+        _clean_rc_expected(st["result"].column_detection_report)
         for st in storeys)
     detected_rc = sum(
         sum(st["result"].column_detection_report.get("detected", {}).values())
@@ -789,28 +1167,147 @@ def generate_building_ruby(
     n_mixed_review = sum(
         len(st["result"].opening_report.get(
             "unresolved_mixed_ids", [])) for st in storeys)
+    export_trace = {
+        "trace_version": "slab_v2_export_trace_v1",
+        "ruby_path": str(out),
+        "model_status": model_status,
+        "readiness_reasons": list(readiness_reasons),
+        "delivery": {
+            "status": "ready" if model_status == "final" else "not_ready",
+            "ready_for_client_or_boss": model_status == "final",
+            "blockers": list(readiness_reasons),
+        },
+        "opening_policy": opening_policy,
+        "debug_export_verified_only": debug_verified_only,
+        "site_offset_mm": [float(site_offset_mm[0]), float(site_offset_mm[1])],
+        "summary": {
+            "level_count": len(levels),
+            "raw_elements": n_elems,
+            "verified_cut_openings": n_openings,
+            "rc_columns_exported": n_cols,
+            "rc_columns_detected_raw": detected_rc,
+            "rc_expected_after_cleanup": expected_rc,
+            "rc_columns_hidden": hidden_rc_total,
+            "steel_members_exported": n_steel_members,
+            "steel_columns_exported": n_steel_cols,
+            "steel_beams_exported": n_steel_beams,
+            "steel_bracing_exported": n_steel_bracing,
+            "steel_floor_regions_exported": n_steel_floors,
+            "walls_exported": n_walls,
+            "shaft_solids": n_shaft_solids,
+            "stair_solids": n_stair_solids,
+            "other_floor_systems_retained": n_other_floors,
+            "vertical_shaft_pairs": pairs,
+            "judge_accepted": judge_accepted,
+            "judge_excluded": judge_excluded,
+        },
+        "height": {
+            "statuses": height_statuses,
+            "unverified": unverified_heights,
+        },
+        "rc_columns": {
+            "hidden_reasons": dict(hidden_rc_columns),
+            "export_policy": {
+                "debug_export_shape_fallback_rc_columns": bool(getattr(
+                    cfg, "debug_export_shape_fallback_rc_columns", False)),
+                "debug_export_cross_floor_recovered_rc_columns": bool(getattr(
+                    cfg, "debug_export_cross_floor_recovered_rc_columns",
+                    False)),
+            },
+        },
+        "openings": {
+            "stair_context": n_stair_context,
+            "prevented_stair_cuts": n_prevented_stairs,
+            "unresolved_mixed_candidates": n_mixed_review,
+        },
+        "steel": {
+            "statuses": steel_statuses,
+            "export_policy": steel_export_policy,
+            "export_all_detected_steel": steel_export_all_detected,
+            "expected_symbols": steel_expected_symbols,
+            "review_count": n_steel_review_header,
+            "rejected_count": n_steel_rejected_header,
+            "zero_reasons": steel_zero_reasons,
+            "zero_or_low_reasons": steel_zero_or_low_reasons,
+            "counts_by_level": steel_counts_by_level,
+        },
+        "drawing_contract": {
+            "status": contract_status,
+            "critical_unfulfilled_count": contract_critical,
+            "by_subsystem": contract_by_subsystem,
+            "reasons": contract_reasons[:50],
+        },
+        "levels": [
+            {
+                "level_id": lv.get("level_id", ""),
+                "level_name": lv.get("level_name", ""),
+                "ffl_mm": float(lv.get("ffl_mm", 0) or 0),
+                "height_mm": float(height or 0),
+                "height_status": lv.get("height_status", ""),
+                "pages": list(lv.get("pages", [])),
+                "counts": {
+                    "slabs_exported": len(lv.get("slabs_mm", [])),
+                    "verified_openings_exported": len(lv.get("openings_mm", [])),
+                    "render_elements_exported": len(lv.get("render_mm", [])),
+                    "rc_columns_exported": len(lv.get("columns_mm", [])),
+                    "steel_members_exported": len(lv.get("steel_members_mm", [])),
+                    "walls_exported": len(lv.get("walls_mm", [])),
+                },
+                "page_trace": lv.get("page_export_trace", []),
+                "column_export_trace": lv.get("column_export_trace", []),
+            }
+            for lv, height in zip(levels, heights)
+        ],
+        "warnings": warnings,
+    }
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(json.dumps(
+        export_trace, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8")
     lines += [
         "",
         "model.commit_operation",
         f"puts 'slab_v2: imported {len(levels)} level(s), "
         f"{n_elems} raw element(s), {n_openings} verified cut opening(s), "
         f"{n_cols} RC column(s), {n_steel_cols} steel column(s), "
+        f"{n_steel_beams} steel beam(s), {n_steel_bracing} steel bracing, "
+        f"{n_steel_floors} steel floor region(s), "
         f"{n_walls} wall(s), "
         f"{n_shaft_solids} shaft solid(s), "
         f"{n_stair_solids} stair solid(s), "
         f"{n_other_floors} other floor system(s) retained, "
         f"{pairs} vertical shaft pair(s), "
         f"judge accepted {judge_accepted}, excluded {judge_excluded}, "
-        f"RC columns {detected_rc}/{expected_rc}'",
+        f"RC verified/exported {n_cols}; RC detected raw {detected_rc}; "
+        f"RC expected after cleanup {expected_rc}; "
+        f"RC review hidden {hidden_rc_total}'",
+        f"puts 'Debug export gate: exported_verified_only="
+        f"{str(debug_verified_only).lower()}; hidden RC reasons: "
+        f"{_safe(hidden_rc_summary or 'none')}; "
+        f"height status: "
+        f"{'UNVERIFIED HEIGHTS' if unverified_heights else 'verified/inferred'}'",
         f"puts 'Opening policy: {opening_policy}; stair context: "
         f"{n_stair_context}; prevented stair cuts: {n_prevented_stairs}; "
         f"unresolved mixed candidates: {n_mixed_review}; stair solids: 0'",
         f"puts 'Steel readiness: {steel_status}; steel export: "
-        f"verified_only; steel members: {n_steel_members}'",
+        f"{steel_export_policy}; steel expected: {len(steel_expected_symbols)}; "
+        f"verified: {n_steel_members}; review: {n_steel_review_header}; "
+        f"rejected: {n_steel_rejected_header}; zero reason: "
+        f"{_safe('; '.join(steel_zero_reasons) or 'none')}; diagnosis: "
+        f"{_safe('; '.join(steel_zero_or_low_reasons) or 'none')}'",
+        f"puts 'Drawing contract: status={_safe(contract_status)}; "
+        f"critical={contract_critical}; summary="
+        f"{_safe(contract_summary)}; reasons="
+        f"{_safe(contract_reason_text)}'",
+        f"puts 'DELIVERY STATUS: "
+        f"{'READY' if model_status == 'final' else 'NOT_READY'}; "
+        f"ready_for_client_or_boss="
+        f"{str(model_status == 'final').lower()}; blockers: "
+        f"{_safe('; '.join(readiness_reasons) or 'none')}'",
+        f"puts 'Export trace: {_safe(str(trace_path))}'",
         f"puts 'MODEL READINESS: {model_status.upper()}'",
     ]
 
-    out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines), encoding="utf-8")
     return str(out), warnings

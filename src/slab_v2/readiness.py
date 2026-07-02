@@ -61,12 +61,29 @@ def build_model_readiness(storeys: list[dict], level_datums: list,
                      if getattr(s["result"], "steel_readiness", None)]
     steel_bad = [report for report in steel_reports
                  if report.get("status", "not_required")
-                 not in {"verified", "not_required"}]
+                 not in {"verified", "verified_steel", "not_required"}]
     steel_status = "verified" if steel_reports and not steel_bad else "not_required"
     if steel_bad:
         steel_status = "review"
         reasons.append(
             "Steel members require review or lack verified geometry.")
+
+    contract_rows = [
+        getattr(s["result"], "contract_reconciliation", {}) or {}
+        for s in storeys
+        if getattr(s["result"], "contract_reconciliation", None)
+    ]
+    contract_bad = False
+    for report in contract_rows:
+        if int(report.get("critical_unfulfilled_count", 0) or 0) > 0:
+            contract_bad = True
+            break
+        if report.get("contract_status") not in {None, "", "fulfilled"}:
+            contract_bad = True
+            break
+    if contract_bad:
+        reasons.append(
+            "Drawing contract has missing, extra, blocked, or partial expected items.")
 
     rendered_shafts = [element for s in storeys
                        for element in s["result"].render_elements
@@ -102,7 +119,8 @@ def build_model_readiness(storeys: list[dict], level_datums: list,
              and column_status == "verified"
              and steel_status in {"verified", "not_required"}
              and shaft_render_status == "verified"
-             and stair_render_status == "verified")
+             and stair_render_status == "verified"
+             and not contract_bad)
     return ModelReadinessReport(
         slab_status=slab_status, height_status=height_status,
         opening_status=opening_status, wall_status=wall_status,

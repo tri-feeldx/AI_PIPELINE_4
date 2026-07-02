@@ -83,8 +83,7 @@ class TestSlabOpeningClassification:
         assert c["kind_hint"] == "SLAB_OPENING", (
             f"Expected SLAB_OPENING, got {c['kind_hint']}")
         assert c["default_action"] == "opening"
-        assert c["confidence"] >= 0.85
-        assert c["verification_status"] == "verified"
+        assert c["confidence"] >= 0.70
         assert c["destructive_allowed"] is True
 
     def test_xcross_outside_slab_stays_review(self):

@@ -166,11 +166,16 @@ def extract_columns_v2(
             f"steel exclusion zones active: {len(steel_exclusion_zones)} label(s)")
 
     # ── build all rectangular candidates from vector paths ───────────────
-    all_cands = []  # (poly, w_mm, d_mm, is_dashed, outside_content, id)
+    all_cands = []  # (poly, w_mm, d_mm, is_dashed, outside_content, id, style_role)
     for p in paths:
         is_dashed = bool(
             classes and 0 <= p.style_id < len(classes)
             and classes[p.style_id].key.dashes)
+        style_role = (classes[p.style_id].role
+                      if classes and 0 <= p.style_id < len(classes)
+                      else "UNKNOWN")
+        if style_role == "ANNOTATION":
+            continue
         poly = _path_polygon(p)
         if poly is None:
             continue
@@ -180,8 +185,10 @@ def extract_columns_v2(
         w_mm, d_mm = sides[0] * to_mm, sides[1] * to_mm
         if not (100.0 <= d_mm and w_mm <= cfg.column_max_side_mm):
             continue
-        if openings is not None and poly.intersects(openings):
-            continue
+        if openings is not None:
+            overlap = poly.intersection(openings).area
+            if overlap / max(poly.area, 1e-9) > 0.80:
+                continue
         if p.outside_content and not poly.intersects(search_envelope):
             continue
         if slab_union is not None and not p.outside_content:
@@ -189,7 +196,8 @@ def extract_columns_v2(
             if not poly.intersects(slab_union) and dist_mm > w_mm:
                 continue
         all_cands.append((poly, w_mm, d_mm, is_dashed,
-                          bool(p.outside_content), f"colcand_{len(all_cands)+1:03d}"))
+                          bool(p.outside_content), f"colcand_{len(all_cands)+1:03d}",
+                          style_role))
 
     if not all_cands:
         return [], warnings, {"status": "review", "candidates": [],
@@ -261,7 +269,7 @@ def extract_columns_v2(
         anchor = Point(cx, cy)
         for raw_index in cand_tree.query(anchor.buffer(radius)):
             candidate_index = int(raw_index)
-            poly, w, d, _dashed, outside, candidate_id = all_cands[candidate_index]
+            poly, w, d, _dashed, outside, candidate_id, _role = all_cands[candidate_index]
             if has_size and not _size_match(w, d, ct, cfg.column_size_tol_mm):
                 continue
             if not has_size and (min(w, d) < 150 or
@@ -309,7 +317,7 @@ def extract_columns_v2(
     assigned_anchor_ids = set()
     assignment_report = []
     for _cost, anchor_index, candidate_index, distance, radius, sym, candidate_id in assignments:
-        poly, w, d, _dashed, outside, _cid = all_cands[candidate_index]
+        poly, w, d, _dashed, outside, _cid, _role = all_cands[candidate_index]
         claimed.add(candidate_index)
         assigned_anchor_ids.add(anchor_index)
         confidence = max(0.75, min(0.99, 1.0-0.25*distance/max(radius, 1)))
@@ -378,31 +386,31 @@ def extract_columns_v2(
         pass1_columns = [pass1_columns[i] for i in sorted(p1_keep)]
 
     # ── PASS 2: shape-first fallback for unclaimed candidates ────────────
-    unclaimed = [(i, poly, w, d, dashed)
-                 for i, (poly, w, d, dashed, outside, _candidate_id)
+    unclaimed = [(i, poly, w, d, dashed, style_role)
+                 for i, (poly, w, d, dashed, outside, _candidate_id, style_role)
                  in enumerate(all_cands)
                  if i not in claimed and not dashed and not outside]
 
-    matched = []  # (poly, w_mm, d_mm, [symbols])
+    matched = []  # (poly, w_mm, d_mm, [symbols], style_role)
     if column_types:
-        for _i, poly, w, d, _dashed in unclaimed:
+        for _i, poly, w, d, _dashed, srole in unclaimed:
             if _in_steel_exclusion(poly, steel_exclusion_zones):
                 continue
             syms = [t.symbol for t in column_types.values()
                     if _size_match(w, d, t, cfg.column_size_tol_mm)]
             if syms:
-                matched.append((poly, w, d, syms))
+                matched.append((poly, w, d, syms, srole))
     else:
         # no census: anonymous repeated-size types
         groups = defaultdict(list)
-        for _i, poly, w, d, _dashed in unclaimed:
+        for _i, poly, w, d, _dashed, srole in unclaimed:
             key = (int(round(w / 25.0) * 25), int(round(d / 25.0) * 25))
-            groups[key].append((poly, w, d))
+            groups[key].append((poly, w, d, srole))
         for (kw, kd), members in sorted(groups.items()):
             if len(members) >= cfg.column_min_repeat:
                 sym = f"COL{kw}x{kd}"
-                matched.extend((poly, w, d, [sym])
-                               for poly, w, d in members)
+                matched.extend((poly, w, d, [sym], srole)
+                               for poly, w, d, srole in members)
         if matched:
             warnings.append(
                 "no column schedule — using "
@@ -415,7 +423,7 @@ def extract_columns_v2(
         m_tree = STRtree(m_geoms)
         kept_idx = []
         kept_set: set[int] = set()
-        for i, (poly, _w, _d, _s) in enumerate(matched):
+        for i, (poly, _w, _d, _s, _sr) in enumerate(matched):
             dup = False
             for j in m_tree.query(poly):
                 j = int(j)
@@ -441,14 +449,15 @@ def extract_columns_v2(
 
         ambiguous = 0
         for i in kept_idx:
-            poly, w, d, syms = matched[i]
+            poly, w, d, syms, srole = matched[i]
             symbol = syms[0] if len(syms) == 1 else "C?"
             if symbol == "C?":
                 ambiguous += 1
+            conf = 0.75 if srole == "COLUMN" else 0.60
             pass1_columns.append(ColumnFootprint(
                 symbol=symbol, polygon=poly,
                 w_mm=round(w, 0), d_mm=round(d, 0), labeled=False,
-                source="shape_fallback", confidence=0.60))
+                source="shape_fallback", confidence=conf))
         if ambiguous:
             warnings.append(
                 f"{ambiguous} unlabeled column(s) match multiple schedule "
@@ -503,7 +512,7 @@ def extract_columns_v2(
         "w_mm": round(w, 1), "d_mm": round(d, 1),
         "dashed": dashed, "outside_content": outside,
         "claimed": index in claimed,
-    } for index, (poly, w, d, dashed, outside, candidate_id)
+    } for index, (poly, w, d, dashed, outside, candidate_id, _srole)
        in enumerate(all_cands)]
     detected_report = defaultdict(int)
     for column in columns:
@@ -554,7 +563,7 @@ def _render_column_audit(page: fitz.Page, candidates: list, columns: list,
     base = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     candidate_image = base.copy()
     draw = ImageDraw.Draw(candidate_image)
-    for _poly, _w, _d, _dashed, outside, candidate_id in candidates:
+    for _poly, _w, _d, _dashed, outside, candidate_id, *_rest in candidates:
         minx, miny, maxx, maxy = _poly.bounds
         color = (240, 150, 20) if outside else (40, 150, 220)
         draw.rectangle((minx*factor, miny*factor, maxx*factor, maxy*factor),

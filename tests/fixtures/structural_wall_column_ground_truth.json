@@ -1,0 +1,18 @@
+{
+  "description": "Architect-confirmed semantic acceptance targets; production code must not depend on page numbers or coordinates.",
+  "page_8_rc_columns": {
+    "symbols": ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16"],
+    "count_each": 1,
+    "ambiguous": 0,
+    "steel_as_rc": 0
+  },
+  "page_11_wall_junction": {
+    "walls": ["LW6", "LW7"],
+    "maximum_gap_mm": 1.0,
+    "expected_relationship": "LW6 terminates at the exterior face of LW7"
+  },
+  "shaft_policy": {
+    "keep_as_slab_opening": true,
+    "render_separate_solid": false
+  }
+}

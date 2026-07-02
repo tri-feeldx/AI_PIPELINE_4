@@ -21,6 +21,47 @@ from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import VectorPath, Face, FaceGraph
 
 
+def _boundary_edges_to_inject(
+    segments: list,
+    content_rect,
+    proximity_pt: float = 3.0,
+    min_touches: int = 2,
+) -> list:
+    """Detect which content_rect edges have segments terminating nearby.
+
+    Multi-sheet structural plans often have slab boundaries that extend
+    beyond the drawing area.  Injecting the touched content_rect edges
+    closes the boundary so polygonization can produce large slab faces.
+    """
+    if content_rect is None:
+        return []
+    x0, y0 = content_rect.x0, content_rect.y0
+    x1, y1 = content_rect.x1, content_rect.y1
+
+    edges = {
+        "top":    ((x0, y0), (x1, y0)),
+        "right":  ((x1, y0), (x1, y1)),
+        "bottom": ((x1, y1), (x0, y1)),
+        "left":   ((x0, y1), (x0, y0)),
+    }
+
+    touches = {side: 0 for side in edges}
+    for (a, b) in segments:
+        for pt in (a, b):
+            px, py = pt
+            if abs(py - y0) <= proximity_pt and x0 - proximity_pt <= px <= x1 + proximity_pt:
+                touches["top"] += 1
+            if abs(px - x1) <= proximity_pt and y0 - proximity_pt <= py <= y1 + proximity_pt:
+                touches["right"] += 1
+            if abs(py - y1) <= proximity_pt and x0 - proximity_pt <= px <= x1 + proximity_pt:
+                touches["bottom"] += 1
+            if abs(px - x0) <= proximity_pt and y0 - proximity_pt <= py <= y1 + proximity_pt:
+                touches["left"] += 1
+
+    return [edges[side] for side, count in touches.items()
+            if count >= min_touches]
+
+
 def _fill_boundary_segments(fill_poly, simplify_tol: float = 0.5) -> list:
     """Extract simplified boundary segments from a fill polygon's exterior ring."""
     if not fill_poly.is_valid or fill_poly.is_empty:
@@ -225,9 +266,18 @@ def build_face_graph(
     style_ids: set[int],
     cfg: SlabV2Config,
     content_area_pt2: float,
+    content_rect=None,
 ) -> FaceGraph:
     """Node + polygonize the segments of the given style classes."""
     segments = _collect_segments(paths, style_ids)
+
+    if content_rect is not None:
+        boundary_segs = _boundary_edges_to_inject(
+            segments, content_rect,
+            proximity_pt=cfg.content_boundary_proximity_pt,
+            min_touches=cfg.content_boundary_min_touches)
+        segments.extend(boundary_segs)
+
     if len(segments) > cfg.max_polygonize_segments:
         segments.sort(
             key=lambda s: -((s[0][0] - s[1][0]) ** 2 + (s[0][1] - s[1][1]) ** 2))
@@ -311,6 +361,7 @@ def augment_until_closed(
     classes: list,
     cfg: SlabV2Config,
     content_area_pt2: float,
+    content_rect=None,
 ) -> tuple[FaceGraph, set[int], list[int]]:
     """Greedy class augmentation when the elected classes don't close a
     slab-sized face (e.g. the plan is cut by a match line drawn in another
@@ -322,7 +373,8 @@ def augment_until_closed(
     def max_face(fg: FaceGraph) -> float:
         return max((f.area_pt2 for f in fg.faces), default=0.0)
 
-    best_fg = build_face_graph(paths, base_ids, cfg, content_area_pt2)
+    best_fg = build_face_graph(paths, base_ids, cfg, content_area_pt2,
+                               content_rect=content_rect)
     best_ids = set(base_ids)
     added: list[int] = []
     if max_face(best_fg) >= target:
@@ -335,7 +387,8 @@ def augment_until_closed(
     ]
     for c in candidates[:12]:
         trial = best_ids | {c.id}
-        fg2 = build_face_graph(paths, trial, cfg, content_area_pt2)
+        fg2 = build_face_graph(paths, trial, cfg, content_area_pt2,
+                               content_rect=content_rect)
         m2, m1 = max_face(fg2), max_face(best_fg)
         if m2 >= target or m2 > 1.5 * m1:
             best_fg, best_ids = fg2, trial
@@ -347,19 +400,17 @@ def augment_until_closed(
 
 def assemble_slab_polygon(faces: list[Face], face_ids: list[int],
                           void_ids: list[int],
-                          min_component_frac: float = 0.02):
+                          min_component_frac: float = 0.02,
+                          sliver_heal_pt: float = 0.5):
     """Tolerant assembly of an AI face selection into slab geometry.
 
     - union the selected faces; small disconnected strays (mislabeled ids)
       are dropped, large components become separate slab parts
-    - gross outline = exterior ring of each component, which auto-includes
-      sliver faces the model missed between selected faces
+    - buffer/unbuffer heals micro-slivers while preserving genuine holes
     - voids are subtracted only where explicitly marked
 
     Returns (geometry | None, error str | None).
     """
-    from shapely.geometry import Polygon as ShPolygon, MultiPolygon
-
     by_id = {f.id: f for f in faces}
     try:
         union = unary_union([by_id[i].polygon for i in face_ids])
@@ -371,8 +422,10 @@ def assemble_slab_polygon(faces: list[Face], face_ids: list[int],
         max_area = max(c.area for c in comps)
         kept = [c for c in comps if c.area >= min_component_frac * max_area]
 
-        gross_parts = [ShPolygon(c.exterior) for c in kept]
-        gross = unary_union(gross_parts)
+        gross = unary_union(kept)
+        if sliver_heal_pt > 0:
+            gross = gross.buffer(sliver_heal_pt).buffer(-sliver_heal_pt)
+        gross = shapely.make_valid(gross)
 
         if void_ids:
             voids = unary_union([by_id[i].polygon for i in void_ids])

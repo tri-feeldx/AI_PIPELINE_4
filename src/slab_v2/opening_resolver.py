@@ -1065,6 +1065,28 @@ def _verified_core_wall_opening_candidates(
         cands, defs, warns = _core_wall_candidates_for_cluster(
             cluster, raw_elements, page, content_rect, slab_union, scale, cfg,
             paths=paths, id_offset=id_offset)
+        hull = unary_union([w.polygon for w in cluster]).buffer(0).convex_hull
+        has_xcross = any(
+            e.type in ("VOID", "SHAFT", "LIFT")
+            and e.polygon.intersection(hull).area
+            / max(e.polygon.area, 1e-9) > 0.50
+            for e in raw_elements
+        )
+        has_diag = any(
+            c.get("source_element_type") == "SINGLE_DIAGONAL_SHAFT_SEED"
+            for c in cands
+        )
+        if not has_xcross and not has_diag:
+            defs = []
+            for c in cands:
+                if c.get("verification_status") == "verified":
+                    c["verification_status"] = "review"
+                    c["destructive_allowed"] = False
+                    c["reject_reason"] = (
+                        "no X-cross or diagonal evidence in cluster")
+            warns.append(
+                "cluster has no X-cross/diagonal evidence — "
+                "openings demoted to review")
         all_candidates.extend(cands)
         all_defaults.extend(defs)
         all_warnings.extend(warns)
@@ -1145,9 +1167,10 @@ def _raw_candidates(raw_elements, walls, page, content_rect, slab_union=None,
               and slab_containment >= 0.90
               and structural_ratio <= 0.05
               and min_penetration_area <= area_m2 <= max_penetration_area):
+            conf = 0.88 if local_opening_text else 0.72
             kind, label, action, confidence = (
                 "SLAB_OPENING", element.label or "SLAB OPENING",
-                "opening", 0.88)
+                "opening", conf)
         else:
             kind, label, action, confidence = (
                 element.type, element.label, "review", 0.55)

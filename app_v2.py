@@ -5,10 +5,10 @@ Upload â†’ Gemini doc analysis â†’ slab+column extraction â†’ .rb
 Uses the slab_v2 pipeline exclusively. Does NOT touch app.py.
 """
 
-import copy
 import json
 import sys
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -20,6 +20,7 @@ import fitz
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.slab_v2.config import SlabV2Config
+from src.slab_v2 import trace as trace_mod
 from src.slab_v2.doc_analyze import analyze_document
 from src.slab_v2.pipeline import extract_slabs_v2, run_dir
 from src.slab_v2.export_ruby import generate_building_ruby
@@ -27,6 +28,19 @@ from src.slab_v2.models import ColumnFootprint
 from src.slab_v2.readiness import build_model_readiness
 from src.slab_v2.height_reconcile import reconcile_heights
 from src.slab_v2.steel_source_planner import build_steel_census
+from src.slab_v2.steel_position_resolver import (
+    resolve_steel_positions,
+    steel_only_result,
+)
+from src.slab_v2.drawing_contract import (
+    apply_contract_export_policy,
+    attach_contract_to_storeys,
+    build_missing_contract,
+    build_drawing_contract,
+    reconcile_drawing_contract,
+    write_candidate_registry_outputs,
+    write_contract_outputs,
+)
 from src.column_detector import detect_columns_on_page
 from src.building_site_placement import run_building_site_placement_audit
 
@@ -75,6 +89,64 @@ def _display_number(value, digits: int = 0):
     return f"{value:.{digits}f}"
 
 
+def _write_performance_report(out_dir: Path, page_results: dict,
+                              elapsed_s: float, workers: int,
+                              cfg: SlabV2Config) -> dict:
+    """Write a compact run performance report for bottleneck diagnosis."""
+    rows = []
+    stage_totals = {}
+    for pi, payload in sorted(page_results.items()):
+        result = payload.get("result")
+        timings = dict(getattr(result, "timings", {}) or {}) if result else {}
+        total = float(timings.get("total", 0.0) or 0.0)
+        for stage, value in timings.items():
+            try:
+                stage_totals[stage] = stage_totals.get(stage, 0.0) + float(value)
+            except Exception:
+                pass
+        rows.append({
+            "page": int(pi) + 1,
+            "status": getattr(result, "status", "ERROR") if result else "ERROR",
+            "error": payload.get("error"),
+            "total_s": round(total, 3),
+            "timings_s": {k: round(float(v), 3) for k, v in timings.items()},
+            "gemini_calls": getattr(result, "gemini_calls", None) if result else None,
+            "slab_count": len(getattr(result, "slabs", []) or []) if result else 0,
+            "rc_columns": len(getattr(result, "columns", []) or []) if result else 0,
+            "walls": len(getattr(result, "walls", []) or []) if result else 0,
+            "steel": len(getattr(result, "steel_members", []) or []) if result else 0,
+            "warnings": list(getattr(result, "warnings", []) or [])[:8] if result else [],
+        })
+
+    slow_pages = sorted(rows, key=lambda r: r.get("total_s", 0.0),
+                        reverse=True)[:10]
+    stage_ranking = [
+        {"stage": k, "total_s": round(v, 3)}
+        for k, v in sorted(stage_totals.items(), key=lambda item: -item[1])
+    ]
+    report = {
+        "schema": "slab_v2_performance_report_v1",
+        "elapsed_s": round(float(elapsed_s), 3),
+        "workers": int(workers),
+        "speed_mode": bool(getattr(cfg, "speed_mode", False)),
+        "fast_disable_page_ai": bool(getattr(cfg, "fast_disable_page_ai", False)),
+        "debug_images": bool(getattr(cfg, "debug_images", False)),
+        "trace_level": getattr(cfg, "trace_level", ""),
+        "page_count": len(rows),
+        "avg_s_per_page": round(float(elapsed_s) / max(len(rows), 1), 3),
+        "stage_totals_s": stage_ranking,
+        "slow_pages": slow_pages,
+        "pages": rows,
+    }
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "performance_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return report
+
+
 _DEFAULTS = {
     "pdf_path": None,
     "pdf_name": None,
@@ -87,8 +159,12 @@ _DEFAULTS = {
     "height_result": None,
     "height_overrides": {},
     "model_readiness": {},
+    "audit_reports": {},
+    "drawing_contract": None,
+    "contract_reconciliation": None,
     "wall_source_registry": None,
     "steel_census": None,
+    "steel_position_link": None,
     "phase": "upload",
 }
 
@@ -118,6 +194,63 @@ def _sidebar_config() -> SlabV2Config:
         model = st.text_input("Gemini model (blank=default)", value="")
         if model:
             cfg.gemini_model = model
+        st.divider()
+        st.subheader("Performance")
+        fast_scan = st.checkbox(
+            "Fast first-pass scan",
+            value=False,
+            help=(
+                "Tắt các Gemini judge phụ và debug image nặng. Dùng để scan "
+                "PDF nhiều trang nhanh hơn; trang review có thể chạy lại "
+                "accurate mode."
+            ),
+        )
+        cfg.speed_mode = bool(fast_scan)
+        cfg.fast_disable_page_ai = st.checkbox(
+            "Skip per-page Gemini slab election",
+            value=False,
+            help=(
+                "Nhanh hơn nhiều vì không gọi Gemini cho từng page. "
+                "Nên dùng cho batch scan/audit trước, không phải final pass."
+            ),
+        )
+        if cfg.fast_disable_page_ai:
+            cfg.speed_mode = True
+        cfg.debug_images = st.checkbox(
+            "Write debug PNG overlays",
+            value=not cfg.speed_mode,
+            help="Tắt để giảm thời gian ghi ảnh khi xử lý nhiều page.",
+        )
+        default_workers = min(16, max(4, (os.cpu_count() or 8)))
+        cfg.extraction_max_workers = st.slider(
+            "Parallel page workers",
+            min_value=1,
+            max_value=32,
+            value=default_workers,
+            step=1,
+            help=(
+                "Tăng worker giúp vector/geometry chạy nhanh hơn. Gemini calls "
+                "vẫn được giới hạn riêng để tránh nghẽn API."
+            ),
+        )
+        cfg.max_parallel_pages = cfg.extraction_max_workers
+        cfg.trace_level = st.selectbox(
+            "Audit trace level",
+            ["summary", "full", "forensic", "off"],
+            index=1,
+            help="Forensic ghi nhiều hơn để truy lỗi; summary nhẹ hơn.",
+        )
+        st.divider()
+        st.subheader("Debug Export")
+        cfg.export_all_detected_steel = st.checkbox(
+            "Export all detected steel geometry",
+            value=True,
+            help=(
+                "Debug mode: vẽ mọi steel candidate có geometry thật, không "
+                "dashed/reference-only. Candidate thiếu profile/verification "
+                "sẽ được tag là unverified trong Ruby/audit."
+            ),
+        )
         st.divider()
         if st.button("Reset"):
             for k, v in _DEFAULTS.items():
@@ -170,8 +303,12 @@ def _phase_upload():
         st.session_state["height_result"] = None
         st.session_state["height_overrides"] = {}
         st.session_state["model_readiness"] = {}
+        st.session_state["audit_reports"] = {}
+        st.session_state["drawing_contract"] = None
+        st.session_state["contract_reconciliation"] = None
         st.session_state["wall_source_registry"] = None
         st.session_state["steel_census"] = None
+        st.session_state["steel_position_link"] = None
         st.rerun()
 
 
@@ -297,6 +434,9 @@ def _phase_analyze(cfg: SlabV2Config):
         st.session_state["phase"] = "extracting"
         st.session_state["storeys"] = None
         st.session_state["ruby_bytes"] = None
+        st.session_state["steel_position_link"] = None
+        st.session_state["drawing_contract"] = None
+        st.session_state["contract_reconciliation"] = None
         st.rerun()
 
 
@@ -427,13 +567,37 @@ def _phase_extract(cfg: SlabV2Config):
             st.session_state["steel_census"] = build_steel_census(
                 pdf_path, ana, cfg, _upload_dir)
     steel_census = st.session_state.get("steel_census") or {}
-    with st.expander("Steel Source Planner", expanded=True):
+    if st.session_state.get("steel_position_link") is None:
+        with st.spinner("Resolving steel positions and linking details..."):
+            st.session_state["steel_position_link"] = resolve_steel_positions(
+                pdf_path, steel_census, cfg, _upload_dir,
+                column_types=ana.column_types if ana.column_types else None)
+    steel_position_link = st.session_state.get("steel_position_link") or {}
+    steel_link_report = steel_position_link.get("report") or {}
+    with st.expander("Steel Source Intelligence", expanded=True):
         steel_status = steel_census.get("status", "steel_source_missing")
         st.write(f"Status: **{steel_status}**")
         st.json({
-            "source_pages": steel_census.get("source_pages", []),
+            "source_pages": steel_census.get("steel_source_views")
+                or steel_census.get("source_pages", []),
+            "position_sources": steel_census.get("position_sources", []),
+            "profile_sources": steel_census.get("profile_sources", []),
+            "reference_sources": steel_census.get("reference_sources", []),
+            "role_taxonomy": steel_census.get("role_taxonomy", {}),
+            "symbol_families": steel_census.get("symbol_families", []),
+            "detail_members": len(steel_census.get("steel_detail_members", []) or []),
             "expected_symbols": steel_census.get("expected_symbols", []),
             "zero_steel_reason": steel_census.get("zero_steel_reason", ""),
+            "zero_or_low_steel_reason": steel_census.get("zero_or_low_steel_reason", ""),
+            "link_status": steel_link_report.get("status", "not_run"),
+            "linked_verified": len(steel_link_report.get("verified_members", []) or []),
+            "linked_review": len(steel_link_report.get("review_candidates", []) or []),
+            "linked_by_final_level": steel_link_report.get("member_final_level_counts", {}),
+            "level_symbol_counts": steel_link_report.get("counts_by_level_and_symbol", [])[:80],
+            "prevented_wrong_level_exports": len(
+                steel_link_report.get("prevented_wrong_level_exports", []) or []),
+            "link_zero_reason": steel_link_report.get("zero_steel_reason", ""),
+            "link_zero_or_low_reason": steel_link_report.get("zero_or_low_steel_reason", ""),
             "warnings": steel_census.get("warnings", []),
         })
 
@@ -517,8 +681,9 @@ def _phase_extract(cfg: SlabV2Config):
     def _extract_one_page(task):
         pi = task["pi"]
         try:
+            page_use_ai = not bool(getattr(cfg, "fast_disable_page_ai", False))
             result = extract_slabs_v2(
-                pdf_path, pi, cfg, use_ai=True,
+                pdf_path, pi, cfg, use_ai=page_use_ai,
                 column_types=ana.column_types if ana.column_types else None,
                 columns_per_floor=task.get("floor_columns") or None,
                 wall_types=v2_wall_types if v2_wall_types else None,
@@ -615,8 +780,10 @@ def _phase_extract(cfg: SlabV2Config):
 
     from src.slab_v2.gemini_client import get_client, set_gemini_concurrency
     get_client()  # warm up credentials before workers start
-    max_w = max(10, int(cfg.extraction_max_workers))
-    set_gemini_concurrency(min(10, max_w))
+    max_w = max(1, int(cfg.extraction_max_workers))
+    max_w = min(max_w, max(len(tasks), 1))
+    gemini_limit = 1 if getattr(cfg, "fast_disable_page_ai", False) else min(10, max_w)
+    set_gemini_concurrency(gemini_limit)
     st.info(f"Extracting {len(tasks)} pages with {max_w} parallel workers...")
     page_results = {}
     _t_extract_start = time.time()
@@ -630,6 +797,317 @@ def _phase_extract(cfg: SlabV2Config):
     st.info(f"Done: {len(tasks)} pages in {_t_extract_elapsed:.1f}s "
             f"({max_w} workers, "
             f"{_t_extract_elapsed / max(len(tasks), 1):.1f}s/page avg)")
+    perf_report = _write_performance_report(
+        run_dir(cfg, pdf_path), page_results, _t_extract_elapsed, max_w, cfg)
+    if perf_report.get("slow_pages"):
+        slow = perf_report["slow_pages"][0]
+        st.caption(
+            f"Slowest page: P{slow.get('page')} "
+            f"{slow.get('total_s', 0):.1f}s. Details saved to "
+            f"{run_dir(cfg, pdf_path) / 'performance_report.json'}")
+
+    steel_link_assignments = {"assigned": [], "unassigned": []}
+    _assigned_doc_steel_ids = set()
+
+    def _norm_level_token(value) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+    def _level_number_tokens(value) -> set:
+        text = str(value or "").upper()
+        tokens = set()
+        for m in re.finditer(r"\b(?:LEVEL|L)\s*0?(\d{1,2})\b", text):
+            try:
+                tokens.add(int(m.group(1)))
+            except Exception:
+                pass
+        if re.search(r"\bROOF\b", text):
+            tokens.add("ROOF")
+        return tokens
+
+    def _storey_matches_steel_hint(storey, member) -> bool:
+        final_level = getattr(member, "final_level", "") or ""
+        hints = [final_level] if final_level else (
+            getattr(member, "level_hints", []) or [])
+        if not hints:
+            return False
+        target_text = f"{storey.get('level_id', '')} {storey.get('level_name', '')}"
+        target = _norm_level_token(target_text)
+        target_levels = _level_number_tokens(target_text)
+        for hint in hints:
+            h = _norm_level_token(hint)
+            if h and (h in target or target in h):
+                return True
+            hint_levels = _level_number_tokens(hint)
+            if hint_levels and target_levels and hint_levels & target_levels:
+                return True
+        return False
+
+    def _storey_level_number(storey):
+        nums = {
+            n for n in _level_number_tokens(
+                f"{storey.get('level_id', '')} {storey.get('level_name', '')}"
+            )
+            if isinstance(n, int)
+        }
+        return min(nums) if nums else None
+
+    def _steel_hint_key(member) -> str:
+        final_level = getattr(member, "final_level", "") or ""
+        hints = [final_level] if final_level else (
+            getattr(member, "level_hints", []) or [])
+        if not hints:
+            return ""
+        first = str(hints[0])
+        return _norm_level_token(first) or "STEELLEVEL"
+
+    def _steel_hint_fallback_template(kept_storeys, member):
+        """Create a steel-only level anchor when a marking plan has a clear level
+        but that level has no slab sheet in the extracted floor set.
+
+        This keeps verified marking-plan steel visible without pretending it came
+        from a concrete slab page.  The assignment report keeps the provenance so
+        downstream readiness can remain Debug/Review if heights are inferred.
+        """
+        final_level = getattr(member, "final_level", "") or ""
+        hints = [final_level] if final_level else (
+            getattr(member, "level_hints", []) or [])
+        if not hints or not kept_storeys:
+            return None, "no steel level hint"
+
+        hint_levels = set()
+        for hint in hints:
+            hint_levels.update(_level_number_tokens(hint))
+
+        numbered = [
+            (n, s) for s in kept_storeys
+            for n in [_storey_level_number(s)]
+            if isinstance(n, int)
+        ]
+        if not numbered:
+            return None, "no numeric storey anchor for steel level hint"
+
+        numbered.sort(key=lambda x: x[0])
+        max_num, max_storey = numbered[-1]
+        target_label = str(hints[0])
+
+        target_num = next((n for n in hint_levels if isinstance(n, int)), None)
+        if target_num is not None:
+            base = next((s for n, s in numbered if n == target_num - 1), None)
+            if base is None and target_num > max_num:
+                base = max_storey
+            elif base is None:
+                return None, "steel level hint is below/inside extracted storeys but no exact match"
+            height = float(base.get("height_mm") or 3000.0)
+            ffl = float(base.get("ffl_mm") or 0.0) + height
+            return {
+                **base,
+                "ffl_mm": ffl,
+                "height_mm": height,
+                "level_id": f"steel_{_norm_level_token(target_label).lower()}",
+                "level_name": f"{target_label} steel",
+                "height_status": "steel_level_inferred_from_marking_plan",
+            }, "clear steel marking level inferred from adjacent storey"
+
+        if "ROOF" in hint_levels:
+            height = float(max_storey.get("height_mm") or 3000.0)
+            ffl = float(max_storey.get("ffl_mm") or 0.0) + height
+            return {
+                **max_storey,
+                "ffl_mm": ffl,
+                "height_mm": height,
+                "level_id": "steel_roof",
+                "level_name": "ROOF steel",
+                "height_status": "steel_roof_inferred_from_highest_storey",
+            }, "roof steel inferred from highest extracted storey"
+
+        return None, "unsupported steel level hint"
+
+    def _append_steel_to_result(result, members, link_report):
+        existing = {getattr(m, "id", "") for m in result.steel_members}
+        new_members = [m for m in members if getattr(m, "id", "") not in existing]
+        if not new_members:
+            return
+        result.steel_members.extend(new_members)
+        readiness = dict(getattr(result, "steel_readiness", {}) or {})
+        readiness["status"] = "verified_steel"
+        readiness["verified_count"] = int(readiness.get("verified_count", 0) or 0) + len(new_members)
+        readiness["review_count"] = int(readiness.get("review_count", 0) or 0) + len(
+            link_report.get("review_candidates", []) or [])
+        readiness["rejected_count"] = int(readiness.get("rejected_count", 0) or 0) + len(
+            link_report.get("rejected_candidates", []) or [])
+        pages = set(readiness.get("source_pages", []) or [])
+        pages.update(int(getattr(m, "source_page", result.page_index + 1)) for m in new_members)
+        readiness["source_pages"] = sorted(pages)
+        symbols = set(readiness.get("expected_symbols", []) or [])
+        symbols.update(getattr(m, "symbol", "") for m in new_members)
+        readiness["expected_symbols"] = sorted(s for s in symbols if s)
+        readiness["expected_count"] = len(readiness["expected_symbols"])
+        readiness["counts_by_level"] = dict(
+            link_report.get("member_final_level_counts", {}) or {})
+        readiness["counts_by_level_and_symbol"] = (
+            link_report.get("counts_by_level_and_symbol", []) or [])
+        readiness["expected_vs_detected_by_level"] = (
+            link_report.get("expected_vs_detected_by_level", {}) or {})
+        readiness["prevented_wrong_level_exports"] = (
+            link_report.get("prevented_wrong_level_exports", []) or [])
+        readiness["export_all_detected_steel"] = bool(
+            getattr(cfg, "export_all_detected_steel", False))
+        readiness["export_policy"] = (
+            "detected_debug_all_geometry"
+            if readiness["export_all_detected_steel"] else "verified_only")
+        readiness["document_level_linker"] = True
+        result.steel_readiness = readiness
+
+    def _inject_document_steel_members(building_name, kept_storeys):
+        """Attach document-level linked steel to floor/page export entries."""
+        linked = [
+            m for m in steel_position_link.get("members", []) or []
+            if (
+                getattr(m, "status", "") in {"verified", "review"}
+                and getattr(m, "final_level", "")
+                and getattr(m, "polygon", None) is not None
+            )
+        ]
+        if not linked or not kept_storeys:
+            return kept_storeys
+
+        link_report = steel_position_link.get("report") or {}
+        synthetic_groups = {}
+
+        for member in linked:
+            mid = getattr(member, "id", "")
+            if not mid or mid in _assigned_doc_steel_ids:
+                continue
+            source_page = int(getattr(member, "source_page", 0) or 0)
+            direct = next(
+                (s for s in kept_storeys if int(s.get("page_idx", -999)) == source_page - 1),
+                None)
+            if direct is not None:
+                _append_steel_to_result(direct["result"], [member], link_report)
+                _assigned_doc_steel_ids.add(mid)
+                steel_link_assignments["assigned"].append({
+                    "id": mid,
+                    "symbol": getattr(member, "symbol", ""),
+                    "member_type": getattr(member, "member_type", ""),
+                    "building": building_name,
+                    "target": "same_page_floor",
+                    "source_page": source_page,
+                    "level_id": direct.get("level_id"),
+                    "final_level": getattr(member, "final_level", ""),
+                    "position_level": getattr(member, "position_level", ""),
+                    "level_assignment_status": getattr(
+                        member, "level_assignment_status", ""),
+                    "level_assignment_reason": getattr(
+                        member, "level_assignment_reason", ""),
+                    "level_hints": getattr(member, "level_hints", []),
+                    "level_hint_evidence": getattr(member, "level_hint_evidence", []),
+                })
+                continue
+
+            level_match = next(
+                (s for s in kept_storeys if _storey_matches_steel_hint(s, member)),
+                None)
+            if level_match is not None and source_page > 0:
+                key = (source_page, level_match.get("level_id", ""))
+                group = synthetic_groups.setdefault(key, {
+                    "members": [],
+                    "level": level_match,
+                })
+                group["members"].append(member)
+                _assigned_doc_steel_ids.add(mid)
+                steel_link_assignments["assigned"].append({
+                    "id": mid,
+                    "symbol": getattr(member, "symbol", ""),
+                    "member_type": getattr(member, "member_type", ""),
+                    "building": building_name,
+                    "target": "linked_steel_source_page",
+                    "source_page": source_page,
+                    "level_id": level_match.get("level_id"),
+                    "final_level": getattr(member, "final_level", ""),
+                    "position_level": getattr(member, "position_level", ""),
+                    "level_assignment_status": getattr(
+                        member, "level_assignment_status", ""),
+                    "level_assignment_reason": getattr(
+                        member, "level_assignment_reason", ""),
+                    "level_hints": getattr(member, "level_hints", []),
+                    "level_hint_evidence": getattr(member, "level_hint_evidence", []),
+                })
+                continue
+
+            inferred_template, inferred_reason = _steel_hint_fallback_template(
+                kept_storeys, member)
+            if inferred_template is not None and source_page > 0:
+                key = (source_page, _steel_hint_key(member))
+                group = synthetic_groups.setdefault(key, {
+                    "members": [],
+                    "level": inferred_template,
+                    "assignment_reason": inferred_reason,
+                })
+                group["members"].append(member)
+                _assigned_doc_steel_ids.add(mid)
+                steel_link_assignments["assigned"].append({
+                    "id": mid,
+                    "symbol": getattr(member, "symbol", ""),
+                    "member_type": getattr(member, "member_type", ""),
+                    "building": building_name,
+                    "target": "linked_steel_source_level_hint",
+                    "source_page": source_page,
+                    "level_id": inferred_template.get("level_id"),
+                    "level_name": inferred_template.get("level_name"),
+                    "final_level": getattr(member, "final_level", ""),
+                    "position_level": getattr(member, "position_level", ""),
+                    "level_assignment_status": getattr(
+                        member, "level_assignment_status", ""),
+                    "level_assignment_reason": getattr(
+                        member, "level_assignment_reason", ""),
+                    "level_hints": getattr(member, "level_hints", []),
+                    "level_hint_evidence": getattr(member, "level_hint_evidence", []),
+                    "reason": inferred_reason,
+                })
+                continue
+
+            hints = getattr(member, "level_hints", []) or []
+            steel_link_assignments["unassigned"].append({
+                "id": mid,
+                "symbol": getattr(member, "symbol", ""),
+                "member_type": getattr(member, "member_type", ""),
+                "source_page": source_page,
+                "final_level": getattr(member, "final_level", ""),
+                "position_level": getattr(member, "position_level", ""),
+                "level_assignment_status": getattr(
+                    member, "level_assignment_status", ""),
+                "level_assignment_reason": getattr(
+                    member, "level_assignment_reason", ""),
+                "level_hints": hints,
+                "level_hint_evidence": getattr(member, "level_hint_evidence", []),
+                "reason": (
+                    "level hints did not match extracted floor storeys"
+                    if hints else "no matching extracted floor page or level hint"
+                ),
+            })
+
+        for (source_page, level_id), group in synthetic_groups.items():
+            template = group["level"]
+            scale = float(getattr(group["members"][0], "source_scale", 100.0) or 100.0)
+            debug_dir = run_dir(cfg, pdf_path) / f"steel_position_page_{source_page:02d}_{level_id}"
+            result = steel_only_result(
+                page_index=source_page - 1,
+                scale=scale,
+                members=group["members"],
+                debug_dir=debug_dir,
+                report=link_report)
+            kept_storeys.append({
+                "result": result,
+                "ffl_mm": template.get("ffl_mm", 0.0),
+                "page_idx": source_page - 1,
+                "level_id": template.get("level_id", level_id),
+                "level_name": str(template.get("level_name") or level_id),
+                "height_mm": template.get("height_mm"),
+                "height_status": template.get("height_status"),
+                "steel_only": True,
+                "steel_assignment_reason": group.get("assignment_reason"),
+            })
+        return kept_storeys
 
     # ---- Render results on main thread (Streamlit UI) ----------------------------
     for b in ana.buildings:
@@ -831,29 +1309,88 @@ def _phase_extract(cfg: SlabV2Config):
             else:
                 kept.append(s)
 
-        # fallback: clone slab from nearest valid level
+        # Contract-count governance is fail-closed: a tiny/outlier slab is not
+        # repaired by copying another floor, because that invents geometry and
+        # hides the actual extraction failure from audit.
         for s in deferred:
             a = _max_slab(s)
-            if kept:
-                nearest = min(kept,
-                              key=lambda k: abs(k["ffl_mm"] - s["ffl_mm"]))
-                cloned = copy.copy(s["result"])
-                cloned.slabs = copy.deepcopy(nearest["result"].slabs)
-                cloned.scale = nearest["result"].scale or s["result"].scale
-                s["result"] = cloned
-                kept.append(s)
-                st.warning(
-                    f"Page {s['page_idx'] + 1}: slab {a:.1f} m\u00b2 too small "
-                    f"(<10% of {biggest:.1f} m\u00b2)  --  using slab shape from "
-                    f"page {nearest['page_idx'] + 1} (fallback)")
-            else:
-                st.warning(
-                    f"Page {s['page_idx'] + 1}: slab {a:.1f} m\u00b2  --  "
-                    f"excluded, no fallback available")
+            result = s["result"]
+            fail_msg = (
+                f"NO_EXPORT_TINY_SLAB: raw slab {a:.1f} m2 was below 10% "
+                f"of run maximum {biggest:.1f} m2; slab geometry was not "
+                "exported because no verified local floor geometry exists.")
+            result.slabs = []
+            result.status = "NO_EXPORT_TINY_SLAB"
+            result.warnings = list(getattr(result, "warnings", []) or [])
+            if fail_msg not in result.warnings:
+                result.warnings.append(fail_msg)
+            for attr in ("slab_readiness", "floor_system_readiness"):
+                row = dict(getattr(result, attr, {}) or {})
+                row["status"] = "review"
+                warnings = list(row.get("warnings") or [])
+                if fail_msg not in warnings:
+                    warnings.append(fail_msg)
+                row["warnings"] = warnings
+                row["reason"] = (
+                    (row.get("reason") or "") + " " + fail_msg
+                ).strip()
+                setattr(result, attr, row)
+            kept.append(s)
+            st.warning(
+                f"Page {s['page_idx'] + 1}: slab {a:.1f} m\u00b2 too small "
+                f"(<10% of {biggest:.1f} m\u00b2) -- not exported; "
+                "contract audit will report the missing slab.")
 
+        kept = _inject_document_steel_members(b.name, kept)
+        for s in kept:
+            result = s.get("result")
+            if result is None:
+                continue
+            readiness = dict(getattr(result, "steel_readiness", {}) or {})
+            readiness["export_all_detected_steel"] = bool(
+                getattr(cfg, "export_all_detected_steel", False))
+            if readiness["export_all_detected_steel"]:
+                readiness["export_policy"] = "detected_debug_all_geometry"
+            result.steel_readiness = readiness
         all_storeys[b.name] = kept
 
     progress.progress(1.0)
+
+    try:
+        (run_dir(cfg, pdf_path) / "steel_link_assignment_report.json").write_text(
+            json.dumps(steel_link_assignments, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        contract = build_drawing_contract(
+            ana, all_storeys, steel_census=steel_census, pdf_path=pdf_path)
+        if not (contract.get("contract_items") or []):
+            raise RuntimeError(
+                "Drawing contract produced no contract items; "
+                "count governance cannot guarantee export completeness.")
+        contract_export_decisions = apply_contract_export_policy(
+            contract, all_storeys)
+        reconciliation = reconcile_drawing_contract(contract, all_storeys)
+        reconciliation["export_decisions"] = contract_export_decisions
+        attach_contract_to_storeys(contract, reconciliation, all_storeys)
+        write_contract_outputs(run_dir(cfg, pdf_path), contract, reconciliation)
+        write_candidate_registry_outputs(run_dir(cfg, pdf_path), all_storeys)
+        st.session_state["drawing_contract"] = contract
+        st.session_state["contract_reconciliation"] = reconciliation
+    except Exception as e:
+        reason = f"Drawing contract audit failed: {e}"
+        st.warning(reason)
+        contract, reconciliation = build_missing_contract(reason)
+        try:
+            attach_contract_to_storeys(contract, reconciliation, all_storeys)
+            write_contract_outputs(run_dir(cfg, pdf_path), contract, reconciliation)
+            write_candidate_registry_outputs(run_dir(cfg, pdf_path), all_storeys)
+        except Exception:
+            pass
+        st.session_state["drawing_contract"] = contract
+        st.session_state["contract_reconciliation"] = reconciliation
 
     # generate .rb files
     ruby_bytes = {}
@@ -877,9 +1414,13 @@ def _phase_extract(cfg: SlabV2Config):
         out_dir = run_dir(cfg, pdf_path)
         try:
             from dataclasses import asdict
+            readiness_payload = asdict(readiness)
             (out_dir / f"model_readiness_{bid}.json").write_text(
-                json.dumps(asdict(readiness), indent=2,
+                json.dumps(readiness_payload, indent=2,
                            ensure_ascii=False), encoding="utf-8")
+            reports = trace_mod.write_run_audit_reports(
+                out_dir, readiness_payload)
+            st.session_state.setdefault("audit_reports", {})[bname] = reports
         except Exception:
             pass
         prefix = "final_model" if readiness.model_status == "final" \
@@ -901,6 +1442,14 @@ def _phase_extract(cfg: SlabV2Config):
                 st.warning(f"Export: {w}")
             ruby_bytes[bname] = Path(path).read_bytes()
         except Exception as e:
+            err_path = out_dir / f"ruby_export_error_{bid}.txt"
+            try:
+                import traceback
+                err_path.write_text(
+                    "".join(traceback.format_exception(e)),
+                    encoding="utf-8")
+            except Exception:
+                pass
             st.error(f"Ruby export failed for {bname}: {e}")
         doc.close()
 
@@ -1016,6 +1565,35 @@ def _show_results(cfg: SlabV2Config):
                     st.session_state["phase"] = "analyzing"
                     st.rerun()
 
+    contract = st.session_state.get("drawing_contract") or {}
+    reconciliation = st.session_state.get("contract_reconciliation") or {}
+    if contract or reconciliation:
+        with st.expander("Drawing Contract Reconciliation", expanded=True):
+            summary = reconciliation.get("by_subsystem", {}) or {}
+            st.table([{
+                "Subsystem": subsystem,
+                "Status": row.get("status", "unknown"),
+                "Expected": row.get("expected", 0),
+                "Detected": row.get("detected", 0),
+                "Exported": row.get("exported", 0),
+                "Missing": row.get("missing", 0),
+                "Extra": row.get("extra", 0),
+                "Blocked/review": row.get("blocked", 0),
+            } for subsystem, row in sorted(summary.items())])
+            st.caption(
+                "Contract status: "
+                f"{reconciliation.get('contract_status', 'unknown')} | "
+                f"critical unfulfilled: "
+                f"{reconciliation.get('critical_unfulfilled_count', 0)}")
+            blockers = reconciliation.get("missing_extra_blocked", []) or []
+            if blockers:
+                st.caption("Missing / extra / blocked contract items")
+                st.dataframe(blockers[:500], use_container_width=True)
+            rows = reconciliation.get("counts_by_level", []) or []
+            if rows:
+                st.caption("Counts by level and symbol")
+                st.dataframe(rows[:1000], use_container_width=True)
+
     for bname, storeys in all_storeys.items():
         st.subheader(f"Building: {bname}")
         readiness = (st.session_state.get("model_readiness") or {}).get(bname)
@@ -1035,6 +1613,57 @@ def _show_results(cfg: SlabV2Config):
                 "Model": readiness.model_status,
                 "Reasons": "; ".join(readiness.reasons),
             }])
+        audit = (st.session_state.get("audit_reports") or {}).get(bname) or {}
+        if not audit:
+            out_dir = run_dir(cfg, st.session_state["pdf_path"])
+            audit = trace_mod.write_run_audit_reports(
+                out_dir,
+                getattr(readiness, "__dict__", None) if readiness else None)
+        delivery = audit.get("delivery_readiness") or {}
+        quality = audit.get("quality_gate") or {}
+        ledger = audit.get("audit_ledger") or {}
+        if delivery or quality:
+            with st.expander("QA Audit / Delivery Readiness", expanded=True):
+                ready = bool(delivery.get("ready_for_client_or_boss"))
+                if ready:
+                    st.success("QA status: ready for client/boss review")
+                else:
+                    st.error("QA status: NOT ready for client/boss delivery")
+                st.table([{
+                    "Quality": quality.get("status"),
+                    "Critical blockers": quality.get("critical_count", 0),
+                    "Warnings": quality.get("warning_count", 0),
+                    "Median slab area (m2)": quality.get(
+                        "median_slab_area_m2"),
+                    "Dominant scale": quality.get("dominant_scale"),
+                    "Delivery": delivery.get("delivery_status"),
+                }])
+                blockers = delivery.get("blockers") or []
+                warnings = delivery.get("warnings") or []
+                if blockers:
+                    st.caption("Critical blockers")
+                    st.dataframe(blockers, use_container_width=True)
+                if warnings:
+                    st.caption("Warnings")
+                    st.dataframe(warnings, use_container_width=True)
+                pages = (ledger.get("pages") or [])
+                if pages:
+                    st.caption("Page audit ledger")
+                    st.dataframe([{
+                        "Page": p.get("page"),
+                        "Status": p.get("status"),
+                        "Scale": p.get("scale"),
+                        "Area m2": p.get("area_m2"),
+                        "Slab/content": p.get("slab_fraction_of_content"),
+                        "Slab": (p.get("readiness") or {}).get("slab"),
+                        "Floor": (p.get("readiness") or {}).get(
+                            "floor_system"),
+                        "Cols": (p.get("counts") or {}).get("columns"),
+                        "Walls": (p.get("counts") or {}).get("walls"),
+                        "Steel": (p.get("counts") or {}).get("steel_members"),
+                        "Cuts": (p.get("counts") or {}).get(
+                            "verified_cut_openings"),
+                    } for p in pages], use_container_width=True)
 
         rows = []
         col_summary = {}  # symbol -> {floors, total}

@@ -12,11 +12,38 @@ FLOOR_PLAN_KEYWORDS = [
     "GROUND FLOOR", "FIRST FLOOR", "SECOND FLOOR", "ROOF", "PODIUM",
 ]
 
+_GEOMETRY_TITLE_RE = re.compile(
+    r"\b(GENERAL\s+ARRANGEMENT\s+PLAN|GA\s+PLAN|OUTLINE\s+PLAN|"
+    r"FLOOR\s+PLAN|SLAB\s+PLAN|FRAMING\s+PLAN|STEELWORK\s+PLAN|"
+    r"STEEL\s+MARKING\s+PLAN|MARKING\s+PLAN|LEVEL\s+\d+\s+PLAN|"
+    r"LEVEL\s+\d+\s+OUTLINE\s+PLAN)\b",
+    re.IGNORECASE,
+)
+_FOUNDATION_TITLE_RE = re.compile(
+    r"\b(FOUNDATION\s+PLAN|FOOTING\s+PLAN|PILE\s+CAP\s+PLAN|"
+    r"PILE\s+PLAN|PAD\s+FOOTING\s+PLAN)\b",
+    re.IGNORECASE,
+)
+_LOADING_TITLE_RE = re.compile(r"\b(LOADING\s+PLAN|LOAD\s+PLAN)\b", re.IGNORECASE)
+_EVIDENCE_TITLE_RE = re.compile(
+    r"\b(SCHEDULE|DETAIL|ELEVATION|SECTION|LEGEND|NOTES)\b",
+    re.IGNORECASE,
+)
+
 FFL_PATTERN = re.compile(
     r"(?:FFL|RL|EL|FL|AHD|NGL)\s*[=:+]?\s*([+-]?\d{1,4}(?:\.\d{1,3})?)\s*(?:m|M|mAHD)?",
     re.IGNORECASE,
 )
-SCALE_PATTERN = re.compile(r"1\s*[:/]\s*(\d+)", re.IGNORECASE)
+SCALE_PATTERN = re.compile(r"\b1\s*[:/]\s*(\d{1,4})\b", re.IGNORECASE)
+_EXPLICIT_SCALE_RE = re.compile(
+    r"\bSCALE\b[^A-Z0-9]{0,20}\b1\s*[:/]\s*(\d{1,4})\b",
+    re.IGNORECASE,
+)
+_TIME_LIKE_RE = re.compile(
+    r"\b\d{1,2}\s*:\s*\d{2}(?:\s*:\s*\d{2})?\s*(?:AM|PM)?\b",
+    re.IGNORECASE,
+)
+_DATE_LIKE_RE = re.compile(r"\b\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4}\b")
 SLAB_LABEL_PATTERN = re.compile(
     r"\b([A-Z]?S\d+[A-Z]?)\b|\b(SL[\s-]?\d+)\b|\b([A-Z]-S\d+-[A-Z]{2}\d+)\b",
     re.IGNORECASE,
@@ -123,17 +150,182 @@ def extract_ffl_values(text_blocks: list[dict]) -> list[dict]:
 
 
 def detect_scale_from_blocks(text_blocks: list[dict]) -> int | None:
-    """Find scale ratio like '1:100' or '1:200' from text blocks."""
-    for block in text_blocks:
-        m = SCALE_PATTERN.search(block["text"])
-        if m:
+    """Find a drawing scale ratio like 'SCALE - 1 : 100'.
+
+    Ratios are only trusted when they are tied to explicit SCALE context.  This
+    intentionally rejects timestamp/date/path ratios such as '9:11:15 PM'.
+    """
+    return collect_scale_candidates_from_blocks(text_blocks).get("chosen_scale")
+
+
+def collect_scale_candidates_from_blocks(text_blocks: list[dict]) -> dict:
+    """Return accepted/rejected scale candidates with provenance.
+
+    The detector is deliberately conservative: a bare ``1:15`` is not a
+    drawing scale unless it is on or near a SCALE label.  This prevents footer
+    timestamps and revision dates from silently shrinking/expanding models.
+    """
+    candidates: list[dict] = []
+    blocks = list(text_blocks or [])
+
+    for idx, block in enumerate(blocks):
+        text = str(block.get("text", "") or "")
+        for match in SCALE_PATTERN.finditer(text):
+            candidates.append(_score_scale_candidate(
+                ratio_text=match.group(0),
+                denominator_text=match.group(1),
+                context=text,
+                bbox=block.get("bbox"),
+                source=f"block:{idx}",
+                match_start=match.start(),
+                match_end=match.end(),
+            ))
+
+    joined_parts = [str(b.get("text", "") or "") for b in blocks]
+    joined = " ".join(t for t in joined_parts if t)
+    for match in _EXPLICIT_SCALE_RE.finditer(joined):
+        denom = match.group(1)
+        context = joined[max(0, match.start() - 80):match.end() + 80]
+        if not any(c.get("denominator") == _safe_int(denom)
+                   and "SCALE" in c.get("context", "").upper()
+                   for c in candidates):
+            candidates.append(_score_scale_candidate(
+                ratio_text=match.group(0),
+                denominator_text=denom,
+                context=context,
+                bbox=None,
+                source="joined_text",
+                match_start=max(0, context.upper().find("1")),
+                match_end=len(context),
+            ))
+
+    accepted = [c for c in candidates if c.get("accepted")]
+    accepted.sort(key=lambda c: (-float(c.get("score", 0)), c.get("source", "")))
+    chosen = accepted[0]["denominator"] if accepted else None
+    return {
+        "schema": "scale_candidates_v2",
+        "chosen_scale": chosen,
+        "status": "verified" if chosen else "missing",
+        "candidates": candidates,
+        "reason": (
+            f"Selected SCALE 1:{chosen} from explicit scale context."
+            if chosen else
+            "No numeric scale with explicit SCALE context was found."
+        ),
+    }
+
+
+def _safe_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _score_scale_candidate(
+    *,
+    ratio_text: str,
+    denominator_text: str,
+    context: str,
+    bbox,
+    source: str,
+    match_start: int,
+    match_end: int,
+) -> dict:
+    denominator = _safe_int(denominator_text)
+    upper = context.upper()
+    local = context[max(0, match_start - 40):match_end + 40]
+    local_upper = local.upper()
+    reasons: list[str] = []
+    reject_reason = ""
+    score = 0.0
+
+    if denominator is None or not (10 <= denominator <= 2000):
+        reject_reason = "denominator_out_of_range"
+    elif _TIME_LIKE_RE.search(local) and "SCALE" not in local_upper:
+        reject_reason = "timestamp_or_time_ratio"
+    elif _DATE_LIKE_RE.search(local) and "SCALE" not in local_upper:
+        reject_reason = "date_ratio"
+    elif "SCALE" not in upper:
+        reject_reason = "missing_scale_keyword"
+    elif "DO NOT SCALE" in upper and not _EXPLICIT_SCALE_RE.search(context):
+        reject_reason = "do_not_scale_without_numeric_scale"
+    else:
+        if _EXPLICIT_SCALE_RE.search(context):
+            score += 100.0
+            reasons.append("explicit_scale_phrase")
+        if "SCALE" in local_upper:
+            score += 50.0
+            reasons.append("same_block_scale_keyword")
+        if denominator in {50, 100, 200, 250, 500}:
+            score += 5.0
+            reasons.append("common_architectural_scale")
+        if bbox:
             try:
-                scale = int(m.group(1))
-                if 10 <= scale <= 2000:
-                    return scale
-            except ValueError:
+                # Title block scales are usually near sheet lower area.
+                y0 = float(bbox[1])
+                score += max(0.0, min(10.0, y0 / 250.0))
+            except Exception:
                 pass
-    return None
+
+    return {
+        "ratio_text": ratio_text,
+        "denominator": denominator,
+        "context": context[:240],
+        "bbox": list(bbox) if bbox else None,
+        "source": source,
+        "score": round(score, 3),
+        "accepted": not bool(reject_reason),
+        "reject_reason": reject_reason,
+        "evidence": reasons,
+    }
+
+
+def classify_page_role_from_blocks(text_blocks: list[dict]) -> dict:
+    """Classify whether a page should export geometry or only provide evidence."""
+    text = " ".join(str(b.get("text", "") or "") for b in text_blocks or [])
+    upper = text.upper()
+    title = _extract_page_title(text_blocks)
+    title_upper = title.upper()
+    floor_hits = [kw for kw in FLOOR_PLAN_KEYWORDS if kw in upper]
+    evidence_hits = [
+        kw for kw in (
+            "SCHEDULE", "DETAIL", "ELEVATION", "SECTION", "LEGEND",
+            "TYPICAL", "NOTES", "REINFORCEMENT", "DIAPHRAGM",
+        )
+        if kw in upper
+    ]
+
+    # Sheet title/page role is stronger than incidental words elsewhere on
+    # the sheet.  Foundation/loading sheets often contain "ROOF", "LEVEL", or
+    # "SCHEDULE" in notes; those terms must not make them slab geometry pages.
+    if _FOUNDATION_TITLE_RE.search(title_upper):
+        role = "foundation_plan"
+        reason = "Sheet title indicates foundation/footing geometry, not a slab floor plan."
+    elif _LOADING_TITLE_RE.search(title_upper):
+        role = "evidence_only"
+        reason = "Sheet title indicates a loading plan; use as evidence, not slab geometry authority."
+    elif _GEOMETRY_TITLE_RE.search(title_upper) or "GENERAL ARRANGEMENT PLAN" in upper:
+        role = "geometry_plan"
+        reason = "Page title/text indicates a drawable floor/GA/outline/framing plan."
+    elif evidence_hits:
+        role = "evidence_only"
+        reason = "Page appears to be schedule/detail/elevation/notes evidence only."
+    elif floor_hits:
+        role = "geometry_plan"
+        reason = "Page text contains floor-plan terms and no stronger evidence-only title."
+    else:
+        role = "unknown"
+    return {
+        "schema": "page_role_classification_v2",
+        "role": role,
+        "floor_plan_evidence": floor_hits,
+        "evidence_only_terms": evidence_hits,
+        "title": title,
+        "reason": (
+            reason if role != "unknown" else "No strong page role evidence found."
+        ),
+    }
 
 
 def extract_slab_labels(text_blocks: list[dict]) -> list[dict]:

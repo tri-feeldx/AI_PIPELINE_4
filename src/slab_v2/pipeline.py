@@ -33,8 +33,9 @@ import fitz
 
 from src.slab_v2.config import SlabV2Config
 from src.slab_v2.models import ElementFootprint, SlabV2Result
-from src.slab_v2 import vector_extract, planarize
+from src.slab_v2 import vector_extract, planarize, plan_viewport
 from src.slab_v2.debug_render import PageRenderer
+from src.slab_v2 import trace as trace_mod
 
 # one numbered run folder per CLI invocation / upload:
 # debug_slab_v2/<stem>/upload<N>/page_<P>/... — runs never overwrite each
@@ -75,6 +76,18 @@ def _detect_scale(doc: fitz.Document, page_index: int) -> int | None:
     return detect_scale_from_blocks(blocks)
 
 
+def _page_text_audits(doc: fitz.Document, page_index: int) -> tuple[int | None, dict, dict]:
+    from src.pdf_processor import (
+        classify_page_role_from_blocks,
+        collect_scale_candidates_from_blocks,
+        extract_text_blocks,
+    )
+    blocks = extract_text_blocks(doc[page_index])
+    scale_audit = collect_scale_candidates_from_blocks(blocks)
+    role_audit = classify_page_role_from_blocks(blocks)
+    return scale_audit.get("chosen_scale"), scale_audit, role_audit
+
+
 def extract_slabs_v2(
     pdf_path: str,
     page_index: int,
@@ -94,13 +107,42 @@ def extract_slabs_v2(
         cfg.enable_slab_face_judge = False
         cfg.enable_floor_system_judge = False
         cfg.debug_images = False
+        cfg.save_prompt_images = False
     doc = fitz.open(pdf_path)
     page = doc[page_index]
 
-    out_dir = run_dir(cfg, pdf_path) / f"page_{page_index + 1}"
+    run_root = run_dir(cfg, pdf_path)
+    out_dir = run_root / f"page_{page_index + 1}"
     result = SlabV2Result(page_index=page_index, debug_dir=str(out_dir))
     rend = PageRenderer(page, cfg, str(out_dir))
     t0 = time.time()
+    trace_enabled = str(getattr(cfg, "trace_level", "full")).lower() != "off"
+    trace_stages: list[dict] = []
+    if trace_enabled:
+        trace_mod.init_run_trace(run_root, pdf_path, cfg, doc.page_count)
+
+    def _trace(stage: str, status: str = "ok", **payload) -> None:
+        if not trace_enabled:
+            return
+        row = {
+            "stage": stage,
+            "status": status,
+            "elapsed_total_s": round(time.time() - t0, 3),
+            **payload,
+        }
+        trace_stages.append(row)
+        trace_mod.append_event(run_root, out_dir, stage, status, payload)
+
+    def _write_page_trace(extra: dict | None = None) -> None:
+        if trace_enabled:
+            trace_mod.write_page_trace(result, page, out_dir, trace_stages, extra)
+
+    _trace(
+        "input_page",
+        pdf_path=pdf_path,
+        page_count=doc.page_count,
+        page=trace_mod._page_snapshot(page),
+    )
 
     # ── Stage A ───────────────────────────────────────────────────────────
     content = _content_rect(page)
@@ -111,32 +153,149 @@ def extract_slabs_v2(
     paths, classes = vector_extract.extract_paths(page, cfg, content)
     result.style_classes = classes
     result.timings["stage_a"] = time.time() - t0
+    _trace(
+        "vector_extract",
+        duration_s=round(result.timings["stage_a"], 3),
+        content_rect=trace_mod.content_rect_snapshot(content),
+        content_area_pt2=round(content_area, 3),
+        vector_stats=trace_mod.vector_stats(paths, classes),
+    )
 
+    need_prompt_images = bool(use_ai and getattr(cfg, "save_prompt_images", True))
     if cfg.debug_images:
         rend.step00_page_raster()
-    rend.step01_paths_by_style(paths, classes)
-    rend.step02_style_legend_sheet(classes)
+    if cfg.debug_images or need_prompt_images:
+        rend.step01_paths_by_style(paths, classes)
+        rend.step02_style_legend_sheet(classes)
 
     # ── Stage B ───────────────────────────────────────────────────────────
+    detected_scale, scale_audit, role_audit = _page_text_audits(doc, page_index)
+    result.scale_audit = scale_audit
+    result.page_role_classification = role_audit
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"scale_candidates_p{page_index + 1:02d}.json").write_text(
+            json.dumps(scale_audit, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+        (out_dir / f"page_role_classification_p{page_index + 1:02d}.json").write_text(
+            json.dumps(role_audit, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception as exc:
+        result.warnings.append(f"text audit output failed: {exc}")
+    _trace(
+        "text_audit",
+        scale_status=scale_audit.get("status"),
+        chosen_scale=scale_audit.get("chosen_scale"),
+        scale_candidates=scale_audit.get("candidates", []),
+        page_role=role_audit,
+    )
+
+    if role_audit.get("role") in {"evidence_only", "foundation_plan"}:
+        result.status = (
+            "FOUNDATION_PLAN_PAGE"
+            if role_audit.get("role") == "foundation_plan"
+            else "EVIDENCE_ONLY_PAGE"
+        )
+        result.warnings.append(
+            "page role classified as non-slab evidence/geometry context; "
+            "slab geometry export skipped")
+        _trace("early_exit", result.status.lower(), page_role=role_audit)
+        _write_result_json(result, out_dir)
+        _write_page_trace({"exit": result.status})
+        return result
+
+    viewport_rect, viewport_audit = plan_viewport.detect_plan_viewport(
+        page, paths, content, role_audit)
+    result.plan_viewport = viewport_audit
+    try:
+        plan_viewport.write_plan_viewport_artifacts(
+            page, rend, out_dir, page_index + 1, viewport_rect, content,
+            viewport_audit)
+    except Exception as exc:
+        result.warnings.append(f"plan viewport artifact output failed: {exc}")
+    area_ref = (
+        float(viewport_rect.width * viewport_rect.height)
+        if viewport_audit.get("status") == "detected"
+        else float(content_area)
+    )
+    if area_ref <= 0:
+        area_ref = content_area
+    area_ref_label = (
+        "plan_viewport"
+        if viewport_audit.get("status") == "detected"
+        else "content_rect"
+    )
+    _trace(
+        "plan_viewport",
+        status=viewport_audit.get("status", "unknown"),
+        area_reference=area_ref_label,
+        viewport=viewport_audit,
+        analysis_area_pt2=round(area_ref, 3),
+    )
+
     t1 = time.time()
     all_ids = {c.id for c in classes if c.role not in ("FRAME", "HATCH")}
-    fg_all = planarize.build_face_graph(paths, all_ids, cfg, content_area)
+    _boundary_rect = content if cfg.use_content_boundary else None
+    fg_all = planarize.build_face_graph(paths, all_ids, cfg, area_ref,
+                                         content_rect=_boundary_rect)
     result.timings["stage_b"] = time.time() - t1
+    _trace(
+        "face_graph_all",
+        duration_s=round(result.timings["stage_b"], 3),
+        selected_style_ids=sorted(all_ids),
+        use_content_boundary=bool(cfg.use_content_boundary),
+        face_graph=trace_mod.face_graph_stats(fg_all, area_ref),
+        area_reference=area_ref_label,
+    )
 
     if cfg.debug_images:
         rend.step03_planarized(fg_all)
         rend.faces_numbered(fg_all, "step_04_faces_all.png",
-                            content_area_pt2=content_area)
+                            content_area_pt2=area_ref)
 
-    if not fg_all.faces:
-        result.status = "NO_FACES"
-        _write_result_json(result, out_dir)
-        return result
+    no_initial_faces = not fg_all.faces
+    if no_initial_faces:
+        result.warnings.append(
+            "all-classes face graph produced no closed faces; continuing to "
+            "no-fill boundary resolver if this is a geometry plan")
+        _trace("face_graph_all", "no_closed_faces_continue",
+               reason="face graph has no faces")
+        if not (
+            role_audit.get("role") == "geometry_plan"
+            and viewport_audit.get("status") == "detected"
+        ):
+            result.status = "NO_FACES"
+            _trace("early_exit", "no_faces",
+                   reason="face graph has no faces and page is not a "
+                   "detected geometry plan")
+            _write_result_json(result, out_dir)
+            _write_page_trace({"exit": "NO_FACES"})
+            return result
 
     if cfg.manual_scale:
         text_scale = cfg.manual_scale
+        result.scale_audit = {
+            **scale_audit,
+            "chosen_scale": text_scale,
+            "status": "manual_override",
+            "reason": f"Manual scale override selected 1:{text_scale}.",
+        }
     else:
-        text_scale = scale if scale is not None else _detect_scale(doc, page_index)
+        text_scale = scale if scale is not None else detected_scale
+        if scale is not None:
+            result.scale_audit = {
+                **scale_audit,
+                "chosen_scale": scale,
+                "status": "provided_override",
+                "reason": f"Caller-provided scale selected 1:{scale}.",
+            }
+    result.scale = text_scale
+    try:
+        (out_dir / f"scale_candidates_p{page_index + 1:02d}.json").write_text(
+            json.dumps(result.scale_audit, indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
 
     # ── face source: deterministic default, optional Gemini election ──────
     fg_src = fg_all
@@ -149,7 +308,7 @@ def extract_slabs_v2(
                        or w[1] > page.rect.height * 0.88]
         ctx = ai_select.SelectionContext(
             page=page, paths=paths, classes=classes, cfg=cfg,
-            content_rect=content, content_area_pt2=content_area,
+            content_rect=content, content_area_pt2=area_ref,
             renderer=rend, fg_all=fg_all, scale=text_scale,
             title_text=" ".join(title_words))
         try:
@@ -159,10 +318,43 @@ def extract_slabs_v2(
             base_ids = (set(election.slab_edge_classes)
                         | set(election.supporting_classes))
             fg_sel, _used, added = planarize.augment_until_closed(
-                paths, base_ids, classes, cfg, content_area)
+                paths, base_ids, classes, cfg, area_ref,
+                content_rect=_boundary_rect)
             if added:
                 election.supporting_classes = sorted(
                     set(election.supporting_classes) | set(added))
+            # face count validation gate
+            if (fg_sel.faces
+                    and len(fg_sel.faces) < cfg.min_faces_for_election):
+                result.warnings.append(
+                    f"face count gate: {len(fg_sel.faces)} faces < "
+                    f"{cfg.min_faces_for_election} — requesting re-election")
+                try:
+                    face_fb = [
+                        f"Your class selection produced only "
+                        f"{len(fg_sel.faces)} closed faces. A structural "
+                        f"slab plan typically has 20-100+ faces. Your "
+                        f"selected classes (slab_edge="
+                        f"{election.slab_edge_classes}) likely included "
+                        f"wall/annotation lines instead of the structural "
+                        f"slab boundary. Re-examine and select classes "
+                        f"whose lines form closed rectangular regions."]
+                    election2 = ai_select.elect_classes(ctx, face_fb)
+                    base2 = (set(election2.slab_edge_classes)
+                             | set(election2.supporting_classes))
+                    fg_sel2, _, added2 = planarize.augment_until_closed(
+                        paths, base2, classes, cfg, area_ref,
+                        content_rect=_boundary_rect)
+                    if (fg_sel2.faces
+                            and len(fg_sel2.faces) > len(fg_sel.faces)):
+                        fg_sel = fg_sel2
+                        election = election2
+                        if added2:
+                            election.supporting_classes = sorted(
+                                set(election.supporting_classes)
+                                | set(added2))
+                except ai_select.AIError:
+                    pass
             result.election = election
             if cfg.debug_images:
                 rend.step06_elected_classes(paths, classes,
@@ -180,9 +372,24 @@ def extract_slabs_v2(
                 f"all-classes graph")
         result.gemini_calls = ctx.calls_used
 
+    _trace(
+        "ai_class_election",
+        status="used" if result.election else "fallback",
+        gemini_calls=result.gemini_calls,
+        election=(
+            {
+                "slab_edge_classes": result.election.slab_edge_classes,
+                "supporting_classes": result.election.supporting_classes,
+                "warning": result.election.warning,
+            } if result.election else None
+        ),
+        candidate_face_graph=trace_mod.face_graph_stats(fg_src, area_ref),
+        area_reference=area_ref_label,
+    )
+
     if cfg.debug_images:
         rend.faces_numbered(fg_src, "step_07_faces_candidates.png",
-                            content_area_pt2=content_area)
+                            content_area_pt2=area_ref)
 
     # ── deterministic assembly with retry (up to 3 attempts) ─────────────
     _SLAB_MIN_FRAC = 0.10
@@ -190,16 +397,21 @@ def extract_slabs_v2(
     gross, frac = None, 0.0
 
     def _try_assemble(fg):
+        threshold = cfg.min_keep_face_frac * area_ref
+        bg_max = cfg.background_face_max_frac * area_ref
         ids = [f.id for f in fg.faces
-               if f.area_pt2 >= cfg.min_keep_face_frac * content_area]
+               if f.area_pt2 >= threshold
+               and not (f.depth == 0 and f.parent_id is None
+                        and f.area_pt2 > bg_max)]
         if not ids:
             return None, 0.0
         g, _err = planarize.assemble_slab_polygon(
             fg.faces, ids, [],
-            min_component_frac=cfg.min_component_frac)
+            min_component_frac=cfg.min_component_frac,
+            sliver_heal_pt=cfg.sliver_heal_pt)
         if g is None:
             return None, 0.0
-        return g, g.area / max(content_area, 1.0)
+        return g, g.area / max(area_ref, 1.0)
 
     # Attempt 1: elected classes
     gross, frac = _try_assemble(fg_src)
@@ -214,7 +426,7 @@ def extract_slabs_v2(
             gross, frac, fg_src = g2, f2, fg_all
             if cfg.debug_images:
                 rend.faces_numbered(fg_src, "step_07_faces_candidates.png",
-                                    content_area_pt2=content_area)
+                                    content_area_pt2=area_ref)
 
     # Attempt 3: re-call Gemini with feedback
     if (gross is None or frac < _SLAB_MIN_FRAC) and use_ai and ctx:
@@ -232,7 +444,8 @@ def extract_slabs_v2(
             base2 = (set(election2.slab_edge_classes)
                      | set(election2.supporting_classes))
             fg_sel2, _, _ = planarize.augment_until_closed(
-                paths, base2, classes, cfg, content_area)
+                paths, base2, classes, cfg, area_ref,
+                content_rect=_boundary_rect)
             if fg_sel2.faces:
                 g3, f3 = _try_assemble(fg_sel2)
                 if g3 is not None and f3 > frac:
@@ -245,22 +458,162 @@ def extract_slabs_v2(
                             election2.supporting_classes)
                         rend.faces_numbered(
                             fg_src, "step_07_faces_candidates.png",
-                            content_area_pt2=content_area)
+                            content_area_pt2=area_ref)
             result.gemini_calls = ctx.calls_used
         except Exception as e:
             result.warnings.append(f"attempt 3 (re-elect) failed: {e}")
+
+    no_fill_boundary_audit = None
+    if (
+        (gross is None or frac < _SLAB_MIN_FRAC)
+        and role_audit.get("role") == "geometry_plan"
+        and viewport_audit.get("status") == "detected"
+    ):
+        try:
+            no_fill_poly, no_fill_boundary_audit = (
+                plan_viewport.assemble_irregular_no_fill_slab_boundary(
+                    paths, viewport_rect, area_ref,
+                    snap_grid=getattr(cfg, "snap_grid_pt", 0.05))
+            )
+            try:
+                plan_viewport.write_no_fill_irregular_artifacts(
+                    page, rend, Path(out_dir), page_index + 1,
+                    no_fill_poly, viewport_rect, no_fill_boundary_audit)
+            except Exception:
+                pass
+            if no_fill_poly is None:
+                # Keep the older four-side resolver as a narrow fallback for
+                # simple rectangular no-fill sheets.  The richer v2 audit stays
+                # nested so the failure reason remains traceable.
+                v2_audit = no_fill_boundary_audit
+                no_fill_poly, v1_audit = (
+                    plan_viewport.assemble_no_fill_slab_boundary(
+                        paths, viewport_rect, area_ref)
+                )
+                no_fill_boundary_audit = {
+                    "schema": "no_fill_slab_boundary_combined_v1",
+                    "status": (
+                        "verified" if no_fill_poly is not None
+                        else "unresolved"
+                    ),
+                    "primary_v2": v2_audit,
+                    "fallback_v1": v1_audit,
+                    "reason": (
+                        "v2 unresolved; v1 rectangular fallback accepted"
+                        if no_fill_poly is not None
+                        else "v2 and v1 no-fill resolvers unresolved"
+                    ),
+                }
+            if no_fill_poly is not None:
+                gross = no_fill_poly
+                frac = gross.area / max(area_ref, 1.0)
+                result.warnings.append(
+                    "no-fill GA boundary resolver accepted a slab boundary "
+                    "from closed vector outline evidence")
+                try:
+                    plan_viewport.write_slab_boundary_failure_artifacts(
+                        page, rend, Path(out_dir), page_index + 1, gross,
+                        viewport_rect, no_fill_boundary_audit)
+                except Exception:
+                    pass
+                _trace(
+                    "no_fill_slab_boundary",
+                    "accepted",
+                    slab_fraction_of_area_ref=round(frac, 6),
+                    audit=no_fill_boundary_audit,
+                    gross_geometry=trace_mod.geometry_summary(gross),
+                )
+            else:
+                _trace(
+                    "no_fill_slab_boundary",
+                    "unresolved",
+                    audit=no_fill_boundary_audit,
+                )
+        except Exception as exc:
+            no_fill_boundary_audit = {
+                "schema": "no_fill_slab_boundary_v1",
+                "status": "error",
+                "reason": str(exc),
+            }
+            result.warnings.append(
+                f"no-fill slab boundary resolver failed: {exc}")
+            _trace(
+                "no_fill_slab_boundary",
+                "error",
+                audit=no_fill_boundary_audit,
+            )
 
     if gross is None:
         result.status = "NO_FACES"
         result.warnings.append(
             "all 3 assembly attempts produced no geometry — skipping page")
+        _trace(
+            "assembly",
+            "failed",
+            slab_fraction_of_content=round(frac, 4),
+            slab_fraction_of_area_ref=round(frac, 4),
+            area_reference=area_ref_label,
+            face_graph=trace_mod.face_graph_stats(fg_src, area_ref),
+        )
         _write_result_json(result, out_dir)
+        _write_page_trace({"exit": "NO_FACES_AFTER_ASSEMBLY"})
         return result
 
     if frac < _SLAB_MIN_FRAC:
+        result.status = "NO_EXPORT_TINY_SLAB"
+        boundary_audit = plan_viewport.analyze_slab_boundary_failure(
+            gross, viewport_rect, paths, area_ref)
+        if no_fill_boundary_audit:
+            boundary_audit["no_fill_boundary_audit"] = no_fill_boundary_audit
+        result.slab_readiness = {
+            "status": "blocked",
+            "reason": "tiny_slab_fail_closed",
+            "slab_fraction_of_content": round(
+                float(getattr(gross, "area", 0.0)) / max(content_area, 1.0),
+                6),
+            "slab_fraction_of_area_ref": round(frac, 6),
+            "area_reference": area_ref_label,
+            "plan_viewport": viewport_audit,
+            "boundary_audit": boundary_audit,
+            "min_required_fraction": _SLAB_MIN_FRAC,
+            "warnings": list(result.warnings),
+        }
         result.warnings.append(
-            f"assembled slab covers only {frac:.0%} after 3 attempts — "
-            f"using best result anyway (thà dư chứ đừng thiếu)")
+            f"assembled slab covers only {frac:.0%} after 3 attempts; "
+            "fail-closed and no slab geometry will be exported")
+        try:
+            (Path(out_dir) / f"slab_boundary_candidates_p{page_index + 1:02d}.json").write_text(
+                json.dumps(boundary_audit, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            (Path(out_dir) / f"slab_missing_boundary_sides_p{page_index + 1:02d}.json").write_text(
+                json.dumps(boundary_audit, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            plan_viewport.write_slab_boundary_failure_artifacts(
+                page, rend, Path(out_dir), page_index + 1, gross,
+                viewport_rect, boundary_audit)
+        except Exception:
+            pass
+        _trace(
+            "assembly",
+            "tiny_slab_fail_closed",
+            slab_fraction_of_content=result.slab_readiness.get(
+                "slab_fraction_of_content"),
+            slab_fraction_of_area_ref=round(frac, 6),
+            area_reference=area_ref_label,
+            min_required_fraction=_SLAB_MIN_FRAC,
+            boundary_audit=boundary_audit,
+            face_graph=trace_mod.face_graph_stats(fg_src, area_ref),
+            gross_geometry=trace_mod.geometry_summary(gross),
+        )
+        try:
+            (Path(out_dir) / "slab_readiness_report.json").write_text(
+                json.dumps(result.slab_readiness, indent=2,
+                           ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        _write_result_json(result, out_dir)
+        _write_page_trace({"exit": "NO_EXPORT_TINY_SLAB"})
+        return result
     elif frac > 0.90:
         result.warnings.append(
             f"assembled slab covers {frac:.0%} of the drawing area — may "
@@ -271,10 +624,20 @@ def extract_slabs_v2(
               "polygon_pdf": g, "void_count": 0}
              for j, g in enumerate(parts)]
     result.timings["assembly"] = time.time() - t2
+    _trace(
+        "assembly",
+        duration_s=round(result.timings["assembly"], 3),
+        slab_fraction_of_content=round(
+            float(getattr(gross, "area", 0.0)) / max(content_area, 1.0), 4),
+        slab_fraction_of_area_ref=round(frac, 4),
+        area_reference=area_ref_label,
+        slab_component_count=len(parts),
+        gross_geometry=trace_mod.geometry_summary(gross),
+    )
 
     if cfg.debug_images:
         final_keep_ids = [f.id for f in fg_src.faces
-                          if f.area_pt2 >= cfg.min_keep_face_frac * content_area]
+                          if f.area_pt2 >= cfg.min_keep_face_frac * area_ref]
         rend.step08_assembled_slab(slabs, final_keep_ids)
 
     # ── elements: X-cross openings ────────────────────────────────────────
@@ -282,14 +645,46 @@ def extract_slabs_v2(
     hatch_ids = {c.id for c in classes if c.role == "HATCH"}
     elem_paths = [p for p in paths if p.style_id not in hatch_ids]
     elems, elem_warnings = elements_mod.extract_elements(
-        page, fg_all, cfg, content, content_area, paths=elem_paths,
+        page, fg_all, cfg, content, area_ref, paths=elem_paths,
         scale=text_scale)
+
+    # Per-page fallback: if page has VOID/PENETRATION text but strict
+    # thresholds found nothing, retry with relaxed thresholds.
+    # This ensures Cairns Hospital-style PDFs still detect large voids
+    # while Combined Structural keeps its strict detection.
+    _void_keywords = {"VOID", "PENETRATION", "PENETRATIONS", "OPENING"}
+    page_words = [w[4].strip().upper().rstrip(".")
+                  for w in page.get_text("words")]
+    has_void_text = bool(_void_keywords & set(page_words))
+    void_elems = [e for e in elems if e.type == "VOID"]
+    if has_void_text and not void_elems and cfg.xcross_max_area_frac < 0.10:
+        from dataclasses import replace as _cfg_replace
+        relaxed_cfg = _cfg_replace(cfg, xcross_max_area_frac=0.10)
+        elems_retry, retry_warnings = elements_mod.extract_elements(
+            page, fg_all, relaxed_cfg, content, area_ref,
+            paths=elem_paths, scale=text_scale)
+        new_voids = [e for e in elems_retry if e.type == "VOID"
+                     and e not in elems]
+        if new_voids:
+            elems = elems + new_voids
+            elem_warnings.append(
+                f"per-page fallback: relaxed xcross threshold found "
+                f"{len(new_voids)} additional VOID element(s)")
+
     # keep only openings that intersect a slab
     from shapely.ops import unary_union
     slab_union = unary_union([s["polygon_pdf"] for s in slabs])
     result.elements = [e for e in elems
                        if e.polygon.intersects(slab_union)]
     result.warnings.extend(elem_warnings)
+    _trace(
+        "raw_elements",
+        detected=len(elems),
+        kept=len(result.elements),
+        discarded=len(elems) - len(result.elements),
+        has_void_text=has_void_text,
+        warnings=list(elem_warnings),
+    )
     _to_mm_log = 25.4 / 72.0 * float(text_scale or 100)
     xcross_audit = []
     for e in elems:
@@ -326,6 +721,17 @@ def extract_slabs_v2(
     result.verification = report
     rend.step_dimensions(dims, "step_09b_dimensions.png")
     result.timings["verify"] = time.time() - t3
+    _trace(
+        "dimension_verify",
+        duration_s=round(result.timings["verify"], 3),
+        text_scale=text_scale,
+        scale_used=report.scale_used,
+        scale_precise=round(report.scale_precise, 4) if report.scale_precise else None,
+        scale_consistency=report.scale_consistency,
+        n_dims_detected=len(dims),
+        n_dims_associated=report.n_dims_associated,
+        failure_count=len(report.failures or []),
+    )
 
     final_scale = text_scale
     if cfg.manual_scale:
@@ -352,16 +758,29 @@ def extract_slabs_v2(
         result.warnings.append(
             "scale unverified: no dimension annotations associated")
     result.scale = final_scale
+    _trace(
+        "scale_final",
+        text_scale=text_scale,
+        final_scale=final_scale,
+        manual_scale=cfg.manual_scale,
+    )
 
     result.status = "OK"
 
     # ── columns (text-anchor-then-shape v2; fallback to shape-first v1) ───
+    # Only exclude column candidates from elements that have specific text
+    # evidence (a named label, not just the type name). Raw X-cross detections
+    # without text anchors are unreliable and must not suppress columns.
     column_t0 = time.time()
+    evidenced_elements = [
+        e for e in result.elements
+        if e.label and e.label != e.type
+    ]
     if column_types is not None:
         from src.slab_v2 import columns_v2 as columns_mod
         cols, col_warnings, column_audit = columns_mod.extract_columns_v2(
             page, paths, slab_union, final_scale, column_types, cfg,
-            elements=result.elements,
+            elements=evidenced_elements,
             columns_per_floor_census=columns_per_floor,
             classes=classes, audit_out_dir=Path(out_dir))
         result.columns = cols
@@ -410,6 +829,18 @@ def extract_slabs_v2(
         json.dumps(result.column_detection_report, indent=2,
                    ensure_ascii=False), encoding="utf-8")
     result.timings["columns"] = time.time() - column_t0
+    _trace(
+        "columns",
+        duration_s=round(result.timings["columns"], 3),
+        column_status=column_status,
+        raw_count=len(result.columns),
+        expected_count=sum(expected_rc_columns.values()),
+        detected_counts=detected_column_counts,
+        missing_count=sum(missing_columns.values()),
+        extra_count=sum(extra_columns.values()),
+        ambiguous_count=detected_column_counts.get("C?", 0),
+        candidate_count=len(result.column_candidates or []),
+    )
 
     # Steel is a separate subsystem. RC detection intentionally excludes steel
     # symbols; this stage audits and exports only verified steel geometry.
@@ -440,6 +871,13 @@ def extract_slabs_v2(
             "zero_steel_reason": "Steel source planner was not run.",
         }
     result.timings["steel"] = time.time() - steel_t0
+    _trace(
+        "steel",
+        duration_s=round(result.timings["steel"], 3),
+        member_count=len(result.steel_members or []),
+        candidate_count=len(result.steel_candidates or []),
+        readiness=result.steel_readiness,
+    )
 
     # ── walls: census-aware v2 or WALL-class face fallback ────────────────
     wall_t0 = time.time()
@@ -456,7 +894,7 @@ def extract_slabs_v2(
     elif result.election:
         from src.slab_v2 import wall_extract
         result.walls = wall_extract.extract_walls(
-            page, fg_all, result.election, cfg, content_area, text_scale,
+            page, fg_all, result.election, cfg, area_ref, text_scale,
             column_polys=col_polys)
 
     if wall_source_registry and wall_types is not None:
@@ -527,6 +965,17 @@ def extract_slabs_v2(
         ]
     result.warnings.extend(opening_resolution.warnings)
     result.timings["openings"] = time.time() - opening_t0
+    _trace(
+        "openings",
+        duration_s=round(result.timings["openings"], 3),
+        candidate_count=len(opening_resolution.candidates or []),
+        verified_cut_openings=len(result.verified_cut_openings or []),
+        context_objects=len(result.opening_context_objects or []),
+        review_candidates=len(result.opening_review_candidates or []),
+        resolved_penetrations=len(result.resolved_penetrations or []),
+        judgement=opening_resolution.judgement,
+        report=opening_resolution.report,
+    )
 
     detected_wall_counts = {}
     for w in result.walls:
@@ -561,6 +1010,14 @@ def extract_slabs_v2(
             **base_wall_report,
             "warnings": ["Wall source registry unavailable; shape detector used."],
         }
+    _trace(
+        "walls",
+        duration_s=round(result.timings.get("walls", 0.0), 3),
+        wall_count=len(result.walls or []),
+        detected_counts=detected_wall_counts,
+        readiness=result.wall_readiness,
+        detection_report=result.wall_detection_report,
+    )
 
     if cfg.debug_images:
         if not (Path(out_dir) / "step_09c_opening_candidates.png").exists():
@@ -668,10 +1125,58 @@ def extract_slabs_v2(
         "reason": floor_resolution.reason,
         "warnings": floor_resolution.warnings,
     }
+    quality_warnings = []
+    try:
+        if frac is not None and float(frac) < 0.03:
+            quality_warnings.append(
+                f"QA gate: slab covers only {float(frac):.1%} of content; "
+                "floor/slab readiness forced to review.")
+    except Exception:
+        pass
+    if any("using best result anyway" in str(w).lower()
+           or "covers only 1%" in str(w).lower()
+           or "covers only 2%" in str(w).lower()
+           for w in result.warnings):
+        quality_warnings.append(
+            "QA gate: tiny slab fallback warning detected; "
+            "floor/slab readiness forced to review.")
+    if quality_warnings:
+        floor_resolution.status = "review"
+        merged = list(floor_resolution.warnings or [])
+        for warning in quality_warnings:
+            if warning not in merged:
+                merged.append(warning)
+            if warning not in result.warnings:
+                result.warnings.append(warning)
+        floor_resolution.warnings = merged
+        result.floor_system_readiness["status"] = "review"
+        result.floor_system_readiness["warnings"] = merged
+        result.slab_readiness["status"] = "review"
+        result.slab_readiness["warnings"] = merged
+        _trace("quality_gate", "review", warnings=quality_warnings,
+               slab_fraction_of_content=frac)
     result.warnings.extend(floor_resolution.warnings)
     result.gemini_calls += sum((Path(out_dir) / name).exists() for name in (
         "step_08b_floor_system_profile_raw.txt",
         "step_08c_floor_system_judge_raw.txt"))
+    _trace(
+        "floor_system",
+        candidate_count=len(floor_candidates or []),
+        floor_system_status=floor_resolution.status,
+        confidence=floor_resolution.confidence,
+        pt_slab_ids=floor_resolution.pt_slab_ids,
+        other_floor_ids=floor_resolution.other_floor_ids,
+        opening_ids=floor_resolution.opening_ids,
+        unknown_ids=floor_resolution.unknown_ids,
+        reason=floor_resolution.reason,
+        warnings=floor_resolution.warnings,
+        pt_gross_geometry=trace_mod.geometry_summary(
+            floor_resolution.pt_gross_geometry),
+        pt_net_geometry=trace_mod.geometry_summary(
+            floor_resolution.pt_net_geometry),
+        other_floor_geometry=trace_mod.geometry_summary(
+            floor_resolution.other_floor_geometry),
+    )
 
     resolved_parts = [g for g in getattr(
         floor_resolution.pt_gross_geometry, "geoms",
@@ -744,7 +1249,14 @@ def extract_slabs_v2(
     if cfg.debug_images:
         rend.step10_final(slabs, result.verified_cut_openings)
     result.timings["total"] = time.time() - t0
+    _trace(
+        "final_page",
+        total_s=round(result.timings["total"], 3),
+        counts=trace_mod.result_counts(result),
+        statuses=trace_mod.report_statuses(result),
+    )
     _write_result_json(result, out_dir)
+    _write_page_trace({"exit": "OK"})
     return result
 
 
@@ -767,6 +1279,9 @@ def _write_result_json(result: SlabV2Result, out_dir: Path) -> None:
         "page_number": result.page_index + 1,
         "status": result.status,
         "scale": result.scale,
+        "scale_audit": result.scale_audit,
+        "page_role_classification": result.page_role_classification,
+        "plan_viewport": result.plan_viewport,
         "gemini_calls": result.gemini_calls,
         "warnings": result.warnings,
         "timings_s": {k: round(v_, 2) for k, v_ in result.timings.items()},

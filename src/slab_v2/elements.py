@@ -188,7 +188,7 @@ def extract_elements(
 
     _PT_TO_MM_e = 25.4 / 72.0
     _to_mm_e = _PT_TO_MM_e * (scale or 100)
-    _MIN_SIDE_MM = 200.0
+    _MIN_SIDE_MM = 300.0
     _min_side_pt = _MIN_SIDE_MM / _to_mm_e
 
     max_area = cfg.xcross_max_area_frac * content_area_pt2

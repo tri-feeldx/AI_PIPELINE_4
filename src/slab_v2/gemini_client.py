@@ -77,6 +77,7 @@ def call_gemini_json(
     placed before the prompt text. Returns the parsed JSON dict.
     Raises RuntimeError on empty/invalid response.
     """
+    import hashlib
     import json
     import time
     from google.genai import types
@@ -88,6 +89,12 @@ def call_gemini_json(
     contents = [types.Part.from_bytes(data=b, mime_type="image/png")
                 for b in images]
     contents.append(prompt)
+
+    _h = hashlib.sha256(prompt.encode("utf-8"))
+    for b in images:
+        _h.update(len(b).to_bytes(8, "big"))
+        _h.update(b[:256])
+    content_hex = _h.hexdigest()[:16]
 
     sem = _gemini_semaphore
     if sem:
@@ -102,6 +109,7 @@ def call_gemini_json(
                     contents=contents,
                     config=types.GenerateContentConfig(
                         temperature=0,
+                        top_k=1,
                         seed=0,
                         response_mime_type="application/json",
                         response_schema=response_schema,
@@ -131,7 +139,8 @@ def call_gemini_json(
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as fh:
             fh.write(f"\n{'=' * 70}\n[{tag}] model={model_name} "
-                     f"images={len(images)}\n{'-' * 70}\nPROMPT:\n{prompt}\n"
+                     f"images={len(images)} content_hash={content_hex}\n"
+                     f"{'-' * 70}\nPROMPT:\n{prompt}\n"
                      f"{'-' * 70}\nRESPONSE:\n{raw}\n")
 
     if not raw.strip():

@@ -379,9 +379,12 @@ def analyze_document(pdf_path: str,
         for f in b.floors:
             wd = _match_col_data(wall_buildings, b.name, f.level_name,
                                  f.level_id)
-            # Gemini wall census is ground truth for which walls belong
-            # to each floor.  Page text only validates presence within
-            # the census scope — it must not add walls the census omits.
+            # Gemini wall census is the contract/count authority for which
+            # walls belong to each floor. Page text is still useful audit
+            # evidence for under/over/reference-only labels, but it must not
+            # erase expected wall counts. The downstream contract reconciler
+            # will export only candidates with real vector geometry and will
+            # report any missing/non-drawable walls.
             census_walls = wd.get("walls", {}) if wd else {}
             local_walls: dict[str, int] = {}
             search_symbols = set(res.wall_types) | set(census_walls)
@@ -403,8 +406,14 @@ def analyze_document(pdf_path: str,
                 local_walls[symbol] = 1 if re.match(
                     r"^(?:LW|W)\d+$", symbol.upper()) else current_count
 
-            f.walls = local_walls
-            f.total_walls = sum(local_walls.values())
+            f.walls = dict(census_walls or local_walls)
+            total_walls = 0
+            for value in f.walls.values():
+                try:
+                    total_walls += int(round(float(value)))
+                except Exception:
+                    pass
+            f.total_walls = total_walls
             scoped_refs = {
                 symbol: counts for symbol, counts in scope_evidence.items()
                 if counts.get("under_only") or counts.get("over_only")
@@ -420,7 +429,8 @@ def analyze_document(pdf_path: str,
             if wd and census_walls != local_walls:
                 res.warnings.append(
                     f"{b.name}/{f.level_id}: wall census reconciled with "
-                    "drawing-zone vertical-scope evidence")
+                    "drawing-zone vertical-scope evidence; Gemini wall "
+                    "counts remain the contract authority")
 
     # Save merged JSON
     with open(out_root / "doc_analysis.json", "w", encoding="utf-8") as fh:

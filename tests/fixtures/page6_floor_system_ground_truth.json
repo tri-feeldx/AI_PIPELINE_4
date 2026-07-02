@@ -1,0 +1,14 @@
+{
+  "source": "Structural.pdf page 6 vector boundaries",
+  "baseline_gross_area_m2": 401.1315777631173,
+  "expected_pt_area_m2": 371.2445747079302,
+  "area_tolerance_fraction": 0.01,
+  "minimum_component_iou": 0.85,
+  "other_floor_components_pdf_pts": [
+    [[416.78, 911.16], [467.78, 911.16], [467.78, 1146.48], [416.78, 1146.48], [416.78, 911.16]],
+    [[1371.98, 911.16], [1423.10, 911.16], [1423.10, 1146.24], [1371.98, 1146.24], [1371.98, 911.16]]
+  ],
+  "expected_prevented_overcut_m2": 10.812126518115377,
+  "expected_opening_labels": ["STAIR 04", "STAIR 05", "CORE/SHAFT", "CORE/SHAFT", "CORE/SHAFT"],
+  "forbidden_opening_labels": ["FB", "FLOOR BOX"]
+}

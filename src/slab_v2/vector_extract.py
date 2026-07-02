@@ -244,12 +244,32 @@ def extract_paths(
         if bw * bh >= cfg.frame_area_frac * page_area and len(ids) <= 6:
             sc.role = "FRAME"
             sc.role_confidence = 0.9
+        # slab edge fingerprint: dark solid stroke, medium+ weight, top-3
+        elif (cid <= 2
+              and key.stroke is not None
+              and max(key.stroke) <= 0.3
+              and key.fill is None
+              and not key.dashes
+              and key.width >= 0.5):
+            sc.role = "SLAB_EDGE"
+            sc.role_confidence = 0.75
         # hatch fingerprint: fill-only, many micro-segments
         elif (key.fill is not None and key.stroke is None
               and n_segs > 500 and median < 1.0):
             sc.role = "HATCH"
             sc.role_confidence = 0.85
             sc.prefiltered = True
+        # Revit column fingerprint: solid dark stroke, no fill, medium weight
+        elif (key.stroke is not None and max(key.stroke) <= 0.15
+              and key.fill is None and not key.dashes
+              and 0.9 <= key.width <= 1.5):
+            sc.role = "COLUMN"
+            sc.role_confidence = 0.70
+        # annotation fingerprint: thin + (dashed or colored)
+        elif (key.stroke is not None and key.width <= 0.5
+              and (key.dashes or max(key.stroke) > 0.5)):
+            sc.role = "ANNOTATION"
+            sc.role_confidence = 0.65
         for pid in ids:
             paths[pid].style_id = cid
         classes.append(sc)

@@ -185,6 +185,12 @@ def elect_classes(ctx: SelectionContext,
         (Path(ctx.renderer.out_dir) / "step_05_prompt_round1_legend.png"
          ).write_bytes(images[2])
 
+    # capture fingerprinted SLAB_EDGE ids before Gemini overwrites roles
+    fingerprinted_slab_ids = {
+        c.id for c in candidates
+        if c.role == "SLAB_EDGE" and c.role_confidence >= 0.70
+    }
+
     data = ctx.call(_round1_prompt(ctx, candidates, feedback), images,
                     _ROUND1_SCHEMA, tag="round1_class_election")
 
@@ -204,8 +210,29 @@ def elect_classes(ctx: SelectionContext,
             by_id[cid].role = r.get("role", "OTHER")
             by_id[cid].role_confidence = float(r.get("confidence") or 0.0)
 
+    # deterministic anchor: fingerprinted SLAB_EDGE always included
+    for fid in fingerprinted_slab_ids:
+        if fid not in slab_ids:
+            slab_ids.insert(0, fid)
+
     if not slab_ids:
         raise AIError("Round 1: model returned no valid slab_edge_classes")
+
+    # deterministic fallback: too many slab_edge classes → filter by style
+    max_slab = getattr(ctx.cfg, "max_slab_edge_classes", 2)
+    if len(slab_ids) > max_slab:
+        filtered = [sid for sid in slab_ids
+                    if by_id[sid].key.stroke is not None
+                    and max(by_id[sid].key.stroke) <= 0.3
+                    and not by_id[sid].key.dashes
+                    and by_id[sid].key.width >= 0.5]
+        if filtered:
+            if len(filtered) > max_slab:
+                filtered.sort(key=lambda sid: -by_id[sid].total_length_pt)
+                filtered = filtered[:max_slab]
+            dropped = [s for s in slab_ids if s not in filtered]
+            supp_ids = dropped + supp_ids
+            slab_ids = filtered
 
     # coverage check: low coverage is a WARNING, not a failure — the greedy
     # class augmentation in the pipeline can still close the real boundary

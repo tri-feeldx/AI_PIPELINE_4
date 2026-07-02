@@ -38,6 +38,18 @@ class SlabV2Config:
     max_polygonize_segments: int = 200_000
     """Safety cap on segment count fed to shapely (A1 sheets stay well under)."""
 
+    use_content_boundary: bool = True
+    """Inject content_rect edges to close open slab boundaries at page edges
+    (common in multi-sheet structural plans where the slab continues on
+    another drawing)."""
+
+    content_boundary_proximity_pt: float = 3.0
+    """Max distance (pt) from content_rect edge for a segment endpoint to
+    count as 'touching' the boundary."""
+
+    content_boundary_min_touches: int = 2
+    """Minimum endpoint count near an edge before that edge is injected."""
+
     # ── Stage C: AI selection ─────────────────────────────────────────────────
     gemini_model: str = ""
     """Override Gemini model name; empty = GEMINI_MODEL env or gemini-2.5-flash."""
@@ -53,6 +65,14 @@ class SlabV2Config:
     min_class_coverage_frac: float = 0.30
     """Round-1 validation: elected slab-edge classes must jointly cover at
     least this fraction of the content rect bbox."""
+
+    max_slab_edge_classes: int = 2
+    """If Gemini selects more than this many slab_edge_classes, the
+    deterministic fallback filter keeps only dark solid classes."""
+
+    min_faces_for_election: int = 10
+    """If elected classes produce fewer faces than this, re-elect with
+    feedback about the low face count."""
 
     min_area_frac: float = 0.05
     max_area_frac: float = 0.90
@@ -114,14 +134,25 @@ class SlabV2Config:
     fraction of the largest component are dropped (stray column boxes,
     symbols) while detached slab pads/wings are kept ("đừng thiếu")."""
 
+    background_face_max_frac: float = 0.50
+    """Depth-0 faces (no parent) covering more than this fraction of the
+    content area are background (space between building outline and
+    drawing border) and excluded from slab assembly."""
+
+    sliver_heal_pt: float = 0.5
+    """Buffer distance for closing micro-slivers between adjacent faces.
+    Gaps narrower than 2× this value are sealed; genuine holes (shafts,
+    stairs) are preserved."""
+
     element_max_area_frac: float = 0.15
     """An element footprint (stair/lift/shaft) larger than this fraction of
     the content area is considered a mis-anchor and skipped with a warning."""
 
-    xcross_max_area_frac: float = 0.10
+    xcross_max_area_frac: float = 0.04
     """X-cross opening candidates (rect with corner-to-corner diagonals)
-    must be at most this fraction of the content area — large shaft voids
-    can reach ~8% on dense pages."""
+    must be at most this fraction of the content area — shafts are small;
+    anything bigger is a drawing region, never an opening.
+    Per-page fallback raises this to 0.10 when VOID text evidence exists."""
 
     xcross_min_area_frac: float = 0.0002
     """Merged X-cross footprints smaller than this fraction of the content
@@ -288,12 +319,46 @@ class SlabV2Config:
     batch processing.  Gross slab geometry (Round 1 + deterministic assembly)
     is unaffected.  Re-run with speed_mode=False for pages needing review."""
 
+    fast_disable_page_ai: bool = False
+    """When True, skip per-page Gemini slab class election and use the
+    deterministic vector/fill pipeline only. This is intended for first-pass
+    batch scans; review pages can be re-run in accurate mode."""
+
     debug_images: bool = True
     """When False, skip non-essential debug images (step_00, step_03-11).
     Prompt images (step_01, step_02) are always generated for Gemini."""
+
+    trace_level: str = "full"
+    """Pipeline flight-recorder verbosity: off, summary, full, or forensic.
+    The trace is observational only and must not affect geometry decisions."""
 
     # ── Output ────────────────────────────────────────────────────────────────
     debug_dir: str = "debug_slab_v2"
     debug_dpi: int = 150
     save_prompt_images: bool = True
     """Write the byte-identical images sent to Gemini into the debug folder."""
+
+    debug_export_verified_only: bool = True
+    """When the model readiness is DEBUG, export only geometry that has local
+    verification. Review/backfilled geometry stays in audit JSON instead of
+    being drawn as if it were final."""
+
+    debug_export_shape_fallback_rc_columns: bool = False
+    """Allow unlabeled shape-fallback RC columns in DEBUG exports. Default is
+    False because these are the most common source of misleading white blocks
+    on unfamiliar PDFs."""
+
+    debug_export_cross_floor_recovered_rc_columns: bool = False
+    """Allow cross-floor recovered RC columns in DEBUG exports. Default is
+    False because recovery is useful audit evidence but can look authoritative
+    when the page-level column assignment is still in review."""
+
+    export_all_detected_steel: bool = True
+    """DEBUG steel export mode. When True, export all steel members that have
+    real plan geometry and are not dashed/reference-only, even if their
+    profile/detail verification is incomplete. The Ruby header marks these as
+    an unverified steel debug export."""
+
+    export_foundations: bool = False
+    """Export foundation/pile-like solids. Disabled by default until the
+    foundation subsystem has its own verified gate."""

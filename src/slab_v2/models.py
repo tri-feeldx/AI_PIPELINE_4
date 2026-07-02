@@ -546,6 +546,13 @@ class SlabV2Result:
     floor_system_resolution: Optional[FloorSystemResolution] = None
     other_floor_systems: list = field(default_factory=list)
     floor_system_readiness: dict = field(default_factory=dict)
+    drawing_contract: dict = field(default_factory=dict)
+    contract_reconciliation: dict = field(default_factory=dict)
+    contract_export_decisions: dict = field(default_factory=dict)
+    candidate_registry: list = field(default_factory=list)
+    scale_audit: dict = field(default_factory=dict)
+    page_role_classification: dict = field(default_factory=dict)
+    plan_viewport: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     scale: Optional[float] = None           # nominal int or precise float
     attempts: int = 0

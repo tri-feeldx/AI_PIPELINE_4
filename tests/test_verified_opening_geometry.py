@@ -54,7 +54,7 @@ def test_core_envelope_is_context_and_only_interior_faces_are_openings():
         walls, raw, page, page.rect, box(0, 0, 500, 500), 100,
         SlabV2Config(debug_images=False))
     context = candidates[0]
-    assert context["id"] == "core_lw_wall_enclosed"
+    assert context["id"] == "core_lw_wall_enclosed_0"
     assert context["destructive_allowed"] is False
     assert context["default_action"] == "exclude"
     assert len(defaults) == 3
@@ -131,7 +131,7 @@ def test_p8_golden_core_faces_are_independent_and_envelope_is_never_cut():
         walls, raw, page, page.rect, box(0, 0, 1600, 1400), 100,
         SlabV2Config(debug_images=False))
     context = next(candidate for candidate in candidates
-                   if candidate["id"] == "core_lw_wall_enclosed")
+                   if candidate["id"] == "core_lw_wall_enclosed_0")
     assert context["destructive_allowed"] is False
     assert all(abs(actual - expected) < 0.01 for actual, expected in zip(
         context["polygon"].bounds, fixture["core_context_bbox"]))
@@ -176,9 +176,10 @@ def test_isolated_xcross_is_verified_from_slab_penetration_legend():
     doc.close()
 
 
-def test_isolated_xcross_without_legend_stays_review_and_does_not_cut():
+def test_isolated_xcross_near_stair_without_legend_stays_review_and_does_not_cut():
     doc = fitz.open()
     page = doc.new_page(width=500, height=500)
+    page.insert_text((210, 195), "STAIR")
     element = _element((200, 200, 225, 215))
     candidates, defaults, _warnings = _raw_candidates(
         [element], [], page, page.rect, box(50, 50, 450, 450), 100,
