@@ -122,11 +122,45 @@ def find_legend_rect(page: fitz.Page) -> fitz.Rect:
     return fitz.Rect(pw * 0.75, 0, pw, ph)
 
 
+def _title_block_divider_x(page: fitz.Page) -> float | None:
+    """Leftmost full-height vertical line in the right strip of the sheet —
+    the divider between the plan area and the title block."""
+    pw, ph = page.rect.width, page.rect.height
+    best = None
+    for d in page.get_drawings():
+        for item in d["items"]:
+            if item[0] != "l":
+                continue
+            a, b = item[1], item[2]
+            if abs(a.x - b.x) > 1.0:            # not vertical
+                continue
+            if abs(a.y - b.y) < ph * 0.7:       # not full height
+                continue
+            x = (a.x + b.x) / 2.0
+            if pw * 0.70 <= x <= pw * 0.98:
+                best = x if best is None else min(best, x)
+    return best
+
+
 def find_drawing_content_rect(page: fitz.Page, legend_rect: fitz.Rect) -> fitz.Rect:
     pw, ph   = page.rect.width, page.rect.height
     border_x = pw * 0.03
     border_y = ph * 0.03
-    return fitz.Rect(border_x, border_y, legend_rect.x0 - 4, ph - border_y)
+    right    = pw - border_x
+    # the legend only bounds the content when it really is a right-side
+    # panel; a LEGEND block at the bottom-left must not cut the x-axis
+    # (that produced an inverted rect on GA sheets and fail-closed pages)
+    if legend_rect is not None and legend_rect.x0 > pw * 0.55 \
+            and legend_rect.x1 >= pw * 0.9:
+        right = legend_rect.x0 - 4
+    else:
+        divider = _title_block_divider_x(page)
+        if divider is not None:
+            right = divider - 4
+    rect = fitz.Rect(border_x, border_y, right, ph - border_y)
+    if rect.x1 <= rect.x0 or rect.y1 <= rect.y0:
+        rect = fitz.Rect(border_x, border_y, pw - border_x, ph - border_y)
+    return rect
 
 
 def render_crop(page: fitz.Page, clip_rect: fitz.Rect, dpi: int) -> tuple:
