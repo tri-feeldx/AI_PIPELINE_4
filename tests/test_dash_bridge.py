@@ -78,6 +78,48 @@ def test_parallel_dash_pairs_do_not_ladder():
         assert abs(a[1] - b[1]) < 0.1, f"cross-pair rung bridged: {a}->{b}"
 
 
+class TestAdaptiveTolerance:
+    """Robustness rule: thresholds derive from the page's own statistics.
+    The bridge tolerance must come from the measured free-endpoint gap
+    distribution of each style class, so solid-line sets never bridge and
+    any dash rhythm (2.2pt, 4.5pt, ...) bridges itself — no per-file
+    tuning."""
+
+    def test_dashed_class_gets_tolerance_above_its_gap(self):
+        from src.slab_v2.planarize import _adaptive_bridge_tol
+        segs = _dashed_rect(dash=6.0, gap=3.0)
+        tol = _adaptive_bridge_tol(segs, cap=8.0)
+        assert 3.0 <= tol <= 8.0
+
+    def test_solid_lines_get_zero_tolerance(self):
+        from src.slab_v2.planarize import _adaptive_bridge_tol
+        # four long solid lines, ends 50+ pt apart — nothing dash-like
+        segs = [((0, 0), (100, 0)), ((0, 60), (100, 60)),
+                ((200, 0), (300, 0)), ((200, 60), (300, 60))]
+        assert _adaptive_bridge_tol(segs, cap=8.0) == 0.0
+
+    def test_cap_is_respected(self):
+        from src.slab_v2.planarize import _adaptive_bridge_tol
+        segs = _dashed_rect(dash=6.0, gap=7.0)   # gaps larger than cap
+        assert _adaptive_bridge_tol(segs, cap=5.0) <= 5.0
+
+    def test_collect_segments_closes_dashed_rect_end_to_end(self):
+        from unittest.mock import MagicMock
+        from src.slab_v2.planarize import _collect_segments, _polygonize
+        paths = []
+        for i, seg in enumerate(_dashed_rect()):
+            p = MagicMock()
+            p.style_id = 7
+            p.outside_content = False
+            p.has_stroke = True
+            p.fill_polygon = None
+            p.segments = [seg]
+            paths.append(p)
+        segs = _collect_segments(paths, {7}, dash_bridge_tol_pt=8.0)
+        polys, _, _ = _polygonize(segs, snap_grid=0.05)
+        assert polys and max(p.area for p in polys) > 0.9 * 100 * 80
+
+
 def test_bridge_is_mutual_nearest_only():
     # three collinear free points: A(0,0)-B(2,0) mutual; C(5,0) nearest to B
     # but B is taken -> C stays free (no chain bridging)

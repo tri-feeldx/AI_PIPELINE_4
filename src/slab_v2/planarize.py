@@ -106,10 +106,62 @@ def _collect_segments(paths: list[VectorPath], style_ids: set[int],
         segments.extend(collinear)
         if dash_bridge_tol_pt > 0:
             # corner/junction gaps are not collinear; close them by joining
-            # mutually-nearest free endpoints of the same class
-            segments.extend(
-                _bridge_endpoints(segs + collinear, dash_bridge_tol_pt))
+            # mutually-nearest free endpoints of the same class. The
+            # tolerance is derived from this class's own gap statistics
+            # (cap = config), so solid-line classes never bridge.
+            tol = _adaptive_bridge_tol(segs + collinear,
+                                       cap=dash_bridge_tol_pt)
+            if tol > 0:
+                segments.extend(_bridge_endpoints(segs + collinear, tol))
     return segments
+
+
+def _adaptive_bridge_tol(segs: list, cap: float) -> float:
+    """Bridge tolerance from the class's own free-endpoint gap histogram.
+
+    Gap candidates = nearest-free-endpoint distance of every free endpoint.
+    Dash rhythms show up as a dense small-gap cluster (2.2/4.5pt measured
+    on Revit GA exports); tol = p90 of the candidates <= cap. Solid-line
+    classes have only large end-to-end distances -> no cluster -> 0.
+    """
+    import math
+    from collections import Counter
+
+    def key(p):
+        return (round(p[0], 3), round(p[1], 3))
+
+    cnt = Counter()
+    for a, b in segs:
+        cnt[key(a)] += 1
+        cnt[key(b)] += 1
+    free = [p for p, c in cnt.items() if c == 1]
+    if len(free) < 4:
+        return 0.0
+
+    cell = max(cap, 1e-6)
+    grid: dict[tuple, list] = {}
+    for p in free:
+        grid.setdefault((int(p[0] // cell), int(p[1] // cell)), []).append(p)
+    gaps = []
+    for p in free:
+        cx, cy = int(p[0] // cell), int(p[1] // cell)
+        best = None
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for q in grid.get((gx, gy), ()):
+                    if q == p:
+                        continue
+                    d = math.hypot(p[0] - q[0], p[1] - q[1])
+                    if d > 1e-9 and (best is None or d < best):
+                        best = d
+        if best is not None and best <= cap:
+            gaps.append(best)
+    # a real dash rhythm leaves gaps at MOST free endpoints; scattered
+    # coincidences on solid-line classes must not enable bridging
+    if len(gaps) < max(4, 0.3 * len(free)):
+        return 0.0
+    gaps.sort()
+    return min(gaps[int(0.9 * (len(gaps) - 1))] + 0.5, cap)
 
 
 def _bridge_endpoints(segs: list, tol_pt: float,
