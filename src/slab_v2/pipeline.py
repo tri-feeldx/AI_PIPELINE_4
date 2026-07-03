@@ -771,6 +771,26 @@ def extract_slabs_v2(
         e for e in result.elements
         if e.label and e.label != e.type
     ]
+    if column_types is None:
+        # deterministic source: the sheet's own CONCRETE COLUMN SCHEDULE
+        # (Gemini census, when present, still takes precedence upstream)
+        try:
+            from src.slab_v2 import schedule_parser
+            from src.slab_v2.models import ColumnType as _CT
+            _sched = schedule_parser.parse_schedules(page)
+            if _sched.columns:
+                column_types = {}
+                for mark, ct in _sched.columns.items():
+                    w, d = ct.size_mm or (ct.diameter_mm or 0,
+                                          ct.diameter_mm or 0)
+                    column_types[mark] = _CT(
+                        symbol=mark, width_mm=w, depth_mm=d,
+                        material=ct.material)
+                result.warnings.append(
+                    "column types from on-page schedule: "
+                    f"{sorted(column_types)}")
+        except Exception as exc:               # noqa: BLE001
+            result.warnings.append(f"on-page schedule parse failed: {exc}")
     if column_types is not None:
         from src.slab_v2 import columns_v2 as columns_mod
         cols, col_warnings, column_audit = columns_mod.extract_columns_v2(

@@ -55,6 +55,39 @@ class TestSchedules2381P17:
             assert sched.walls[mark].thickness_mm == t, mark
 
 
+PDF_SMPS = Path(r"C:\Users\LENOVO\Downloads"
+                r"\2402. South Melbourne Primary School - CIVIL & STR - 260610.pdf")
+
+
+@pytest.mark.skipif(not PDF_SMPS.exists(), reason="SMPS PDF not present")
+class TestSchedulesSMPSP9:
+    """SMPS uses a different (equally standard) schedule format:
+    'MARK:' headers with colon, marks C2/CC1/SC1, STEEL COLUMN SCHEDULE
+    with section strings (250UC90, 125x6.0 SHS) and a CONCRETE COLUMN
+    SCHEDULE with real bar callouts (8N20, R10-300).  One parser must
+    read both this and the 2381 format — no per-file branches."""
+
+    @pytest.fixture(scope="class")
+    def sched(self):
+        doc = fitz.open(str(PDF_SMPS))
+        return parse_schedules(doc[8])  # p9 GROUND FLOOR SLAB PLAN
+
+    def test_steel_columns_found(self, sched):
+        steel = {m: c for m, c in sched.columns.items()
+                 if c.material == "STEEL"}
+        for mark, section in [("C2", "250UC90"), ("C3", "200UC52"),
+                              ("C4", "125x6.0 SHS"), ("SC1", "114.3x5.4 CHS")]:
+            assert mark in steel, sorted(steel)
+            assert steel[mark].section == section, steel[mark]
+
+    def test_concrete_column_with_bars(self, sched):
+        cc1 = sched.columns.get("CC1")
+        assert cc1 is not None and cc1.material == "RC"
+        assert cc1.diameter_mm == 450
+        assert cc1.main_bars == "8N20"
+        assert cc1.ligatures == "R10-300"
+
+
 def test_rebar_mass_from_rate():
     from src.slab_v2.schedule_parser import ColumnType
     c = ColumnType(mark="C-A1", size_mm=(450, 1200),
