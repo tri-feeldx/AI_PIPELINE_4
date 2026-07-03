@@ -897,6 +897,25 @@ def extract_slabs_v2(
     # ── walls: census-aware v2 or WALL-class face fallback ────────────────
     wall_t0 = time.time()
     col_polys = [c.polygon for c in result.columns] if result.columns else None
+    if wall_types is None:
+        # deterministic source: the sheet's own WALL SCHEDULE (same rule
+        # as columns — Gemini census, when present, wins upstream)
+        try:
+            from src.slab_v2 import schedule_parser as _sp
+            from src.slab_v2.models import WallType as _WT
+            _wsched = _sp.parse_schedules(page)
+            if _wsched.walls:
+                wall_types = {
+                    mark: _WT(symbol=mark,
+                              thickness_mm=float(wt.thickness_mm or 0),
+                              material=wt.description)
+                    for mark, wt in _wsched.walls.items()}
+                result.warnings.append(
+                    "wall types from on-page schedule: "
+                    f"{sorted(wall_types)}")
+        except Exception as exc:               # noqa: BLE001
+            result.warnings.append(
+                f"on-page wall schedule parse failed: {exc}")
     if wall_types is not None:
         from src.slab_v2 import walls_v2
         result.walls, wall_warns = walls_v2.extract_walls_v2(
