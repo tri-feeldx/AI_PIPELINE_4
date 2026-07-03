@@ -506,6 +506,8 @@ class HeightReconciliation:
 class SlabV2Result:
     page_index: int                         # 0-based
     status: str = "OK"                      # OK | VERIFY_FAILED | NO_FACES | AI_ERROR | NO_AI
+    zones: list = field(default_factory=list)  # [(rl_m, polygon), ...] when split
+    zone_split_audit: dict = field(default_factory=dict)  # source, count, confidence
     slabs: list = field(default_factory=list)
     # each: {"label": str, "polygon_pdf": Polygon, "polygon_mm": Polygon|None,
     #        "area_m2": float|None, "void_count": int}

@@ -186,6 +186,9 @@ class SlabV2Config:
     """Search radius for VOID text → face association. Wider than default
     80pt because VOID labels can be further from the opening."""
 
+    enable_zone_split: bool = True
+    """Partition split-deck slabs by RL zones when ARCH pair is available."""
+
     slab_thickness_mm: float = 200.0
     """Extrusion depth for exported slab faces (same default as v1)."""
 

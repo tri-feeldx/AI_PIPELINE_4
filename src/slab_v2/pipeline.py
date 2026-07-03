@@ -760,6 +760,62 @@ def extract_slabs_v2(
         manual_scale=cfg.manual_scale,
     )
 
+    # split slab by zones if ARCH pair available + has zone data
+    if cfg.enable_zone_split and final_scale:
+        try:
+            from src.arch_ref.enrich import build_level_table
+            from src.arch_ref.zone_split import split_polygon_by_zones, fit_axis_map
+            from src.arch_ref.grids import extract_grid
+
+            level_name = (role_audit.get("title") or "").replace(
+                "GENERAL ARRANGEMENT", "").replace("PLAN", "").strip()
+            pdf_dir = Path(page.parent)
+            arch_cands = list(pdf_dir.glob("*ARCH*.pdf")) + list(
+                pdf_dir.glob("*Architect*.pdf"))
+            if arch_cands and level_name:
+                table = build_level_table(str(arch_cands[0]))
+                for lv in table.levels.values():
+                    if lv.name in level_name or level_name in lv.name:
+                        if lv.zones:
+                            try:
+                                import fitz as fitz_
+                                arch_doc = fitz_.open(str(arch_cands[0]))
+                                str_grid = extract_grid(page)
+                                for arch_p in arch_doc:
+                                    arch_grid = extract_grid(arch_p)
+                                    shared = sorted(
+                                        set(str_grid.cols) & set(arch_grid.cols),
+                                        key=int)
+                                    if len(shared) >= 2:
+                                        fx = fit_axis_map(
+                                            [(str_grid.cols[l], arch_grid.cols[l])
+                                             for l in shared])
+                                        zones_mapped = {}
+                                        for zone in lv.zones:
+                                            rl = zone["rl_m"]
+                                            pts_str = [
+                                                (fx(p[0]), p[1]) for p in
+                                                zone["positions"]]
+                                            zones_mapped[rl] = pts_str
+                                        if zones_mapped:
+                                            parts = split_polygon_by_zones(
+                                                slab_union, zones_mapped)
+                                            result.zones = parts
+                                            result.zone_split_audit = {
+                                                "source": "arch_voronoi",
+                                                "count": len(parts),
+                                                "zones_rl_m": sorted(
+                                                    zones_mapped),
+                                                "confidence": "VERIFIED" if len(
+                                                    parts) > 1 else "NONE"}
+                                        break
+                            except Exception as z_exc:          # noqa: BLE001
+                                result.warnings.append(
+                                    f"zone split failed: {z_exc}")
+                        break
+        except Exception as z_exc:                                 # noqa: BLE001
+            result.warnings.append(f"zone detect failed: {z_exc}")
+
     result.status = "OK"
 
     # ── columns (text-anchor-then-shape v2; fallback to shape-first v1) ───
